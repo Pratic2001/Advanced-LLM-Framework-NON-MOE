@@ -162,6 +162,45 @@ print(recipe.special_tokens)
 # ['<|endoftext|>', '<|pad|>', '<|im_start|>', '<|im_end|>', '<think>', '</think>', '<|think_on|>', '<|think_off|>']
 ```
 
+### Sample Recipe File
+
+A reference `recipe.json` is provided at the project root:
+
+```json
+{
+    "comment": "Sample TrainingRecipe for the Advanced LLM Framework",
+    "description": "Hybrid mode recipe with ChatML template.",
+
+    "mode": "hybrid",
+
+    "chat_template": "chatml",
+
+    "turn_prefix_user": "<|im_start|>user\n",
+    "turn_suffix_user": "<|im_end|>\n",
+
+    "turn_prefix_assistant": "<|im_start|>assistant\n",
+    "turn_suffix_assistant": "<|im_end|>\n",
+
+    "think_open": "<think>",
+    "think_close": "</think>",
+
+    "hybrid_think_token": "<|think_on|>",
+    "hybrid_nothink_token": "<|think_off|>",
+
+    "base_special_tokens": [
+        "<|endoftext|>",
+        "<|pad|>",
+        "<|im_start|>",
+        "<|im_end|>"
+    ],
+
+    "model_name": "DenseLLM"
+}
+```
+
+Copy and edit this file to create your own recipe variants for different
+training runs.
+
 ### Saving / Loading
 
 ```bash
