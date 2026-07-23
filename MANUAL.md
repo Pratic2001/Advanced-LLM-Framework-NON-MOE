@@ -22,6 +22,7 @@
    - 6.1  Pretrain Packing
    - 6.2  SFT Packing
    - 6.3  GRPO Packing
+   - 6.4  DPO Packing
 7. [Training: Pretraining](#7-training-pretraining)
    - 7.1  Torch DDP (train_pretrain.py)
    - 7.2  DeepSpeed (train_pretrain_deepspeed.py)
@@ -31,9 +32,13 @@
 9. [Training: GRPO Reinforcement Learning](#9-training-grpo)
    - 9.1  Torch DDP (train_grpo.py)
    - 9.2  DeepSpeed (train_grpo_deepspeed.py)
-10. [Inference](#10-inference)
-11. [Model Architecture](#11-model-architecture)
-12. [Troubleshooting & FAQ](#12-troubleshooting--faq)
+10. [Training: DPO Direct Preference Optimization](#10-training-dpo)
+   - 10.1 Ollama Judge (ollama_judge.py)
+   - 10.2 Torch DDP (train_dpo.py)
+   - 10.3 DeepSpeed (train_dpo_deepspeed.py)
+11. [Inference](#11-inference)
+12. [Model Architecture](#12-model-architecture)
+13. [Troubleshooting & FAQ](#13-troubleshooting--faq)
 
 ---
 
@@ -96,6 +101,9 @@ python infer.py --checkpoint ./checkpoints/latest_checkpoint --prompt "Hello, wo
 ├── train_sft_deepspeed.py             # SFT — DeepSpeed
 ├── train_grpo.py                      # GRPO RL — torch DDP
 ├── train_grpo_deepspeed.py            # GRPO RL — DeepSpeed
+├── train_dpo.py                       # DPO — torch DDP (preference optimization)
+├── train_dpo_deepspeed.py             # DPO — DeepSpeed
+├── ollama_judge.py                    # Ollama remote judge for DPO pair generation
 ├── infer.py                           # Inference (quant, streaming, REPL)
 │
 ├── model.py                           # Model definitions
@@ -107,7 +115,8 @@ python infer.py --checkpoint ./checkpoints/latest_checkpoint --prompt "Hello, wo
 ├── data/
 │   ├── pack_pretrain.py               # Pack pretrain JSONL → .bin
 │   ├── pack_sft.py                    # Pack SFT JSONL → .bin + mask
-│   └── pack_grpo.py                   # Pack GRPO prompts → .bin + answers
+│   ├── pack_grpo.py                   # Pack GRPO prompts → .bin + answers
+   └── pack_dpo.py                    # Pack DPO preference triples → .bin
 ├── configs/                           # Training config files
 ├── tests/
 │   └── test_model.py                  # Forward/backward smoke tests
@@ -663,6 +672,68 @@ python data/pack_grpo.py \
 The prompt is tokenized as `user_turn + assistant_prefix + EOS`. The model
 generates the assistant answer during GRPO training.
 
+### 6.4 DPO Packing (`pack_dpo.py`)
+
+Converts preference pair JSONL (`prompt`, `chosen`, `rejected`, optional
+`chosen_thinking`, `rejected_thinking`) into packed binary format for DPO
+training.
+
+```bash
+# Basic
+python data/pack_dpo.py \
+    --data-dir ./dpo_data \
+    --tokenizer ./tokenizer \
+    --cache-dir ./dpo_packed
+
+# With recipe mode awareness
+python data/pack_dpo.py \
+    --data-dir ./dpo_data \
+    --tokenizer ./tokenizer \
+    --cache-dir ./dpo_packed \
+    --mode reasoning
+
+# With validation split
+python data/pack_dpo.py \
+    --data-dir ./dpo_data \
+    --tokenizer ./tokenizer \
+    --cache-dir ./dpo_packed \
+    --val-fraction 0.05
+
+# Multi-worker (4 parallel processes)
+python data/pack_dpo.py --data-dir ./dpo_data --tokenizer ./tokenizer --worker 0 --num-workers 4 &
+python data/pack_dpo.py --data-dir ./dpo_data --tokenizer ./tokenizer --worker 1 --num-workers 4 &
+python data/pack_dpo.py --data-dir ./dpo_data --tokenizer ./tokenizer --worker 2 --num-workers 4 &
+python data/pack_dpo.py --data-dir ./dpo_data --tokenizer ./tokenizer --worker 3 --num-workers 4 &
+wait
+```
+
+**Output in `--cache-dir`:**
+- `dpo_prompts_train.bin` / `dpo_prompts_val.bin` — uint16 length-prefixed prompt tokens
+- `dpo_chosen_train.bin` / `dpo_chosen_val.bin` — uint16 chosen completion tokens (prompt + chosen)
+- `dpo_rejected_train.bin` / `dpo_rejected_val.bin` — uint16 rejected completion tokens (prompt + rejected)
+- `dpo_prompt_lens_train.json` / `dpo_prompt_lens_val.json` — per-record prompt lengths for masking
+- `dpo_manifest_train.json` / `dpo_manifest_val.json` — metadata
+
+**Input JSONL format:**
+```jsonl
+{"prompt": "What is 2+2?", "chosen": "4", "rejected": "5",
+ "chosen_thinking": "2 plus 2 equals 4", "rejected_thinking": "Maybe 5?"}
+{"prompt": "What is the capital of France?", "chosen": "Paris", "rejected": "London"}
+```
+
+The `thinking` fields are optional. When present, they are wrapped in
+`<think>...</think>` tags inside the assistant turn using the recipe format.
+If absent, the answer appears directly without think tags.
+
+Each record is formatted using `TrainingRecipe` into:
+```
+user_turn + assistant_prefix + (think_open + thinking + think_close + answer | answer) + EOS
+```
+
+The data loader uses prompt lengths from `dpo_prompt_lens.json` to mask
+prompt tokens during loss computation, so only the completion portion
+(chosen or rejected) contributes to log-probability differences.
+
 ---
 
 ## 7. Training: Pretraining
@@ -1100,7 +1171,302 @@ deepspeed --num_gpus 4 train_grpo_deepspeed.py \
 
 ---
 
-## 10. Inference
+## 10. Training: DPO Direct Preference Optimization
+
+DPO (Direct Preference Optimization) is an **alternative to GRPO** for
+post-training alignment. Instead of generating rollouts and scoring them with
+a reward function, DPO works with **static preference pairs**: for each prompt,
+you have one "chosen" completion and one "rejected" completion. The model learns
+to maximize the probability gap between chosen and rejected completions relative
+to a frozen reference model.
+
+The framework provides a complete DPO pipeline:
+
+```
+Ollama Judge (remote server)         OR        Human-labeled .jsonl
+         │                                          │
+         ▼                                          ▼
+   data/pack_dpo.py ──► packed .bin files
+         │
+         ▼
+   train_dpo.py (DDP) / train_dpo_deepspeed.py (DeepSpeed)
+         │
+         ▼
+   dpo_checkpoints/latest.pt
+```
+
+### 10.1 Ollama Judge (`ollama_judge.py`)
+
+Instead of human annotators, you can use an **Ollama model running on a remote
+server** to generate and rank completions into preference pairs.
+
+```bash
+# Connectivity test
+python ollama_judge.py --test
+
+# Generate preference pairs for a single prompt
+python ollama_judge.py --prompt "What is 2+2?" \
+    --url http://remote-server:11434 \
+    --model qwen2.5:7b
+
+# Batch mode: read prompts from JSONL, write preference pairs
+python ollama_judge.py \
+    --input ./prompts.jsonl \
+    --output ./prefs.jsonl \
+    --url http://remote-server:11434 \
+    --gen-model qwen2.5:7b \
+    --judge-model qwen2.5:7b-instruct \
+    --num-candidates 4
+
+# Batch mode with custom temperature and max tokens
+python ollama_judge.py \
+    --input ./prompts.jsonl \
+    --output ./prefs.jsonl \
+    --num-candidates 6 \
+    --temperature 0.8 \
+    --max-tokens 1024
+```
+
+#### How the Judge Works
+
+1. **Generation**: For each prompt, `ollama_judge.py` calls `POST /api/generate`
+   on the remote Ollama server to produce N candidate completions (using
+   `--gen-model`). Generation is parallelised via `ThreadPoolExecutor` for speed.
+
+2. **Judging**: Each pair of candidates is sent to a **judge model** (using
+   `POST /api/chat`) with a structured prompt that asks: *"Which completion is
+   better, A or B? Output JSON: {"verdict": "A" or "B", "reasoning": "..."}"*
+
+   The judge prompt includes quality dimensions: correctness, clarity, helpfulness,
+   instruction following, and conciseness.
+
+3. **Pair Selection**: After a round-robin tournament of pairwise comparisons,
+   the top-ranked completion becomes `chosen` and the lowest-ranked becomes
+   `rejected`. The output JSONL is ready for `data/pack_dpo.py`.
+
+#### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Remote Ollama server URL |
+| `OLLAMA_JUDGE_MODEL` | `qwen2.5:7b-instruct` | Model used for pairwise judging |
+| `OLLAMA_GEN_MODEL` | (same as judge) | Model used for candidate generation |
+
+#### Output JSONL Format
+
+```jsonl
+{"prompt": "What is 2+2?", "chosen": "4", "rejected": "5",
+ "chosen_thinking": "2 plus 2 equals 4", "rejected_thinking": "I think it might be 5"}
+{"prompt": "Explain gravity", "chosen": "Gravity is an attractive force...",
+ "rejected": "Gravity makes things fall...",
+ "chosen_thinking": "Gravity is one of the four fundamental forces...",
+ "rejected_thinking": "Um, gravity is what pulls things down..."}
+```
+
+#### Practical Considerations
+
+- **Latency**: Remote Ollama adds network round-trip time per request.
+  Use `--num-candidates 4` for reasonable speed; higher values produce
+  more pairs but take longer.
+- **Judge model quality**: An instruction-tuned model (e.g.
+  `qwen2.5:7b-instruct`, `llama3.1:8b-instruct`) works best for judging.
+  Using the same model for generation and judging is acceptable but may
+  introduce bias.
+- **No internet required**: Everything runs against your own Ollama server.
+  No data leaves your infrastructure.
+
+### 10.2 Torch DDP (`train_dpo.py`)
+
+DPO training with standard torch DDP, LoRA support, and the standard DPO loss.
+
+```bash
+# Basic
+python train_dpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./dpo_checkpoints \
+    --beta 0.1 \
+    --max-steps 500
+
+# With LoRA
+python train_dpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --lora --lora-rank 64 --lora-alpha 128 \
+    --lr 1e-5 \
+    --max-steps 500
+
+# Multi-GPU (torchrun)
+torchrun --nproc_per_node=4 train_dpo.py \
+    --checkpoint ./sft.pt \
+    --data-dir ./dpo_packed \
+    --batch-size 4
+
+# With label smoothing and clipping
+python train_dpo.py \
+    --checkpoint ./sft.pt \
+    --data-dir ./dpo_packed \
+    --beta 0.2 \
+    --label-smoothing 0.1 \
+    --clip-ratio 0.2
+
+# Smoke test
+python train_dpo.py --smoke-test
+```
+
+#### How DPO Works
+
+The DPO loss directly optimises the policy on preference pairs:
+
+```
+For each preference triple (prompt, chosen, rejected):
+
+  1. Compute logπ(chosen) — logπ_ref(chosen)  = chosen_log_ratio
+  2. Compute logπ(rejected) — logπ_ref(rejected) = rejected_log_ratio
+  3. logits = β × (chosen_log_ratio - rejected_log_ratio)
+  4. loss = -log σ(logits)
+
+  where logprobs are summed over completion tokens only
+  (prompt tokens are masked out)
+```
+
+**Key differences from GRPO:**
+- No rollout generation needed (static pairs)
+- No reward function — preference is baked into the data
+- Reference model anchors the policy to prevent divergence
+- Simpler, more stable training
+
+#### DPO Loss Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--beta` | `0.1` | DPO temperature — higher = more emphasis on preferring chosen |
+| `--label-smoothing` | `0.0` | Smooths the preference label (epsilon in DPO formula) |
+| `--clip-ratio` | `0.0` | PPO-style clipping on implicit reward ratio (0 = disabled) |
+
+#### Reference Policy
+
+```bash
+# Single model (default) — reuse trainable model under no_grad
+python train_dpo.py --ref-policy single ...
+
+# Two-model — separate frozen copy (more stable but 2× memory)
+python train_dpo.py --ref-policy two --checkpoint ./sft.pt ...
+```
+
+Two-model is more stable because the reference never drifts from the initial
+SFT policy. Single-model is more memory-efficient and works well for short runs.
+
+#### Key Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--beta` | `0.1` | DPO temperature parameter |
+| `--label-smoothing` | `0.0` | DPO label smoothing epsilon |
+| `--clip-ratio` | `0.0` | PPO-style clipping on implicit reward |
+| `--lora` | `false` | Enable LoRA adapters |
+| `--lora-rank` | `64` | LoRA rank |
+| `--lora-alpha` | `128.0` | LoRA scaling alpha |
+| `--ref-policy` | `single` | `single` or `two` — reference model strategy |
+| `--batch-size` | `4` | Preference triples per step |
+| `--compile` | `false` | Enable torch.compile |
+| `--save-every` | `50` | Checkpoint interval in steps |
+
+#### Logging
+
+```python
+# Per-step logging output:
+step     0 | loss +0.6931 | acc 48.00% | r_margin 0.0012 | lr 1.00e-06 | g 0.00 | 2.50 step/s
+step    50 | loss +0.6523 | acc 58.00% | r_margin 0.0387 | lr 7.35e-06 | g 0.15 | 3.10 step/s
+step   100 | loss +0.6110 | acc 63.00% | r_margin 0.0874 | lr 1.56e-07 | g 0.12 | 3.05 step/s
+```
+
+Metrics:
+- `loss` — DPO loss (decreasing = policy separating chosen from rejected)
+- `acc` — accuracy (fraction of batch where chosen_reward > rejected_reward)
+- `r_margin` — average reward margin (chosen_reward - rejected_reward)
+- `lr` — current learning rate
+- `g` — gradient norm
+
+### 10.3 DeepSpeed (`train_dpo_deepspeed.py`)
+
+DeepSpeed variant with auto-selected ZeRO stages and hardware audit.
+
+```bash
+# Single GPU
+deepspeed --num_gpus 1 train_dpo_deepspeed.py \
+    --checkpoint ./sft.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer
+
+# Multi-GPU
+deepspeed --num_gpus 4 train_dpo_deepspeed.py \
+    --checkpoint ./sft.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --lora --lora-rank 64
+
+# Force ZeRO-3 with CPU offload
+deepspeed train_dpo_deepspeed.py \
+    --checkpoint ./sft.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --zero-stage 3 --cpu-offload-optimizer
+
+# Resume from full-FT checkpoint
+deepspeed train_dpo_deepspeed.py \
+    --checkpoint ./sft.pt \
+    --data-dir ./dpo_packed \
+    --resume ./dpo_checkpoints/latest_ds
+```
+
+#### End-to-End DPO Pipeline
+
+```bash
+# Step 1: Generate preference pairs using Ollama judge
+python ollama_judge.py \
+    --input ./prompts.jsonl \
+    --output ./prefs.jsonl \
+    --url http://remote:11434 \
+    --num-candidates 4
+
+# Step 2: Pack for training
+python data/pack_dpo.py \
+    --data-dir ./prefs \
+    --tokenizer ./tokenizer \
+    --cache-dir ./dpo_packed \
+    --mode reasoning
+
+# Step 3: Train (DDP)
+python train_dpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --lora \
+    --beta 0.1 \
+    --max-steps 300
+
+# Step 3 (alternative): Train (DeepSpeed)
+deepspeed --num_gpus 4 train_dpo_deepspeed.py \
+    --checkpoint ./sft.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --lora \
+    --beta 0.1 \
+    --max-steps 300
+
+# Step 4: Inference
+python infer.py \
+    --checkpoint ./dpo_checkpoints/latest.pt \
+    --base-checkpoint ./sft.pt \
+    --prompt "What is 2+2?"
+```
+
+---
+
+## 11. Inference
 
 The inference script (`infer.py`) supports one-shot generation, interactive
 REPL, batched evaluation, and quantized modes.
@@ -1197,7 +1563,7 @@ Creates a tiny random model and runs one generation to verify dependencies.
 
 ---
 
-## 11. Model Architecture
+## 12. Model Architecture
 
 The model (`model.py`) is a dense (non-MoE) transformer with these configurable
 components:
@@ -1294,7 +1660,7 @@ Pass `--gradient-checkpointing` to the pretrain script.
 
 ---
 
-## 12. Troubleshooting & FAQ
+## 13. Troubleshooting & FAQ
 
 ### Common Issues
 
