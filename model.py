@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import re
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -278,8 +279,13 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (..., hidden_size) → same shape."""
-        var = x.pow(2).mean(-1, keepdim=True)
-        return x * torch.rsqrt(var + self.eps) * self.weight
+        dtype = x.dtype
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x32 = x.float()
+            variance = x32.pow(2).mean(-1, keepdim=True)
+            x32 = x32 * torch.rsqrt(variance + self.eps)
+            out = self.weight.float() * x32
+        return out.to(dtype)
 
 
 class LayerNorm(nn.Module):
@@ -445,6 +451,12 @@ class Attention(nn.Module):
             k = k.repeat_interleave(self.num_kv_groups, dim=1)
             v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
+        # Sync q/k/v dtypes before SDPA (autocast can promote them differently)
+        if q.dtype != v.dtype:
+            q = q.to(v.dtype)
+        if k.dtype != v.dtype:
+            k = k.to(v.dtype)
+
         # Scale factor for SDPA
         scale = 1.0 / math.sqrt(self.head_dim)
 
@@ -455,13 +467,37 @@ class Attention(nn.Module):
             and T > 1
         )
 
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attention_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=is_causal,
-            scale=scale,
-        )
+        # Explicitly pin the SDPA backend instead of letting PyTorch choose.
+        # Once we pass a custom float attn_mask (needed for left-padding),
+        # the flash-attention kernel is unavailable — fine, we want the
+        # memory-efficient (xFormers-style) kernel in that case, which is
+        # still ~linear in seq_len. What we must NOT allow is a silent
+        # fallback to the naive "math" kernel: that materializes the full
+        # (batch, heads, seq_len, seq_len) attention-probability matrix and
+        # keeps it around for backward on every layer, turning what should
+        # be linear memory into quadratic.
+        backend_ctx = nullcontext()
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            backends = ([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+                        if is_causal else [SDPBackend.EFFICIENT_ATTENTION])
+            backend_ctx = sdpa_kernel(backends)
+        except ImportError:
+            # Older torch: same intent via the legacy context manager.
+            backend_ctx = torch.backends.cuda.sdp_kernel(
+                enable_flash=is_causal,
+                enable_math=False,
+                enable_mem_efficient=True,
+            )
+
+        with backend_ctx:
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attention_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
+                scale=scale,
+            )
 
         # (B, H, T, D_head) → (B, T, H*D_head)
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, -1)

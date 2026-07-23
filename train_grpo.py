@@ -50,6 +50,7 @@ from tokenizers import Tokenizer
 
 from model import ModelConfig, TransformerForCausalLM, count_parameters
 from recipe import TrainingRecipe, get_recipe, add_recipe_args, recipe_from_args
+from train_sft import SFTDataset
 
 # ---------------------------------------------------------------------------
 # Hardware TFLOPS table (for throughput estimation)
@@ -243,6 +244,305 @@ def reward_fn(
 
 
 # ---------------------------------------------------------------------------
+# GRPOPromptDataset — prompt dataset backed by packed SFT memmaps
+# ---------------------------------------------------------------------------
+
+class GRPOPromptDataset:
+    """
+    Streams ``{prompt_ids, ground_truth_answer}`` pairs from the **packed
+    memmaps** written by ``data/pack_sft.py``. Re-tokenisation is unnecessary;
+    the tokens are already on disk in two mmap'd arrays:
+
+        tokens[i]  : token id at position i
+        mask[i]    : 1 = assistant token (in loss), 0 = prompt / EOS sep
+
+    Walking sample boundaries:
+
+        As ``data/pack_sft.py`` writes the file, each record is followed by
+        a single EOS token (mask = 0). Sample boundaries are the positions
+        where mask transitions from 1 -> 0 -> EOS. We find every
+        (prompt_start, prompt_end, answer_end) triple during a single linear
+        sweep over the memmap, store them as ``(offset, prompt_len, answer_len)``
+        triples in RAM, and never re-touch the disk during training.
+
+    Mode selection:
+        default  -> ``--cache_dir ./sft_packed`` + ``--data_dir ./sft_data``.
+                     The packed memmaps drive tokenisation; ``./sft_data`` JSONL
+                     shards are read once to recover ``answer`` strings.
+        override -> ``--prompts_file`` path. A plain JSONL of ``{prompt, answer}``
+                     is read in full (still small enough for typical eval sets).
+
+    Either way the per-step sample() call returns random indices into a
+    pre-built list — RAM stays flat.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Optional[str],        # --cache_dir (packed memmaps)
+        data_dir: Optional[str],         # --data_dir  (raw JSONL, for answer text)
+        prompts_file: Optional[str],     # --prompts_file override
+        tokenizer: Tokenizer,
+        max_prompt_len: int,
+        eos_id: int,
+    ):
+        self.tokenizer      = tokenizer
+        self.max_prompt_len = max_prompt_len
+        self.eos_id         = eos_id
+
+        if prompts_file:
+            self._init_from_jsonl(prompts_file)
+        else:
+            assert cache_dir, "--cache_dir is required when --prompts_file is not given"
+            self._init_from_packed(cache_dir, data_dir)
+
+        if not self._prompts:
+            raise RuntimeError(
+                f"No usable prompts after filtering. Check that "
+                f"{'--cache_dir' if prompts_file is None else prompts_file} "
+                f"contains valid records."
+            )
+
+    # ----------------------------------------------------------------------
+    # Path A: packed SFT memmaps + raw JSONL for answer text
+    # ----------------------------------------------------------------------
+    def _init_from_packed(self, cache_dir: str, data_dir: Optional[str]):
+        """
+        Open the same memmap files train_sft.py reads, locate sample
+        boundaries, and pre-build (prompt_ids, ground_truth) pairs.
+        """
+        # Reuse SFTDataset for manifest discovery + mmap concatenation.
+        # We pass a tiny seq_len so .__len__==0 in the rank/world_size
+        # sense doesn't matter — we use the underlying _ConcatMemmaps
+        # directly.
+        probe = SFTDataset(
+            cache_dir=cache_dir,
+            seq_len=2**30,                  # floor: every "window" is the full file
+            rank=0, world_size=1,
+            split="train",
+        )
+        self._tokens_memmap = probe.tokens   # lazy _ConcatMemmap (mmap-backed, no copy)
+        self._mask_memmap   = probe.mask     # lazy _ConcatMemmap (mmap-backed, no copy)
+        self._n_shards      = probe.n_shards
+        total = len(self._tokens_memmap)
+
+        # ---- find (prompt_start, prompt_end, assistant_end) by scanning
+        #      the mask array. Sample boundary = mask==0 position that is
+        #      also an EOS token (the separator pack_sft_data.py writes).
+        #
+        # We scan each underlying worker-shard memmap directly (still
+        # disk-/page-cache-backed, evictable under memory pressure)
+        # instead of materializing the whole concatenated dataset into
+        # one permanent, non-reclaimable RAM buffer via _contiguous_view.
+        # Each worker shard from pack_sft_data.py holds complete records
+        # (no record straddles two shard files), so per-shard scanning
+        # finds the exact same boundaries as a single global scan would.
+        tok_shards  = self._tokens_memmap.arrays
+        mask_shards = self._mask_memmap.arrays
+
+        # (shard_idx, local_start, local_end) — kept per-shard rather
+        # than flattened into one global offset, so prompt extraction
+        # below can index straight into that shard's own memmap.
+        boundaries: List[Tuple[int, int, int]] = []
+        for shard_idx, (tok_arr, mask_arr) in enumerate(zip(tok_shards, mask_shards)):
+            for s, e in self._scan_boundaries(mask_arr, tok_arr):
+                boundaries.append((shard_idx, s, e))
+
+        # ---- recover the original `answer` strings from the JSONL pool
+        answers_text: List[Optional[str]] = self._load_answer_strings(data_dir, len(boundaries))
+
+        # ---- build per-record slices
+        prompts: List[List[int]] = []
+        ground_truths: List[str] = []
+        prompt_texts: List[str]  = []
+        eos_id = self.eos_id
+
+        skipped_long = 0
+        skipped_no_gt = 0
+        for i, (shard_idx, s, e) in enumerate(boundaries):
+            gt = answers_text[i] if i < len(answers_text) else None
+            if not gt:
+                skipped_no_gt += 1
+                continue
+            tok_arr  = tok_shards[shard_idx]
+            mask_arr = mask_shards[shard_idx]
+            # Find the assistant-turn start: the first mask==1 within [s, e).
+            p_start = s
+            while p_start < e and mask_arr[p_start] == 0:
+                p_start += 1
+            prompt_ids = tok_arr[s:p_start].tolist()
+            if len(prompt_ids) >= self.max_prompt_len:
+                skipped_long += 1
+                continue
+            prompts.append(prompt_ids)
+            ground_truths.append(gt)
+            try:
+                prompt_texts.append(
+                    self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                )
+            except Exception:
+                prompt_texts.append("")
+
+        if skipped_long:
+            print(f"[PackedDataset] skipped {skipped_long} record(s) "
+                  f"with prompt > --max_prompt_len={self.max_prompt_len}")
+        if skipped_no_gt:
+            print(f"[PackedDataset] {skipped_no_gt} record(s) had no "
+                  f"answer text in JSONL pool — skipped")
+
+        self._prompts     = prompts
+        self._answers     = ground_truths
+        self._prompt_text = prompt_texts
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _scan_boundaries(mask_arr: np.ndarray, tok_arr: np.ndarray) -> List[Tuple[int, int]]:
+        """
+        Walk the mask array and return sample boundaries.
+
+        A boundary ends at a position where mask is 0 *and* the
+        corresponding token is the EOS special id (the separator
+        written between records).
+
+        Returns: list of (start, end_exclusive) tuples.
+
+        Implementation: vectorized search with numpy for candidates,
+        then loop over candidates (O(n_records), not O(n_tokens)).
+        """
+        n = len(mask_arr)
+        if n == 0:
+            return []
+
+        # Candidate separator positions: mask==0 and token==EOS(0).
+        candidates = np.flatnonzero((mask_arr == 0) & (tok_arr == 0))
+
+        # Positions where mask==1, needed to confirm "in_record" was
+        # true since the last boundary.
+        mask1_positions = np.flatnonzero(mask_arr == 1)
+
+        boundaries: List[Tuple[int, int]] = []
+        rec_start = 0
+        m1_ptr = 0
+        n_m1 = len(mask1_positions)
+
+        for c in candidates:
+            if c < rec_start:
+                continue
+            while m1_ptr < n_m1 and mask1_positions[m1_ptr] < rec_start:
+                m1_ptr += 1
+            in_record = m1_ptr < n_m1 and mask1_positions[m1_ptr] < c
+            if in_record:
+                boundaries.append((rec_start, c + 1))
+                rec_start = c + 1
+
+        if rec_start < n:
+            while m1_ptr < n_m1 and mask1_positions[m1_ptr] < rec_start:
+                m1_ptr += 1
+            if m1_ptr < n_m1 and mask1_positions[m1_ptr] < n:
+                boundaries.append((rec_start, n))
+
+        return boundaries
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _load_answer_strings(data_dir: Optional[str], n_expected: int) -> List[Optional[str]]:
+        """
+        Stream JSONL shards under data_dir and collect each record's
+        ``answer`` field, in the same order ``data/pack_sft.py`` saw them.
+        """
+        if not data_dir:
+            return [""] * n_expected
+        paths = sorted(glob.glob(os.path.join(data_dir, "*", "*.jsonl")))
+        if not paths:
+            paths = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
+        if not paths:
+            print(f"[PackedDataset] no JSONL found under {data_dir}; "
+                  f"every prompt will get an empty ground truth.")
+            return [""] * n_expected
+
+        answers: List[str] = []
+        for p in paths:
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    answers.append((rec.get("answer") or "").strip())
+        if len(answers) < n_expected:
+            answers.extend([""] * (n_expected - len(answers)))
+        else:
+            answers = answers[:n_expected]
+        return answers
+
+    # ----------------------------------------------------------------------
+    # Path B: plain JSONL override
+    # ----------------------------------------------------------------------
+    def _init_from_jsonl(self, path: str):
+        """Fallback: read every record's prompt + answer from a single file."""
+        prompts: List[List[int]] = []
+        ground_truths: List[str] = []
+        prompt_texts: List[str]  = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                prompt = (rec.get("prompt") or "").strip()
+                answer = (rec.get("answer") or "").strip()
+                if not prompt or not answer:
+                    continue
+                ids = self._format_prompt(prompt)
+                if ids is None:
+                    continue
+                prompts.append(ids)
+                ground_truths.append(answer)
+                prompt_texts.append(prompt)
+
+        self._prompts     = prompts
+        self._answers     = ground_truths
+        self._prompt_text = prompt_texts
+
+    # ----------------------------------------------------------------------
+    def _format_prompt(self, prompt: str) -> Optional[List[int]]:
+        """ChatML user-turn prefix, matches data/pack_sft.py formatting."""
+        text = f"user\n{prompt}\nassistant\n"
+        ids = self.tokenizer.encode(text, add_special_tokens=False).ids
+        if len(ids) >= self.max_prompt_len:
+            return None
+        return ids
+
+    # ----------------------------------------------------------------------
+    def __len__(self) -> int:
+        return len(self._prompts)
+
+    def sample_batch(
+        self, batch_size: int, rng: random.Random,
+    ) -> Tuple[List[List[int]], List[str], List[str]]:
+        """Return (prompt_ids, ground_truth, prompt_text) for `batch_size` prompts."""
+        idxs = [rng.randrange(len(self._prompts)) for _ in range(batch_size)]
+        return (
+            [self._prompts[i]     for i in idxs],
+            [self._answers[i]     for i in idxs],
+            [self._prompt_text[i] for i in idxs],
+        )
+
+
+def _contiguous_view(concat_memmap) -> np.ndarray:
+    """
+    Materialise a ``_ConcatMemmap`` view as a single in-RAM ndarray.
+    Memory cost = one full pass over the dataset.
+    """
+    return np.asarray(concat_memmap[:])
+
+
+# ---------------------------------------------------------------------------
 # PackedGRPODataLoader — reads grpo_prompt_tokens*.bin + grpo_answers*.json
 # ---------------------------------------------------------------------------
 # This is the GRPO-specific data path. Packed data from pack_grpo.py is
@@ -373,6 +673,43 @@ class PackedGRPODataLoader:
 
 
 # ---------------------------------------------------------------------------
+# Attention mask builder for left-padded batches
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _build_attn_mask(
+    prompt_pad_mask: torch.Tensor,   # (B, P) additive float: 0.0 real, -inf pad
+    seq_len: int,
+    past_len: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Build a (B, 1, seq_len, past_len+seq_len) additive attention mask
+    combining standard causal restriction with the prompt's left-padding.
+    Passing an explicit attn_mask disables the model's internal
+    `is_causal` SDPA fast path, so this mask must encode causality itself.
+    """
+    B, P = prompt_pad_mask.shape
+    device = prompt_pad_mask.device
+    total_len = past_len + seq_len
+    gen_len = total_len - P
+    if gen_len > 0:
+        gen_pad = torch.zeros((B, gen_len), dtype=prompt_pad_mask.dtype, device=device)
+        full_pad = torch.cat([prompt_pad_mask, gen_pad], dim=1)
+    else:
+        full_pad = prompt_pad_mask[:, :total_len]
+    # (B, 1, 1, total_len) broadcast — only padding columns are masked
+    pad_mask = full_pad[:, None, None, :]   # 0 real, -inf pad
+    # causal: positions at index > seq_offset are masked
+    seq_offset = past_len
+    causal = torch.triu(
+        torch.full((seq_len, total_len), float("-inf"), device=device, dtype=dtype),
+        diagonal=seq_offset + 1,
+    )
+    return (pad_mask + causal).to(dtype)  # (B, 1, seq_len, total_len)
+
+
+# ---------------------------------------------------------------------------
 # Batched rollout generation
 # ---------------------------------------------------------------------------
 
@@ -403,25 +740,31 @@ def generate_rollouts(
         rng: Per-replica RNG for diverse samples.
 
     Returns:
-        full_ids:   (B*G, P+T) token ids.
-        gen_mask:   (B*G, T) 1 for generated positions, 0 for padding.
-        sampled_lp: (B*G, T) per-token log-prob of the sampled token.
+        full_ids:       (B*G, P+T) token ids.
+        gen_mask:       (B*G, T) 1 for generated positions, 0 for padding.
+        sampled_lp:     (B*G, T) per-token log-prob of the sampled token.
+        prompt_pad_mask: (B*G, P) additive left-padding mask (0 real, -inf pad).
     """
     device = next(model.parameters()).device
 
     B = len(prompt_ids_list)
     P = max(len(p) for p in prompt_ids_list)
     prompt_ids = torch.full((B, P), pad_id, dtype=torch.long, device=device)
+    prompt_pad_mask = torch.zeros((B, P), dtype=torch.float, device=device)
     for i, pids in enumerate(prompt_ids_list):
-        prompt_ids[i, P - len(pids):] = torch.tensor(pids, dtype=torch.long, device=device)
+        offset = P - len(pids)
+        prompt_ids[i, offset:] = torch.tensor(pids, dtype=torch.long, device=device)
+        if offset > 0:
+            prompt_pad_mask[i, :offset] = float("-inf")
 
     full_ids = torch.full((B, P + max_new_tokens), pad_id, dtype=torch.long, device=device)
     full_ids[:, :P] = prompt_ids
     gen_mask = torch.zeros((B, max_new_tokens), dtype=torch.float, device=device)
     sampled_lp = torch.zeros((B, max_new_tokens), dtype=torch.float, device=device)
 
+    model_dtype = next(model.parameters()).dtype
     past_kv = None
-    cur_ids = prompt_ids
+    inp = prompt_ids
 
     g = torch.Generator(device=device)
     g.manual_seed(rng.randrange(2**31))
@@ -429,12 +772,10 @@ def generate_rollouts(
     already_done = torch.zeros(B, dtype=torch.bool, device=device)
 
     for t in range(max_new_tokens):
-        if past_kv is None:
-            inp = cur_ids
-        else:
-            inp = cur_ids[:, -1:]
+        past_len = 0 if past_kv is None else past_kv[0][0].shape[2]
+        attn_mask = _build_attn_mask(prompt_pad_mask, inp.shape[1], past_len, model_dtype)
 
-        out = model(inp, past_key_values=past_kv, use_cache=True)
+        out = model(inp, attention_mask=attn_mask, past_key_values=past_kv, use_cache=True)
         logits = out["logits"][:, -1, :].float()
         past_kv = out["past_key_values"]
 
@@ -471,7 +812,7 @@ def generate_rollouts(
         actual_T = int(active_lens.max().item())
         actual_T = max(1, min(actual_T, max_new_tokens))
 
-    return full_ids[:, :P + actual_T], gen_mask[:, :actual_T], sampled_lp[:, :actual_T]
+    return full_ids[:, :P + actual_T], gen_mask[:, :actual_T], sampled_lp[:, :actual_T], prompt_pad_mask
 
 
 # ---------------------------------------------------------------------------
@@ -483,15 +824,28 @@ def compute_logprobs(
     model: TransformerForCausalLM,
     full_ids: torch.Tensor,
     gen_mask: torch.Tensor,
+    prompt_pad_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Per-token log-prob of generated positions."""
-    out = model(full_ids, use_cache=False)
-    logits = out["logits"][:, :-1, :].float()
-    targets = full_ids[:, 1:]
+    """
+    Per-token log-prob of generated positions.
+
+    When `prompt_pad_mask` is given, builds an explicit causal+padding
+    attention mask so rows with a shorter prompt aren't scored against
+    corrupted (pad-attending) hidden states.
+    """
+    attn_mask = None
+    if prompt_pad_mask is not None:
+        seq_len = full_ids.shape[1]
+        model_dtype = next(model.parameters()).dtype
+        attn_mask = _build_attn_mask(prompt_pad_mask, seq_len, 0, model_dtype)
+    T = gen_mask.shape[1]
+    out = model(full_ids, attention_mask=attn_mask, use_cache=False,
+                num_logits_to_keep=T)
+    logits = out["logits"].float()
+    targets = full_ids[:, -T:]
     logp = logits.log_softmax(dim=-1)
     tok_lp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-    T = gen_mask.shape[1]
-    return tok_lp[:, -T:] * gen_mask
+    return tok_lp * gen_mask
 
 
 # ---------------------------------------------------------------------------
@@ -740,7 +1094,7 @@ def validate(
                 expanded_a.append(a)
                 expanded_wt.append(wt)
 
-        full_ids, gen_mask, _ = generate_rollouts(
+        full_ids, gen_mask, _prompt_pad_mask = generate_rollouts(
             model, expanded_p, recipe,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -878,7 +1232,7 @@ def smoke_test():
         expanded_a = [a for a in batch_answers for _ in range(2)]
         expanded_wt = [wt for wt in batch_wt for _ in range(2)]
 
-        full_ids, gen_mask, _ = generate_rollouts(
+        full_ids, gen_mask, _prompt_pad_mask = generate_rollouts(
             model, expanded_p, recipe,
             max_new_tokens=32,
             temperature=1.0, top_p=0.95,
@@ -906,7 +1260,7 @@ def smoke_test():
 
         # Reference logprobs
         with torch.no_grad():
-            ref_logp = compute_logprobs(ref or model, full_ids, gen_mask)
+            ref_logp = compute_logprobs(ref or model, full_ids, gen_mask, _prompt_pad_mask)
 
         # Policy logprobs
         out = model(full_ids, use_cache=False)
@@ -1115,15 +1469,16 @@ def train(args: argparse.Namespace):
         # 3. rollout
         rollout_model = _raw(model)
         rollout_model.eval()
-        full_ids, gen_mask, _sampled_lp = generate_rollouts(
-            rollout_model, expanded_p, recipe,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            eos_id=eos_id,
-            pad_id=pad_id,
-            rng=rng,
-        )
+        with ctx, torch.no_grad():
+            full_ids, gen_mask, _sampled_lp, prompt_pad_mask = generate_rollouts(
+                rollout_model, expanded_p, recipe,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                eos_id=eos_id,
+                pad_id=pad_id,
+                rng=rng,
+            )
         rollout_model.train()
 
         # 4. decode + reward
@@ -1149,17 +1504,22 @@ def train(args: argparse.Namespace):
         rewards = torch.tensor(rewards_list, dtype=torch.float, device=device)
 
         # 5. reference log-probs (no_grad)
-        with torch.no_grad():
-            ref_logp = compute_logprobs(ref_for_logprob, full_ids, gen_mask)
+        with ctx, torch.no_grad():
+            ref_logp = compute_logprobs(ref_for_logprob, full_ids, gen_mask, prompt_pad_mask)
 
         # 6. policy log-probs (with grad)
-        out = model(full_ids, use_cache=False)
-        policy_logits = out["logits"][:, :-1, :].float()
-        targets = full_ids[:, 1:]
+        policy_attn_mask = _build_attn_mask(
+            prompt_pad_mask, full_ids.shape[1], 0, next(model.parameters()).dtype
+        )
+        T = gen_mask.shape[1]
+        with ctx:
+            out = model(full_ids, attention_mask=policy_attn_mask, use_cache=False,
+                        num_logits_to_keep=T)
+            policy_logits = out["logits"].float()
+        targets = full_ids[:, -T:]
         policy_logp = policy_logits.log_softmax(dim=-1).gather(
             -1, targets.unsqueeze(-1)).squeeze(-1)
-        T = gen_mask.shape[1]
-        policy_logp = policy_logp[:, -T:] * gen_mask
+        policy_logp = policy_logp * gen_mask
 
         # 7. loss + step
         loss, metrics = grpo_loss(

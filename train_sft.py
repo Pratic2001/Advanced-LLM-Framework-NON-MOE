@@ -173,6 +173,195 @@ def destroy_distributed():
 
 
 # ---------------------------------------------------------------------------
+# _ConcatMemmap — lazy zero-copy concatenation of memmap shards
+# ---------------------------------------------------------------------------
+
+class _ConcatMemmap:
+    """
+    Read-only view that makes several np.memmap arrays look like one
+    contiguous array, without copying any of them into RAM.
+
+    This avoids the multi-GB anonymous memory copies that
+    ``np.concatenate(memmaps)`` forces, breaking the "RAM stays flat"
+    promise when the dataset is large or world_size=1 (full dataset
+    slice).
+    """
+
+    def __init__(self, arrays):
+        self.arrays = [a for a in arrays if len(a) > 0]
+        self.lengths = [len(a) for a in self.arrays]
+        self.offsets = np.cumsum([0] + self.lengths)
+        self.total = int(self.offsets[-1])
+
+    def __len__(self):
+        return self.total
+
+    def __array__(self, dtype=None):
+        # Supports np.asarray(concat_memmap) / np.array(concat_memmap).
+        # Materializes exactly the pieces this instance holds — for a
+        # per-step training window (this class's main use case via
+        # __getitem__ below) that's tiny (seq_len-ish elements, usually
+        # just 1-2 pieces). Callers holding a _ConcatMemmap spanning a
+        # much larger range should avoid calling this unless they
+        # specifically want the one-time full-materialization cost.
+        if not self.arrays:
+            return np.array([], dtype=dtype or np.uint16)
+        pieces = [np.asarray(a) for a in self.arrays]
+        out = pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
+        return out.astype(dtype) if dtype is not None else out
+
+    def _locate(self, idx):
+        arr_i = int(np.searchsorted(self.offsets, idx, side="right") - 1)
+        return arr_i, idx - self.offsets[arr_i]
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            start, stop, step = key.indices(self.total)
+            assert step == 1, "strided slicing not supported"
+            if start >= stop:
+                return _ConcatMemmap([])
+            arr_i_start, local_start = self._locate(start)
+            arr_i_end,   local_end   = self._locate(stop - 1)
+            if arr_i_start == arr_i_end:
+                return _ConcatMemmap([self.arrays[arr_i_start][local_start: local_end + 1]])
+            pieces = []
+            cur = start
+            while cur < stop:
+                arr_i, local = self._locate(cur)
+                arr = self.arrays[arr_i]
+                take = min(len(arr) - local, stop - cur)
+                pieces.append(arr[local: local + take])
+                cur += take
+            return _ConcatMemmap(pieces)
+        else:
+            arr_i, local = self._locate(key)
+            return self.arrays[arr_i][local]
+
+
+# ---------------------------------------------------------------------------
+# SFTDataset — manifest-based memmap reader (needed by GRPOPromptDataset)
+# ---------------------------------------------------------------------------
+
+class SFTDataset:
+    """
+    Reads packed memmap files produced by data/pack_sft.py:
+
+        <cache_dir>/sft_train_manifest*.json   — per-worker metadata
+        <cache_dir>/sft_train_tokens*.bin      — uint16/uint32 token ids
+        <cache_dir>/sft_train_mask*.bin        — uint8 loss mask (1 = compute loss)
+
+    All worker shards found for the requested split are discovered,
+    sorted by worker index, and concatenated (still mmap-backed, no RAM
+    copy). The result is sharded across DDP ranks by token count.
+
+    This class is used by GRPOPromptDataset to scan sample boundaries;
+    for SFT training itself, use PackedSFTDataLoader instead.
+    """
+
+    def __init__(
+        self,
+        cache_dir: str,
+        seq_len: int,
+        rank: int = 0,
+        world_size: int = 1,
+        split: str = "train",
+    ):
+        self.seq_len    = seq_len
+        self.rank       = rank
+        self.world_size = world_size
+        self.split      = split
+
+        manifests = self._discover_manifests(cache_dir, split)
+        if not manifests:
+            raise FileNotFoundError(
+                f"No packed manifests found for split={split!r} in {cache_dir}. "
+                f"Run data/pack_sft.py first."
+            )
+
+        dtype_t = np.dtype(manifests[0].get("dtype_tokens", "uint16"))
+        dtype_m = np.dtype(manifests[0].get("dtype_mask", "uint8"))
+
+        token_arrays = []
+        mask_arrays  = []
+        total_records = 0
+        for m in manifests:
+            tok_path  = os.path.join(cache_dir, m["token_file"])
+            mask_path = os.path.join(cache_dir, m["mask_file"])
+            token_arrays.append(np.memmap(tok_path,  dtype=dtype_t, mode="r"))
+            mask_arrays.append(np.memmap(mask_path, dtype=dtype_m, mode="r"))
+            total_records += m.get("num_records", 0)
+
+        self.tokens = _ConcatMemmap(token_arrays)
+        self.mask   = _ConcatMemmap(mask_arrays)
+        self.n_shards = len(token_arrays)
+
+        if rank == 0:
+            print(f"[SFTDataset] {split}: discovered {len(manifests)} worker "
+                  f"shard(s) in {cache_dir} ({total_records:,} records total)")
+
+        # Shard across DDP ranks by token count
+        total = len(self.tokens)
+        shard_size = total // world_size
+        start = rank * shard_size
+        end   = start + shard_size if rank < world_size - 1 else total
+        self.tokens = self.tokens[start:end]
+        self.mask   = self.mask[start:end]
+
+        n_windows = max(0, (len(self.tokens) - 1) // seq_len)
+        print(f"[SFTDataset rank {rank}] {split}: {len(self.tokens):,} tokens "
+              f"-> {n_windows:,} windows of {seq_len}")
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _discover_manifests(cache_dir: str, split: str):
+        """Find every sft_{split}_manifest*.json in cache_dir, sorted by worker."""
+        pattern = os.path.join(cache_dir, f"sft_{split}_manifest*.json")
+        manifest_paths = sorted(glob.glob(pattern))
+        manifests = []
+        for p in manifest_paths:
+            with open(p, "r") as f:
+                m = json.load(f)
+            if m.get("split") != split:
+                continue
+            manifests.append(m)
+        manifests.sort(key=lambda m: m.get("worker", 0))
+        return manifests
+
+    # ------------------------------------------------------------------
+    def __len__(self) -> int:
+        return max(0, (len(self.tokens) - 1) // self.seq_len)
+
+    def get_batch(self, batch_size: int, device: torch.device):
+        """Sample `batch_size` random windows; return (x, y, loss_mask)."""
+        n = len(self)
+        if n == 0:
+            raise RuntimeError(
+                "SFT dataset has no complete windows. "
+                "Try a smaller --seq-len."
+            )
+        starts = torch.randint(0, n, (batch_size,)) * self.seq_len
+        xs, ys, ms = [], [], []
+        for s in starts.tolist():
+            s = min(int(s), len(self.tokens) - self.seq_len - 1)
+            xs.append(torch.from_numpy(
+                np.asarray(self.tokens[s     : s + self.seq_len    ]).astype(np.int64)))
+            ys.append(torch.from_numpy(
+                np.asarray(self.tokens[s + 1 : s + self.seq_len + 1]).astype(np.int64)))
+            ms.append(torch.from_numpy(
+                np.asarray(self.mask  [s + 1 : s + self.seq_len + 1]).astype(np.float32)))
+        x = torch.stack(xs)
+        y = torch.stack(ys)
+        m = torch.stack(ms)
+        if device.type == "cuda":
+            x = x.pin_memory().to(device, non_blocking=True)
+            y = y.pin_memory().to(device, non_blocking=True)
+            m = m.pin_memory().to(device, non_blocking=True)
+        else:
+            x, y, m = x.to(device), y.to(device), m.to(device)
+        return x, y, m
+
+
+# ---------------------------------------------------------------------------
 # DataLoader
 # ---------------------------------------------------------------------------
 
@@ -217,16 +406,15 @@ class PackedSFTDataLoader:
         token_arrs = [np.memmap(f, dtype=np.uint16, mode="r") for f in token_files]
         mask_arrs  = [np.memmap(f, dtype=np.uint8,  mode="r") for f in mask_files]
 
-        if len(token_arrs) > 1:
-            # Keep mmap-backed where possible; single copy is fine for
-            # the concatenated view since the OS still pages from the
-            # underlying files.
-            self.tokens = np.concatenate(token_arrs)
-        else:
-            self.tokens = token_arrs[0]
+        # Use _ConcatMemmap to lazily stitch memmap shards without copying
+        # them into anonymous RAM. The rank-sharding slice below
+        # (self.tokens[start:end]) can cover the *entire* dataset when
+        # world_size=1 — eagerly concatenating would force a multi-GB
+        # anonymous-memory copy that the OS can't reclaim like mmap'd pages.
+        self.tokens = _ConcatMemmap(token_arrs)
 
         if mask_arrs:
-            self.masks = np.concatenate(mask_arrs) if len(mask_arrs) > 1 else mask_arrs[0]
+            self.masks = _ConcatMemmap(mask_arrs)
         else:
             # Fallback: generate an all-ones mask (no masking)
             self.masks = np.ones(len(self.tokens), dtype=np.uint8)
@@ -259,12 +447,9 @@ class PackedSFTDataLoader:
             valid_sum = 0
             for j in range(self.batch_size):
                 idx = (b * self.batch_size + j) * self.seq_len
-                x = self.tokens[idx     : idx + self.seq_len]
-                y = self.tokens[idx + 1 : idx + self.seq_len + 1]
-                m = self.masks[idx + 1  : idx + self.seq_len + 1]
-                xs.append(x.astype(np.int64))
-                ys.append(y.astype(np.int64))
-                ms.append(m.astype(np.float32))
+                x = np.asarray(self.tokens[idx     : idx + self.seq_len]).astype(np.int64)
+                y = np.asarray(self.tokens[idx + 1 : idx + self.seq_len + 1]).astype(np.int64)
+                m = np.asarray(self.masks[idx + 1  : idx + self.seq_len + 1]).astype(np.float32)
                 valid_sum += int(m.sum())
 
             xs = torch.from_numpy(np.stack(xs))
@@ -793,9 +978,9 @@ def main():
         val_token_arrs = [np.memmap(f, dtype=np.uint16, mode="r") for f in val_token_files_sorted]
         val_mask_arrs  = [np.memmap(f, dtype=np.uint8, mode="r") for f in val_mask_files] if val_mask_files else None
         if val_token_arrs:
-            val_loader.tokens = np.concatenate(val_token_arrs) if len(val_token_arrs) > 1 else val_token_arrs[0]
+            val_loader.tokens = _ConcatMemmap(val_token_arrs)
             if val_mask_arrs:
-                val_loader.masks = np.concatenate(val_mask_arrs) if len(val_mask_arrs) > 1 else val_mask_arrs[0]
+                val_loader.masks = _ConcatMemmap(val_mask_arrs)
             else:
                 val_loader.masks = np.ones(len(val_loader.tokens), dtype=np.uint8)
             total_val = len(val_loader.tokens)

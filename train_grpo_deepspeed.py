@@ -73,11 +73,12 @@ from train_grpo import (
     compute_logprobs,
     grpo_loss,
     build_reference,
-    save_checkpoint,
-    load_checkpoint,
+    save_grpo_checkpoint,
+    load_grpo_checkpoint,
     merge_and_save,
     smoke_test,
     GPU_PEAK_TFLOPS,
+    _build_attn_mask,
 )
 
 # Re-use the LoRA machinery from peft.
@@ -704,14 +705,45 @@ def train(args):
               f"vocab={tokenizer.get_vocab_size()}")
 
     # ----------------------------------------------------------------- dataset
-    train_ds = GRPOPromptDataset(
-        cache_dir=args.cache_dir,
-        data_dir=args.data_dir,
-        prompts_file=args.prompts_file,
-        tokenizer=tokenizer,
-        max_prompt_len=args.max_prompt_len,
-        eos_id=eos_id,
-    )
+    # Only rank 0 does the expensive work: SFTDataset concatenates every
+    # packed shard into one in-RAM array and scans it for record
+    # boundaries (see GRPOPromptDataset._init_from_packed). If every rank
+    # did this independently, peak host RAM would be
+    # world_size * (dataset size), since all ranks on a node run this
+    # concurrently. Instead, rank 0 builds it once and broadcasts the
+    # much smaller derived (prompt_ids, answer, prompt_text) lists.
+    if world_size > 1:
+        if master:
+            train_ds = GRPOPromptDataset(
+                cache_dir=args.cache_dir,
+                data_dir=args.data_dir,
+                prompts_file=args.prompts_file,
+                tokenizer=tokenizer,
+                max_prompt_len=args.max_prompt_len,
+                eos_id=eos_id,
+            )
+            payload = [train_ds._prompts, train_ds._answers, train_ds._prompt_text]
+        else:
+            payload = [None, None, None]
+        dist.broadcast_object_list(payload, src=0, device=device)
+        if not master:
+            # Lightweight shell: skip GRPOPromptDataset.__init__ entirely
+            # (that's what does the expensive memmap/JSONL work) and
+            # just populate the few attributes sample_batch()/__len__ need.
+            train_ds = GRPOPromptDataset.__new__(GRPOPromptDataset)
+            train_ds.tokenizer      = tokenizer
+            train_ds.max_prompt_len = args.max_prompt_len
+            train_ds.eos_id         = eos_id
+            train_ds._prompts, train_ds._answers, train_ds._prompt_text = payload
+    else:
+        train_ds = GRPOPromptDataset(
+            cache_dir=args.cache_dir,
+            data_dir=args.data_dir,
+            prompts_file=args.prompts_file,
+            tokenizer=tokenizer,
+            max_prompt_len=args.max_prompt_len,
+            eos_id=eos_id,
+        )
     if master:
         n_shards = len(getattr(train_ds, "_tokens_memmap", None).arrays) \
             if hasattr(train_ds, "_tokens_memmap") else 0
@@ -723,7 +755,7 @@ def train(args):
     if args.resume:
         if args.resume.endswith(".pt"):
             # train_grpo.py-style checkpoint (LoRA or full)
-            start_step = load_checkpoint(args.resume, engine, optimizer, device, is_lora)
+            start_step = load_grpo_checkpoint(args.resume, engine, optimizer, device, is_lora)
         else:
             # DeepSpeed checkpoint directory
             start_step, recipe = load_ds_grpo_checkpoint(engine, args.resume, recipe)
@@ -779,7 +811,7 @@ def train(args):
         # 3. rollout (uses the underlying unwrapped model)
         rollout_model = _underlying()
         rollout_model.eval()
-        full_ids, gen_mask, _sampled_lp = generate_rollouts(
+        full_ids, gen_mask, _sampled_lp, prompt_pad_mask = generate_rollouts(
             rollout_model,
             expanded_p,
             max_new_tokens=args.max_new_tokens,
@@ -817,24 +849,25 @@ def train(args):
 
         # 5. reference log-probs (no_grad)
         with torch.no_grad():
-            ref_logp = compute_logprobs(ref_for_logprob, full_ids, gen_mask)
+            ref_logp = compute_logprobs(ref_for_logprob, full_ids, gen_mask, prompt_pad_mask)
 
-        # 6. policy log-probs (with grad)
-        #    Use torch.autocast for bf16 forward through the DeepSpeed engine.
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                            enabled=args.dtype == "bf16"):
-            out = engine(full_ids)
+        # 6. policy log-probs (with grad) — engine drives the forward +
+        #    backward + (optional) all-reduce + optimizer step in one go.
+        policy_attn_mask = _build_attn_mask(
+            prompt_pad_mask, full_ids.shape[1], 0, next(engine.parameters()).dtype
+        )
+        T = gen_mask.shape[1]
+        out = engine(full_ids, attention_mask=policy_attn_mask, num_logits_to_keep=T)
 
         if isinstance(out, dict):
             policy_logits = out["logits"]
         else:
             policy_logits = out.logits if hasattr(out, "logits") else out["logits"]
-        policy_logits = policy_logits[:, :-1, :].float()
-        targets = full_ids[:, 1:]
+        policy_logits = policy_logits.float()
+        targets = full_ids[:, -T:]
         policy_logp = policy_logits.log_softmax(dim=-1).gather(
             -1, targets.unsqueeze(-1)).squeeze(-1)
-        T = gen_mask.shape[1]
-        policy_logp = policy_logp[:, -T:] * gen_mask
+        policy_logp = policy_logp * gen_mask
 
         # 7. GRPO loss
         loss, metrics = grpo_loss(
@@ -884,8 +917,8 @@ def train(args):
         if step > start_step and step % args.ckpt_interval == 0:
             if master:
                 if is_lora:
-                    save_checkpoint(args.out_dir, step, engine, engine.optimizer,
-                                    config, vars(args), is_lora=True)
+                    save_grpo_checkpoint(args.out_dir, step, engine, engine.optimizer,
+                                         config, vars(args), True, recipe)
                 else:
                     save_ds_grpo_checkpoint(engine, args.out_dir, step, config,
                                             vars(args), recipe)
@@ -894,8 +927,8 @@ def train(args):
     # ---- final checkpoint
     if master:
         if is_lora:
-            save_checkpoint(args.out_dir, args.max_steps, engine, engine.optimizer,
-                            config, vars(args), is_lora=True)
+            save_grpo_checkpoint(args.out_dir, args.max_steps, engine, engine.optimizer,
+                                 config, vars(args), True, recipe)
         else:
             save_ds_grpo_checkpoint(engine, args.out_dir, args.max_steps, config,
                                     vars(args), recipe)
