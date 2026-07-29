@@ -28,7 +28,8 @@
 18. [Checkpoint Save / Resume](#18-checkpoint-save--resume)
 19. [Model Architecture Reference](#19-model-architecture-reference)
 20. [End-to-End Pipeline: Train on an RTX 4090](#20-end-to-end-pipeline-train-a-capable-350m-model-on-an-rtx-4090)
-21. [Appendix A: Full CLI Reference](#appendix-a-full-cli-reference)
+21. [Hardware Benchmark & Hyperparameter Tuning](#21-hardware-benchmark--hyperparameter-tuning)
+22. [Appendix A: Full CLI Reference](#appendix-a-full-cli-reference)
 
 ---
 
@@ -63,6 +64,9 @@ python train_dpo_deepspeed.py --smoke-test
 
 # Inference smoke test (no checkpoint needed)
 python infer.py --smoke-test
+
+# Hardware benchmark + estimate (instant, no GPU needed)
+python benchmark_tune.py --quick
 ```
 
 ---
@@ -3243,6 +3247,83 @@ echo "=== Done ==="
 
 ---
 
+## 21. Hardware Benchmark & Hyperparameter Tuning
+
+`benchmark_tune.py` profiles your hardware and recommends optimal hyperparameters for every training stage. It supports two modes: a fast analytical estimate (no training needed) and real training benchmarks using synthetic data.
+
+### Quick Start
+
+```bash
+# Instant hardware detection + model size ceiling estimate
+python benchmark_tune.py --quick
+
+# Run all real training benchmarks (15-30 min on a 4090)
+python benchmark_tune.py --full
+
+# Fast benchmarks with minimal trials (2 per stage, ~5 min total)
+python benchmark_tune.py --full --fast
+
+# Benchmark a specific stage
+python benchmark_tune.py --pretrain
+python benchmark_tune.py --sft
+python benchmark_tune.py --grpo
+python benchmark_tune.py --dpo
+```
+
+### Modes
+
+| Mode | Description | Runtime |
+|------|-------------|---------|
+| `--quick` | Hardware detection + analytical model ceiling estimation only | < 1s |
+| `--pretrain` | Benchmark batch sizes (1,2,4,8) + Adam vs Muon via real training | ~2-5 min |
+| `--sft` | Benchmark LoRA ranks (0/full, 16, 32, 64) | ~2-5 min |
+| `--grpo` | Benchmark num-generations (2, 4, 8) | ~2-5 min |
+| `--dpo` | Benchmark batch sizes (1, 2, 4) | ~2-5 min |
+| `--full` | Run all training benchmarks | ~15-30 min |
+| *(default)* | Same as `--quick` | < 1s |
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--fast` | off | Minimal trials (faster, less accurate) |
+| `--tokenizer PATH` | auto | Use existing tokenizer (skip tokenizer benchmark) |
+| `--output-dir PATH` | `./benchmark_results` | Report output directory |
+| `--keep-files` | off | Don't clean up `/tmp/benchmark_tune/` |
+| `--json` | off | Also emit structured JSON report |
+| `--model-size SIZE` | `0.3B` | Model size for training benchmarks |
+
+### Output
+
+The script generates a text report (and optional JSON) with:
+
+1. **Hardware Profile** — GPU name, VRAM, CPU RAM, core count
+2. **Model Size Ceiling** — Maximum feasible model size for AdamW and Muon, with and without gradient checkpointing
+3. **Benchmark Results** — Throughput (tokens/s) and peak VRAM per configuration
+4. **Recommended Pipeline Commands** — Ready-to-run bash commands with optimal flags for every stage
+5. **Tips** — Hardware-specific guidance
+
+### Examples
+
+```bash
+# Analytical estimate on a 4090
+python benchmark_tune.py --quick
+
+# Full benchmark + JSON report, saved to custom directory
+python benchmark_tune.py --full --fast --json --output-dir ./my_bench
+
+# Override model size for benchmarks (try 0.6B if 0.3B fits comfortably)
+python benchmark_tune.py --pretrain --model-size 0.6B
+```
+
+### How It Works
+
+- **Analytical mode** (`--quick`): Uses closed-form formulas to estimate VRAM per parameter (12 bytes for AdamW, ~4 bytes for Muon) with activation memory scaling. No training required.
+- **Benchmark mode** (`--pretrain`/`--sft`/etc.): Generates synthetic JSONL data, trains a tiny BPE tokenizer (vocab_size=4096), packs data via the standard packers, then runs the actual training script as a subprocess with `--num-steps 30-50`. VRAM is monitored via a background thread polling `nvidia-smi` every 200ms.
+- **Safety**: All temporary data goes under `/tmp/benchmark_tune/` and is cleaned up unless `--keep-files`. Each benchmark run is capped at 50 steps. Training benchmarks are opt-in (default is `--quick` only).
+
+---
+
 ## Appendix A: Full CLI Reference
 
 Every script has a `--help` flag for the complete list of arguments:
@@ -3258,6 +3339,7 @@ python train_grpo.py --help                  # GRPO
 python train_grpo_deepspeed.py --help        # GRPO (DeepSpeed)
 python train_dpo.py --help                   # DPO
 python train_dpo_deepspeed.py --help         # DPO (DeepSpeed)
+python benchmark_tune.py --help              # Hardware benchmark & tuning
 python infer.py --help                       # Inference
 python ollama_judge.py --help                # DPO preference generation
 python data/pack_pretrain.py --help          # Pretrain data packing

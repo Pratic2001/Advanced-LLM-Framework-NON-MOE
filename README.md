@@ -281,6 +281,7 @@ python infer.py --smoke-test
 | **GRPO (DS)** | `train_grpo_deepspeed.py` | Same + DeepSpeed |
 | **DPO (DDP)** | `train_dpo.py` | Direct Preference Optimization |
 | **DPO (DS)** | `train_dpo_deepspeed.py` | Same + DeepSpeed |
+| **Benchmark** | `benchmark_tune.py` | Hardware benchmark & hyperparameter recommendation for all stages |
 | **Inference** | `infer.py` | Streaming, quantized, REPL, batched |
 | **Ollama Judge** | `ollama_judge.py` | Remote Ollama judge for DPO pair generation |
 | **Optimizer** | `optim/build_optimizer.py` | AdamW, FusedAdam, Muon |
@@ -309,6 +310,7 @@ python infer.py --smoke-test
 ├── recipe.py                      # TrainingRecipe (templates, tokens)
 ├── recipe.json                    # Sample recipe
 ├── tokenizer_train.py             # BBPE tokenizer trainer
+├── benchmark_tune.py              # Hardware benchmark & hyperparameter recommendation
 │
 ├── train_pretrain.py              # Pretrain — torch DDP
 ├── train_pretrain_deepspeed.py    # Pretrain — DeepSpeed
@@ -448,6 +450,7 @@ python train_pretrain.py --help
 python train_sft.py --help
 python train_grpo.py --help
 python train_dpo.py --help
+python benchmark_tune.py --help
 python infer.py --help
 python webscrapped_dataset_curator_AI_MCP/agent/codegen_pipeline.py --help
 python webscrapped_dataset_curator_AI_MCP/agent/hf_to_packed.py --help
