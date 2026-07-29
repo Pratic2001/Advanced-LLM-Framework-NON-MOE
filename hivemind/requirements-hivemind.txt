@@ -1,0 +1,8 @@
+# Hivemind — Decentralized heterogeneous multi-node training
+# Pin to a known-good version for API stability.
+hivemind>=1.1.0
+
+# Core framework dependencies (same as parent project)
+torch>=2.4.0
+numpy>=1.24
+einops>=0.7
