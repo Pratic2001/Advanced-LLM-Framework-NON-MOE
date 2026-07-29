@@ -1517,7 +1517,7 @@ def parse_args():
 
     # model
     p.add_argument("--model-size", default="0.6B",
-                   help="Target size passed to ModelConfig.from_target_size")
+                   help="Target size passed to ModelConfig.from_target_size (e.g. '0.6B', '70B', '1T')")
     p.add_argument("--max-seq-len", type=int, default=None,
                    help="Maximum position embeddings (default 8192). "
                         "Separate from --seq-len so the model can later "

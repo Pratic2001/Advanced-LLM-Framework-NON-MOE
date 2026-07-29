@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"/>
   <img src="https://img.shields.io/badge/torch-2.4%2B-orange" alt="PyTorch 2.4+"/>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"/>
-  <img src="https://img.shields.io/badge/model%20size-0.3B%20to%2014B-purple" alt="0.3B to 14B"/>
+  <img src="https://img.shields.io/badge/model%20size-10M%20to%201T%2B-purple" alt="10M to 1T+"/>
   <img src="https://img.shields.io/badge/deepspeed-ready-brightgreen" alt="DeepSpeed Ready"/>
   <img src="https://img.shields.io/badge/LoRA%2FDoRA-supported-yellow" alt="LoRA/DoRA"/>
   <img src="https://img.shields.io/badge/GRPO%2FDPO-ready-red" alt="GRPO/DPO"/>
@@ -141,7 +141,7 @@ This framework lets you **pre-train a dense transformer from scratch**, then fin
 | **Normalization** | Pre-RMSNorm (or LayerNorm) |
 | **Activation** | SwiGLU or GELU |
 | **QK-Norm** | Optional per-head QK RMSNorm before RoPE |
-| **Sizes** | Auto-sized from 0.3B → 14B via `ModelConfig.from_target_size()` |
+| **Sizes** | Auto-sized from 10M → 1T+ via `ModelConfig.from_target_size()` |
 | **Init** | Carefully tuned std scaling per layer type |
 
 ### 🏋️ Training

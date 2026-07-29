@@ -12,7 +12,9 @@ Generic dense transformer architecture supporting:
     - Component-choice fields: norm_type, mlp_type, use_qk_norm, attn_type
 
 Usage:
-    cfg = ModelConfig.from_target_size(target_params=1_700_000_000)
+    cfg = ModelConfig.from_target_size(target_params=1_700_000_000)   # 1.7B
+    cfg = ModelConfig.from_target_size(target_params=70_000_000_000)  # 70B
+    cfg = ModelConfig.from_target_size(target_params=1_000_000_000_000)  # 1T
     model = TransformerForCausalLM(cfg)
 """
 
@@ -158,6 +160,9 @@ class ModelConfig:
         Uses asymmetric param error (overshoot penalised 1.5×),
         MLP aspect-ratio check, KV-head divisibility, and
         a mild depth preference (deeper = better at same param count).
+
+        ``ref_layers`` scales with hidden_size so that large models
+        (100B+) aren't penalised for having proportionally more layers.
         """
         n_params = ModelConfig._param_count(
             vocab_size, hidden_size, intermediate_size,
@@ -178,7 +183,8 @@ class ModelConfig:
         if num_attention_heads % num_key_value_heads != 0:
             kv_penalty = 0.3
         # Depth preference: deeper models learn better per-param (at equal param count)
-        ref_layers = 28
+        # Scale ref_layers with hidden_size: calibrated at L=28 for H=4096
+        ref_layers = max(4, min(200, hidden_size // 146))
         if num_hidden_layers >= ref_layers:
             depth_score = -math.log(num_hidden_layers / ref_layers) * 0.03  # reward deeper
         else:
@@ -197,37 +203,61 @@ class ModelConfig:
     ) -> "ModelConfig":
         """
         Search for an architecture close to ``target_params`` non-embedding
-        parameters.
+        parameters. Supports the full 10M → trillions range.
 
-        Improvements over the baseline version:
-          - ``head_dim`` auto-selected per model tier (64 for < 1 B, 128 otherwise)
-            so small models don't waste parameters on oversized heads.
-          - Wider search grid (6 hidden multipliers, 5 MLP ratios,
-            +/- 4 layers in steps of 2) for better accuracy.
-          - KV-head options include 1 for sub-1 B models.
-          - The quality score uses asymmetric overshoot penalty and
-            a mild depth preference (deeper = better).
+        Scaling rules:
+          - **hidden_size**: cube-root law — params ∝ H³ (for fixed depth/width
+            ratio), so H = 4096 · (target / 5B)^(1/3).
+          - **head_dim**: auto-tiered — 64 (< 200M), 128 (200M–10B),
+            192 (10B–200B), 256 (200B+).
+          - **layers**: L ≈ H / 146, calibrated so L=28 at H=4096 (≈5B model).
+          - **KV-head options**: widen with model size so very large models
+            can use more KV heads.
+          - Search grid adapts: 6 hidden multipliers × 5 MLP ratios ×
+            6–13 layer depths × 3 KV options ≈ 540–1170 candidates.
         """
-        # Auto-select head_dim based on target size
+        # ------------------------------------------------------------------
+        # Auto-select head_dim by model tier
+        # ------------------------------------------------------------------
         if head_dim is None:
-            head_dim = 64 if target_params < 1_000_000_000 else 128
+            if target_params < 200_000_000:               # 10M  – 200M
+                head_dim = 64
+            elif target_params < 10_000_000_000:          # 200M – 10B
+                head_dim = 128
+            elif target_params < 200_000_000_000:         # 10B  – 200B
+                head_dim = 192
+            else:                                          # 200B – trillions
+                head_dim = 256
 
-        # KV-head options — small models can use 1 KV head (MQA)
-        kv_options = [1, 2, 4] if target_params < 1_000_000_000 else [2, 4, 8]
+        # ------------------------------------------------------------------
+        # KV-head options scale with model tier
+        # ------------------------------------------------------------------
+        if target_params < 200_000_000:
+            kv_options = [1, 2, 4]
+        elif target_params < 10_000_000_000:
+            kv_options = [2, 4, 8]
+        elif target_params < 200_000_000_000:
+            kv_options = [4, 8, 16]
+        else:
+            kv_options = [8, 16, 32]
 
-        # Base hidden-size estimate  (Chinchilla scaling)
-        base = int(4096 * math.sqrt(target_params / 8_000_000_000))
-        hidden = ((base + 127) // 128) * 128
+        # ------------------------------------------------------------------
+        # Base hidden-size estimate — cube-root law
+        # Calibrated: H=4096, L=28 → ~5B params (this framework's defaults)
+        # params ∝ L·H², and L ∝ H, so params ∝ H³
+        # ------------------------------------------------------------------
+        base = int(4096 * (target_params / 5_000_000_000) ** (1 / 3))
+        hidden = ((base + 127) // 128) * 128  # round to multiple of 128
 
         best: Optional[ModelConfig] = None
         best_score = float("inf")
 
-        # More granular search than the baseline
+        # Search grid — constant across tiers for simplicity
         for h_mult in [0.75, 0.875, 1.0, 1.125, 1.25, 1.375]:
             h = max(128, int(hidden * h_mult))
             h = ((h + 63) // 64) * 64
 
-            # Attention heads
+            # Attention heads = hidden_size / head_dim
             H = max(2, h // head_dim)
             if target_params >= 1_000_000_000:
                 H = ((H + 3) // 4) * 4  # round to multiple of 4 for GPU tensor cores
@@ -238,10 +268,21 @@ class ModelConfig:
                 if H % kv != 0:
                     continue
 
-                # Layers proportional to hidden_size  (more granular: +/-4 in steps of 2)
-                L_base = max(6, int(28 * (h / 2048) * depth_mult))
+                # Layers proportional to hidden_size
+                # Calibrated: H=4096 → L≈28, so L = H / 146
+                L_base = max(4, int(h / 146 * depth_mult))
 
-                for L in range(max(4, L_base - 4), L_base + 8, 2):
+                # Search window widens for larger models
+                if h < 4096:
+                    layer_window = 4
+                elif h < 8192:
+                    layer_window = 6
+                else:
+                    layer_window = 8
+                L_start = max(1, L_base - layer_window)
+                L_end = L_base + 2 * layer_window + 1  # inclusive
+
+                for L in range(L_start, L_end, 2):
                     for mlp_ratio in [2.5, 2.75, 3.0, 3.25, 3.5]:
                         inter = int(h * mlp_ratio)
                         inter = ((inter + 63) // 64) * 64
@@ -280,8 +321,10 @@ class ModelConfig:
 
     @staticmethod
     def parse_param_count(value: str) -> int:
-        """Parse '0.6B', '1.7B', '600M' → integer parameter count."""
+        """Parse '0.6B', '1.7B', '600M', '1T', '3T' → integer parameter count."""
         s = value.strip().upper().replace(" ", "")
+        if s.endswith("T"):
+            return int(float(s[:-1]) * 1_000_000_000_000)
         if s.endswith("B"):
             return int(float(s[:-1]) * 1_000_000_000)
         if s.endswith("M"):
@@ -1032,18 +1075,34 @@ def smoke_test():
 
 
 if __name__ == "__main__":
-    # Run architecture search
-    for target in [300_000_000, 600_000_000, 1_700_000_000, 4_000_000_000, 8_000_000_000]:
-        cfg = ModelConfig.from_target_size(target)
-        n = ModelConfig._param_count(
-            cfg.vocab_size, cfg.hidden_size, cfg.intermediate_size,
-            cfg.num_hidden_layers, cfg.num_attention_heads,
-            cfg.num_key_value_heads, cfg.head_dim,
-        )
-        print(f"  target={cfg.parse_param_count(str(target)):,} → "
-              f"H={cfg.hidden_size} L={cfg.num_hidden_layers} "
-              f"heads={cfg.num_attention_heads} kv={cfg.num_key_value_heads} "
-              f"I={cfg.intermediate_size} → N={n:,} (err={abs(n-target)/target*100:.1f}%)")
+    # Run architecture search across 10M → 3T
+    test_cases = [
+        ("10M", 10_000_000),
+        ("100M", 100_000_000),
+        ("300M", 300_000_000),
+        ("1.7B", 1_700_000_000),
+        ("8B", 8_000_000_000),
+        ("70B", 70_000_000_000),
+        ("300B", 300_000_000_000),
+        ("1T", 1_000_000_000_000),
+        ("3T", 3_000_000_000_000),
+    ]
+    for label, target in test_cases:
+        try:
+            cfg = ModelConfig.from_target_size(target)
+            n = ModelConfig._param_count(
+                cfg.vocab_size, cfg.hidden_size, cfg.intermediate_size,
+                cfg.num_hidden_layers, cfg.num_attention_heads,
+                cfg.num_key_value_heads, cfg.head_dim,
+            )
+            err = abs(n - target) / target * 100
+            print(f"  {label:>5s} ({target:>13,}) → "
+                  f"H={cfg.hidden_size:>6} L={cfg.num_hidden_layers:>3} "
+                  f"heads={cfg.num_attention_heads:>3} kv={cfg.num_key_value_heads:>2} "
+                  f"D={cfg.head_dim:>3} I={cfg.intermediate_size:>8} → "
+                  f"N={n:>13,} (err={err:.1f}%)")
+        except Exception as e:
+            print(f"  {label:>5s} ({target:>13,}) → ERROR: {e}")
 
-    # Smoke test
+    print()
     smoke_test()

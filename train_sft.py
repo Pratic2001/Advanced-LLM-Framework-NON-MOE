@@ -753,7 +753,7 @@ def main():
 
     # --- model ---
     p.add_argument("--model-size",     default=None,
-                   help="Target model size (e.g. '1.7B'); creates model from "
+                   help="Target model size (e.g. '1.7B', '70B', '300B', '1T'); creates model from "
                         "scratch using ModelConfig.from_target_size when no "
                         "--checkpoint-dir is given")
 

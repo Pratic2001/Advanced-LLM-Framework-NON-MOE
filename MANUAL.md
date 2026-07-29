@@ -1631,19 +1631,23 @@ config = ModelConfig.from_target_size(target_params=1_700_000_000)
 ```
 
 The auto-sizer searches over hidden sizes, layers, and heads to find a
-configuration closest to the target parameter count while respecting
-constraints (head_dim=128, num_kv_heads = num_attention_heads / 4).
+configuration closest to the target parameter count. It uses cube-root
+scaling (params ∝ H³), auto-tiered head_dim, and adaptive layer search
+to support the full 10M → trillions range.
 
 ### Supported Configurations
 
-| Model Size | Layers | Hidden | Heads | KV Heads | Intermediate | Typical GPU |
-|---|---|---|---|---|---|---|
-| 0.3B | 24 | 1024 | 8 | 2 | 3072 | RTX 4090 (24 GB) |
-| 0.6B | 24 | 1536 | 12 | 3 | 4608 | RTX 4090 (24 GB) |
-| 1.7B | 28 | 2048 | 16 | 4 | 6144 | A100-40GB / 2× RTX 4090 |
-| 4B | 32 | 2560 | 20 | 5 | 7680 | A100-80GB / 2× A100-40GB |
-| 8B | 36 | 3584 | 28 | 7 | 10752 | H100 / 4× A100-40GB |
-| 14B | 40 | 4096 | 32 | 8 | 12288 | 8× A100-40GB |
+| Model Size | Layers | Hidden | Heads | KV Heads | Head Dim | Intermediate | Typical GPU |
+|---|---|---|---|---|---|---|---|
+| 10M | 3 | 576 | 9 | 1 | 64 | 1,472 | CPU / laptop |
+| 100M | 12 | 896 | 14 | 1 | 64 | 2,496 | CPU / laptop |
+| 300M | 16 | 1,280 | 10 | 2 | 128 | 3,840 | RTX 4090 (24 GB) |
+| 600M | 18 | 1,792 | 14 | 2 | 128 | 4,928 | RTX 4090 (24 GB) |
+| 1.7B | 25 | 2,624 | 20 | 4 | 128 | 6,592 | A100-40GB / 2× RTX 4090 |
+| 8B | 41 | 4,288 | 36 | 2 | 128 | 11,840 | H100 / 4× A100-40GB |
+| 70B | 68 | 9,984 | 52 | 4 | 192 | 27,456 | 8× H100 |
+| 300B | 102 | 16,128 | 64 | 32 | 256 | 44,352 | Multi-node |
+| 1T | 162 | 24,064 | 96 | 16 | 256 | 66,176 | Multi-node
 
 ### Flash Attention
 

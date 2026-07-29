@@ -1667,7 +1667,7 @@ def parse_args():
 
     # Model
     p.add_argument("--model-size", type=str, default=None,
-                   help="e.g. '1.7B', '7B' — uses ModelConfig.from_target_size()")
+                   help="e.g. '1.7B', '70B', '1T' — uses ModelConfig.from_target_size()")
 
     # Recipe
     add_recipe_args(p)

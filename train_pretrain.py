@@ -1480,7 +1480,7 @@ def parse_args() -> argparse.Namespace:
 
     # ---- model
     p.add_argument("--model-size", default=None,
-                   help="Target model size (e.g. '0.6B', '1.7B', '600M'). "
+                   help="Target model size (e.g. '600M', '1.7B', '70B', '1T'). "
                         "When set, model architecture is auto-derived.")
     p.add_argument("--vocab-size", type=int, default=None,
                    help="Override vocabulary size (read from meta.json if not set).")
