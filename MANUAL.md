@@ -2908,18 +2908,23 @@ python train_pretrain.py \
     --output-dir ./checkpoints_pretrain
 ```
 
-**VRAM breakdown during pretrain (~10.5 GB):**
+**VRAM breakdown during pretrain (~10-12 GB peak):**
 
-| Component | Memory |
-|-----------|--------|
-| Model weights (bf16) | ~700 MB |
-| Optimizer (Adam, fp32) | ~2.1 GB |
-| Gradients (bf16) | ~700 MB |
-| Activations (checkpointed) | ~4-5 GB |
-| CUDA context, buffers | ~2 GB |
-| **Total** | **~10.5 GB** |
+Training memory has two phases: the **forward pass** (storing activations for backward) and the **backward pass** (computing gradients). During backward, PyTorch temporarily allocates gradient-computation buffers while still holding activations, creating a peak ~1.5× higher than the forward-only steady state. Gradient checkpointing mitigates this by trading memory for ~33% more compute.
 
-> **If you run low on VRAM:** lower `--batch-size` to 2, add `--gradient-accumulation-steps 8`, or set `--gradient-checkpointing` (already on above).
+| Component | Phase | Memory |
+|-----------|-------|--------|
+| Model weights (bf16) | Persistent | ~700 MB |
+| Gradients (bf16) | Backward only | ~700 MB |
+| Adam momentum (fp32) | Persistent | ~1.4 GB |
+| Adam variance (fp32) | Persistent | ~1.4 GB |
+| Activations (checkpointed, stored) | Forward+Backward | ~1-2 GB |
+| Backward recomputation spike temp buffers | Backward peak | ~1-2 GB |
+| Gradient computation temps (FFN/Attn matmuls) | Backward peak | ~0.5-1 GB |
+| CUDA context, kernels, caching allocator slack | Persistent | ~1.5-2.5 GB |
+| **Estimated peak** | **Backward** | **~10-12 GB** |
+
+> **If you run low on VRAM:** lower `--batch-size` to 2 (halves activation memory), double `--gradient-accumulation-steps` to 8 to keep effective batch size the same, or reduce `--max-seq-len` to 1024.
 
 **Expected output after 5K steps** (≈30-60 minutes depending on disk I/O):
 - Loss should drop from ~11 → ~4-5
@@ -2998,7 +3003,12 @@ python train_grpo.py \
     --output-dir ./checkpoints_grpo
 ```
 
-> **⚠️ GRPO on a 4090:** GRPO generates K completions per prompt (default K=4), which multiplies activation memory. With `--batch-size 2` and gradient checkpointing, this uses ~14 GB VRAM. If you see OOM, set `--batch-size 1` or reduce the prompt length with `--max-seq-len 1024`.
+> **⚠️ GRPO on a 4090 — memory inflation:** GRPO has two distinct memory phases:
+>
+> 1. **Roll-out** (generates K=4 completions per prompt): Activation memory scales by ~5× because the model processes 1 prompt + 4 generated sequences. This adds a temporary ~2-3 GB spike. Flash Attention helps but doesn't eliminate it.
+> 2. **Training** (policy gradient on the completions): Normal backward pass with gradient-checkpointing, similar to SFT.
+>
+> With `--batch-size 2`, roll-out peaks at ~14-16 GB, then training settles to ~12-14 GB. The headroom is tight but safe (~8-10 GB). **If you see OOM**, it will happen during the first roll-out step — reduce with `--batch-size 1` and increase `--gradient-accumulation-steps 8` to compensate.
 
 ### 20J. Step 7 — DPO with LoRA (Preference Optimization)
 
@@ -3072,17 +3082,35 @@ python infer.py \
 
 Use this table to pick safe batch sizes for your GPU:
 
-| Model Size | VRAM | Batch Size | Grad Accum | LoRA? | Grad CKPT? | Est. VRAM Use |
-|-----------|------|-----------|------------|-------|-----------|--------------|
-| ~350M | 24 GB | 4 | 4 | No | Yes | ~10.5 GB |
-| ~350M | 24 GB | 2 | 8 | No | Yes | ~8 GB |
-| ~350M | 24 GB | 4 | 4 | Yes (SFT) | Yes | ~7 GB |
-| ~350M | 24 GB | 1 | 8 | Yes (GRPO) | Yes | ~12 GB |
-| ~350M | 24 GB | 2 | 4 | Yes (DPO) | Yes | ~12 GB |
-| ~1B | 24 GB | 2 | 4 | No | Yes | ~18 GB |
-| ~1B | 24 GB | 2 | 8 | Yes | Yes | ~14 GB |
+| Model Size | Phase | Batch Size | Grad Accum | LoRA? | Grad CKPT? | Est. Peak VRAM | Headroom |
+|-----------|-------|-----------|------------|-------|-----------|---------------|----------|
+| ~350M | Pretrain | 4 | 4 | No | Yes | ~10-12 GB | 12-14 GB ✅ |
+| ~350M | Pretrain | 2 | 8 | No | Yes | ~8-10 GB | 14-16 GB ✅ |
+| ~350M | SFT | 2 | 8 | Yes | Yes | ~7-9 GB | 15-17 GB ✅ |
+| ~350M | GRPO | 1 | 8 | Yes | Yes | ~12-14 GB | 10-12 GB ✅ |
+| ~350M | DPO | 2 | 4 | Yes | Yes | ~12-14 GB | 10-12 GB ✅ |
+| ~1B | Pretrain | 2 | 4 | No | Yes | ~16-19 GB | 5-8 GB ⚠️ |
+| ~1B | SFT | 2 | 8 | Yes | Yes | ~12-15 GB | 9-12 GB ✅ |
 
-> **Rule of thumb:** If you hit OOM, halve `--batch-size` and double `--gradient-accumulation-steps` — the effective batch size stays the same, so training quality is unchanged.
+> **Why the ranges?** The lower end is forward-pass steady state; the upper end includes the backward-pass peak where PyTorch simultaneously holds stored activations, recomputed activations (if checkpointing), gradient computation temp buffers (matmul intermediates for every parameter's gradient), and the autograd graph for the current layer. Expect ~1.3-1.7× inflation from forward-alone to backward-peak.
+
+> **GRPO note:** GRPO's `--grpo-k 4` generates 4 completions per prompt during the roll-out phase before training. During roll-out, activation memory briefly scales by ~5× (1 prompt + 4 sequences) even with gradient checkpointing. The estimate above reflects the **training phase**; roll-out adds ~2-3 GB temporary spike. If this causes OOM, set `--batch-size 1` or reduce `--max-seq-len 1024`.
+
+> **Rule of thumb:** If you hit OOM, halve `--batch-size` and double `--gradient-accumulation-steps` — the effective batch size stays the same, so training quality is unchanged. If still OOM, reduce `--max-seq-len` or add `--gradient-checkpointing` (already on in all examples above).
+
+### Monitoring peak VRAM in real time
+
+Open a second terminal during training:
+
+```bash
+# Watch VRAM every 0.5 seconds — note the "peak" column
+watch -n 0.5 nvidia-smi
+
+# Or with more detail (process-level)
+nvidia-smi pmon -s mu -d 1
+```
+
+The peak typically hits within the first ~10 steps during the backward pass of the first batch, before PyTorch's caching allocator stabilizes. If you see usage spike near 22-23 GB and your process doesn't crash, it's fine — the allocator will reuse memory in later steps and the steady-state will be lower.
 
 ### 20M. Full Pipeline Script
 
