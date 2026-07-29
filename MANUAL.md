@@ -2886,7 +2886,7 @@ python data/pack_pretrain.py \
 
 ### 20F. Step 3 — Pretrain the ~350M Model
 
-Now train the base model. The settings below use **~11 GB VRAM** total, leaving 13 GB headroom:
+Now train the base model. These settings use **~10-12 GB VRAM** with AdamW, leaving 12-14 GB headroom:
 
 ```bash
 python train_pretrain.py \
@@ -2925,6 +2925,55 @@ Training memory has two phases: the **forward pass** (storing activations for ba
 | **Estimated peak** | **Backward** | **~10-12 GB** |
 
 > **If you run low on VRAM:** lower `--batch-size` to 2 (halves activation memory), double `--gradient-accumulation-steps` to 8 to keep effective batch size the same, or reduce `--max-seq-len` to 1024.
+
+**🔹 Better: use Muon + WSD (saves ~3 GB, converges faster)**
+
+Muon replaces AdamW's fp32 momentum/variance with a matrix-orthogonalization step that uses negligible memory. WSD (Warmup-Stable-Decay) keeps a high learning rate for most of training, only decaying at the very end — you get better convergence in fewer steps and can extend training without schedule disruption.
+
+Together they cut optimizer memory from **~2.8 GB → ~0 GB** and converge in **~60% of the steps**:
+
+```bash
+python train_pretrain.py \
+    --data-dir ./packed_pretrain \
+    --tokenizer ./tokenizer_16k \
+    --model-size 0.35B \
+    --max-seq-len 2048 \
+    --batch-size 4 \
+    --gradient-accumulation-steps 4 \
+    --max-steps 5000 \
+    --warmup-steps 200 \
+    --lr 3e-4 \
+    --gradient-checkpointing \
+    --bf16 \
+    --optim muon \                  # ← Muon: saves 2.8 GB optimizer state
+    --schedule wsd \                # ← WSD: high LR until the final decay
+    --final-coeff 0.05 \            #     decay to 5% of peak LR
+    --save-every 1000 \
+    --output-dir ./checkpoints_pretrain
+```
+
+With the saved 3 GB, you can upgrade to a **larger model** instead:
+
+```bash
+# ~600M model with Muon + WSD — still only ~11-13 GB VRAM total
+python train_pretrain.py \
+    --data-dir ./packed_pretrain \
+    --tokenizer ./tokenizer_16k \
+    --model-size 0.6B \             # ↑ bigger model, same VRAM
+    --max-seq-len 2048 \
+    --batch-size 4 \
+    --gradient-accumulation-steps 4 \
+    --max-steps 5000 \
+    --lr 3e-4 \
+    --gradient-checkpointing \
+    --bf16 \
+    --optim muon \
+    --schedule wsd \
+    --save-every 1000 \
+    --output-dir ./checkpoints_pretrain
+```
+
+> **Limitation:** Muon is designed for **pretraining only** — don't use it for SFT/GRPO/DPO. The fine-tuning stages use Adam + LoRA as shown later, which is fine because LoRA's tiny parameter count means the optimizer overhead is negligible (~80 MB).
 
 **Expected output after 5K steps** (≈30-60 minutes depending on disk I/O):
 - Loss should drop from ~11 → ~4-5
@@ -3084,8 +3133,10 @@ Use this table to pick safe batch sizes for your GPU:
 
 | Model Size | Phase | Batch Size | Grad Accum | LoRA? | Grad CKPT? | Est. Peak VRAM | Headroom |
 |-----------|-------|-----------|------------|-------|-----------|---------------|----------|
-| ~350M | Pretrain | 4 | 4 | No | Yes | ~10-12 GB | 12-14 GB ✅ |
-| ~350M | Pretrain | 2 | 8 | No | Yes | ~8-10 GB | 14-16 GB ✅ |
+| ~350M | Pretrain (Adam) | 4 | 4 | No | Yes | ~10-12 GB | 12-14 GB ✅ |
+| ~350M | Pretrain (Adam) | 2 | 8 | No | Yes | ~8-10 GB | 14-16 GB ✅ |
+| ~350M | Pretrain (**Muon**) | 4 | 4 | No | Yes | **~7-9 GB** | **15-17 GB ✅** |
+| ~600M | Pretrain (**Muon**) | 4 | 4 | No | Yes | **~11-13 GB** | **11-13 GB ✅** |
 | ~350M | SFT | 2 | 8 | Yes | Yes | ~7-9 GB | 15-17 GB ✅ |
 | ~350M | GRPO | 1 | 8 | Yes | Yes | ~12-14 GB | 10-12 GB ✅ |
 | ~350M | DPO | 2 | 4 | Yes | Yes | ~12-14 GB | 10-12 GB ✅ |
