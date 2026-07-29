@@ -73,7 +73,7 @@ from train_grpo import (                          # type: ignore[import-unchecke
     _detect_gpu_peak_tflops,
 )
 
-from model import ModelConfig, TransformerForCausalLM, count_parameters
+from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, count_parameters
 from recipe import TrainingRecipe, add_recipe_args, recipe_from_args
 
 # ── Hivemind ──────────────────────────────────────────────────────────────
@@ -247,6 +247,7 @@ def _train(
     ckpt_data = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = ModelConfig(**{k: v for k, v in ckpt_data["config"].items()
                             if k in ModelConfig.__init__.__code__.co_varnames})
+    apply_architecture_args(config, args)
 
     model = TransformerForCausalLM(config).to(device)
     model.load_state_dict(ckpt_data["model_state"])
@@ -457,6 +458,7 @@ def _train(
                     use_cache=False, num_logits_to_keep=T,
                 )
                 policy_logits = out["logits"].float()
+                mod_aux_loss = out.get("mod_aux_loss", 0.0)
             targets = full_ids[:, -T:]
             policy_logp = policy_logits.log_softmax(dim=-1).gather(
                 -1, targets.unsqueeze(-1),
@@ -471,6 +473,8 @@ def _train(
                 clip_ratio=args.clip_ratio,
                 entropy_coef=args.entropy_coeff,
             )
+            # MoD auxiliary loss
+            loss += mod_aux_loss
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(
@@ -553,6 +557,8 @@ def parse_args() -> argparse.Namespace:
                    help="Enable LoRA adapters")
     p.add_argument("--lora-rank", type=int, default=64)
     p.add_argument("--lora-alpha", type=float, default=128.0)
+
+    add_architecture_args(p)
 
     # Reference policy
     p.add_argument("--ref-policy", default="single", choices=["single", "two"],

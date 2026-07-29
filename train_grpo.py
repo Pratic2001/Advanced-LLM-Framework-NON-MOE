@@ -48,7 +48,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tokenizers import Tokenizer
 
-from model import ModelConfig, TransformerForCausalLM, count_parameters
+from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, count_parameters
 from recipe import TrainingRecipe, get_recipe, add_recipe_args, recipe_from_args
 from train_sft import SFTDataset
 
@@ -1333,6 +1333,8 @@ def train(args: argparse.Namespace):
     config = ModelConfig(**{k: v for k, v in ckpt_data["config"].items()
                             if k in ModelConfig.__init__.__code__.co_varnames})
 
+    apply_architecture_args(config, args)
+
     model = TransformerForCausalLM(config).to(device)
     model.load_state_dict(ckpt_data["model_state"])
     model.tie_weights()
@@ -1541,6 +1543,8 @@ def train(args: argparse.Namespace):
             clip_ratio=args.clip_ratio,
             entropy_coef=args.entropy_coeff,
         )
+        # MoD auxiliary loss
+        loss += out.get("mod_aux_loss", 0.0)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
@@ -1668,6 +1672,8 @@ def parse_args():
     # Model
     p.add_argument("--model-size", type=str, default=None,
                    help="e.g. '1.7B', '70B', '1T' — uses ModelConfig.from_target_size()")
+
+    add_architecture_args(p)
 
     # Recipe
     add_recipe_args(p)

@@ -66,7 +66,7 @@ import torch.nn.functional as F
 import deepspeed
 from deepspeed.utils import logger as ds_logger
 
-from model import ModelConfig, TransformerForCausalLM, count_parameters
+from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, compute_mtp_loss, count_parameters
 from optim.lr_schedule import build_scheduler
 
 
@@ -1160,6 +1160,9 @@ def train(args):
             max_position_embeddings=max_pos,
         )
 
+    # ---- architecture variant passthrough
+    apply_architecture_args(config, args)
+
     # Whether to run the forward pass under torch.autocast(bf16) instead
     # of DeepSpeed's native bf16 path (which produced a degenerate model
     # at init -- see the long comment in build_ds_config). Model parameters
@@ -1417,6 +1420,15 @@ def train(args):
             # (= one optimizer step), exactly like train.py.
             loss = _pretrain_loss(out["logits"], y,
                                   z_loss_weight=args.z_loss_weight) / args.grad_accum_steps
+            # ---- MTP (multi-token prediction) loss
+            if "mtp_logits" in out:
+                mtp_loss = compute_mtp_loss(
+                    out["mtp_logits"], y,
+                    discount=args.mtp_discount, ignore_index=-100,
+                )
+                loss = loss + mtp_loss / args.grad_accum_steps
+            # ---- MoD auxiliary loss
+            loss = loss + out.get("mod_aux_loss", 0.0) / args.grad_accum_steps
             engine.backward(loss)
 
             # Stay on GPU -- no .item() here. The single .item() per
@@ -1522,6 +1534,8 @@ def parse_args():
                    help="Maximum position embeddings (default 8192). "
                         "Separate from --seq-len so the model can later "
                         "extend to longer contexts.")
+
+    add_architecture_args(p)
 
     # data
     p.add_argument("--data-dir", default="./packed")

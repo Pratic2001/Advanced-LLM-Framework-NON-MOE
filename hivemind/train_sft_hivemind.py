@@ -50,7 +50,7 @@ _PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
-from model import ModelConfig, TransformerForCausalLM, count_parameters
+from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, compute_mtp_loss, count_parameters
 from optim.build_optimizer import build_optimizer
 from optim.lr_schedule import build_scheduler
 
@@ -117,10 +117,29 @@ def sft_loss(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
+    mtp_discount: float = 0.5,
 ) -> torch.Tensor:
-    """Standard cross-entropy SFT loss."""
-    out = model(input_ids, labels=labels, attention_mask=attention_mask)
-    return out["loss"]
+    """SFT cross-entropy loss with optional MTP and MoD auxiliary losses."""
+    out = model(input_ids, attention_mask=attention_mask)
+    logits = out["logits"]  # (B, T, V)
+    # Shift: logits[t] predicts token at t+1
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss = F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1),
+        ignore_index=-100,
+    )
+    # Multi-Token Prediction (MTP) auxiliary loss
+    if "mtp_logits" in out:
+        mtp_loss = compute_mtp_loss(
+            out["mtp_logits"], labels,
+            discount=mtp_discount, ignore_index=-100,
+        )
+        loss += mtp_loss
+    # Mixture-of-Depth (MoD) auxiliary loss
+    loss += out.get("mod_aux_loss", 0.0)
+    return loss
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +574,10 @@ def _train(
             for micro_step in range(args.grad_accum):
                 input_ids, labels, attn_mask = next(train_iter)
                 with amp_ctx:
-                    loss = sft_loss(model, input_ids, labels, attn_mask) / args.grad_accum
+                    loss = sft_loss(
+                        model, input_ids, labels, attn_mask,
+                        mtp_discount=args.mtp_discount,
+                    ) / args.grad_accum
                 loss.backward()
                 loss_accum += loss.item()
 
@@ -631,7 +653,7 @@ def _prune_ckpts(checkpoint_dir: str, keep: int = 3) -> None:
 def _build_config(args, vocab_size):
     max_pos = getattr(args, "max_seq_len", None) or 8192
     hidden_size = args.hidden_size or 2048
-    return ModelConfig(
+    config = ModelConfig(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
         intermediate_size=args.intermediate_size or hidden_size * 3,
@@ -641,6 +663,8 @@ def _build_config(args, vocab_size):
         head_dim=args.head_dim or 128,
         max_position_embeddings=max_pos,
     )
+    apply_architecture_args(config, args)
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +688,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--intermediate-size", type=int, default=None)
     p.add_argument("--head-dim", type=int, default=128)
     p.add_argument("--max-seq-len", type=int, default=None)
+
+    add_architecture_args(p)
+
     p.add_argument("--data-dir", default="./sft_packed")
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--batch-size", type=int, default=4)

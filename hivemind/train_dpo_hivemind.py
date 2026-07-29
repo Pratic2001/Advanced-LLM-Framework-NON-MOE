@@ -74,7 +74,7 @@ from train_dpo import (                          # type: ignore[import-unchecked
     _detect_gpu_peak_tflops,
 )
 
-from model import ModelConfig, TransformerForCausalLM, count_parameters
+from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, count_parameters
 from recipe import TrainingRecipe, add_recipe_args, recipe_from_args
 
 # ── Hivemind ──────────────────────────────────────────────────────────────
@@ -245,13 +245,13 @@ def validate(
         rejected_mask = rejected_mask.to(device)
 
         # Policy logprobs
-        policy_c_logp = compute_sequence_logprobs(model, chosen_ids)
-        policy_r_logp = compute_sequence_logprobs(model, rejected_ids)
+        policy_c_logp, _ = compute_sequence_logprobs(model, chosen_ids)
+        policy_r_logp, _ = compute_sequence_logprobs(model, rejected_ids)
 
         # Reference logprobs
         ref_for_logprob = ref_model if ref_model is not None else model
-        ref_c_logp = compute_sequence_logprobs(ref_for_logprob, chosen_ids)
-        ref_r_logp = compute_sequence_logprobs(ref_for_logprob, rejected_ids)
+        ref_c_logp, _ = compute_sequence_logprobs(ref_for_logprob, chosen_ids)
+        ref_r_logp, _ = compute_sequence_logprobs(ref_for_logprob, rejected_ids)
 
         _, metrics = dpo_loss(
             policy_c_logp, policy_r_logp,
@@ -305,6 +305,7 @@ def _train(
     ckpt_data = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = ModelConfig(**{k: v for k, v in ckpt_data["config"].items()
                             if k in ModelConfig.__init__.__code__.co_varnames})
+    apply_architecture_args(config, args)
 
     model = TransformerForCausalLM(config).to(device)
     model.load_state_dict(ckpt_data["model_state"])
@@ -470,15 +471,16 @@ def _train(
 
             # 2. reference log-probs (no_grad) ─────────────────────────────
             with torch.no_grad():
-                ref_c_logp = compute_sequence_logprobs(ref_for_logprob, chosen_ids)
-                ref_r_logp = compute_sequence_logprobs(ref_for_logprob, rejected_ids)
+                ref_c_logp, _ = compute_sequence_logprobs(ref_for_logprob, chosen_ids)
+                ref_r_logp, _ = compute_sequence_logprobs(ref_for_logprob, rejected_ids)
 
             # 3. policy log-probs (with grad) ──────────────────────────────
             with ctx:
                 if _use_cudagraphs:
                     torch.compiler.cudagraph_mark_step_begin()
-                policy_c_logp = compute_sequence_logprobs(model, chosen_ids)
-                policy_r_logp = compute_sequence_logprobs(model, rejected_ids)
+                policy_c_logp, c_mod_aux = compute_sequence_logprobs(model, chosen_ids)
+                policy_r_logp, r_mod_aux = compute_sequence_logprobs(model, rejected_ids)
+                mod_aux_loss = c_mod_aux + r_mod_aux
 
             # 4. DPO loss ─────────────────────────────────────────────────
             loss, metrics = dpo_loss(
@@ -489,6 +491,8 @@ def _train(
                 label_smoothing=args.label_smoothing,
                 clip_ratio=args.clip_ratio if args.clip_ratio > 0 else None,
             )
+            # MoD auxiliary loss
+            loss += mod_aux_loss
 
             # 5. backward + step ──────────────────────────────────────────
             optimizer.zero_grad(set_to_none=True)
@@ -585,6 +589,8 @@ def parse_args() -> argparse.Namespace:
                    help="Enable LoRA adapters")
     p.add_argument("--lora-rank", type=int, default=64)
     p.add_argument("--lora-alpha", type=float, default=128.0)
+
+    add_architecture_args(p)
 
     # Reference policy
     p.add_argument("--ref-policy", default="single", choices=["single", "two"],

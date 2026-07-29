@@ -69,7 +69,7 @@ _PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
-from model import ModelConfig, TransformerForCausalLM, count_parameters
+from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, compute_mtp_loss, count_parameters
 from optim.build_optimizer import build_optimizer
 from optim.lr_schedule import build_scheduler
 
@@ -174,6 +174,7 @@ def _build_config(args: argparse.Namespace, vocab_size: int) -> ModelConfig:
             head_dim=args.head_dim or 128,
             max_position_embeddings=max_pos,
         )
+    apply_architecture_args(config, args)
     return config
 
 
@@ -450,10 +451,25 @@ def _train(
                 with amp_ctx:
                     if _use_cudagraphs:
                         torch.compiler.cudagraph_mark_step_begin()
-                    loss = pretrain_loss(
-                        model, x, y, pad_id=0,
-                        z_loss_weight=args.z_loss_weight,
+                    out = model(x)
+                    logits = out["logits"]
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        y.reshape(-1),
+                        ignore_index=0,
                     ) / args.grad_accum
+                    # Z-loss for stabilising logit magnitudes
+                    if args.z_loss_weight > 0:
+                        loss += args.z_loss_weight * logits.float().square().mean() / args.grad_accum
+                    # Multi-Token Prediction (MTP) auxiliary loss
+                    if "mtp_logits" in out:
+                        mtp_loss = compute_mtp_loss(
+                            out["mtp_logits"], y,
+                            discount=args.mtp_discount, ignore_index=0,
+                        )
+                        loss += mtp_loss / args.grad_accum
+                    # Mixture-of-Depth (MoD) auxiliary loss
+                    loss += out.get("mod_aux_loss", 0.0) / args.grad_accum
                 loss.backward()
 
                 loss_accum = loss_accum + loss.detach()
@@ -682,6 +698,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--intermediate-size", type=int, default=None)
     p.add_argument("--head-dim", type=int, default=128)
     p.add_argument("--max-seq-len", type=int, default=None)
+
+    add_architecture_args(p)
 
     # ---- data ---------------------------------------------------------------
     p.add_argument("--data-dir", default="./packed",

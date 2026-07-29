@@ -90,7 +90,7 @@ import torch.nn.functional as F
 
 import deepspeed
 
-from model import ModelConfig, TransformerForCausalLM, count_parameters
+from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, compute_mtp_loss, count_parameters
 from optim.lr_schedule import build_scheduler
 from recipe import TrainingRecipe, get_recipe, add_recipe_args, recipe_from_args
 from peft.lora import (
@@ -1025,6 +1025,9 @@ def train(args):
     model.load_state_dict(base_state)
     model.tie_weights()
 
+    # ---- architecture variant passthrough
+    apply_architecture_args(config, args)
+
     is_lora = args.lora_rank > 0
     lora_type = getattr(args, "lora_type", "lora")
     target_modules = getattr(args, "lora_target_modules",
@@ -1242,6 +1245,15 @@ def train(args):
                 # Z-loss: penalise large logits for training stability
                 if args.z_loss_weight > 0:
                     loss = loss + (args.z_loss_weight * out["logits"].float().square().mean() / args.grad_accum_steps)
+                # ---- MTP (multi-token prediction) loss
+                if "mtp_logits" in out:
+                    mtp_loss = compute_mtp_loss(
+                        out["mtp_logits"], y,
+                        discount=args.mtp_discount, ignore_index=-100,
+                    )
+                    loss = loss + mtp_loss / args.grad_accum_steps
+                # ---- MoD auxiliary loss
+                loss = loss + out.get("mod_aux_loss", 0.0)
 
             engine.backward(loss)
             loss_accum += loss.item()
@@ -1403,6 +1415,8 @@ def parse_args():
     p.add_argument("--gradient-checkpointing", action="store_true",
                    help="Recompute activations on backward (~35% less VRAM)")
     p.add_argument("--seed", type=int, default=42)
+
+    add_architecture_args(p)
 
     # ZeRO / offload
     p.add_argument("--zero-stage", type=int, default=None,

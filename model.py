@@ -101,6 +101,21 @@ class ModelConfig:
         # Derived
         self.num_key_value_groups = num_attention_heads // num_key_value_heads
 
+        # ----------------------------------------------------------
+        # Variant architecture fields (all with defaults for backward compat)
+        # ----------------------------------------------------------
+        self.arch_type: str = "dense"              # "dense" | "jamba"
+        self.layer_type: str = "sequential"        # "sequential" | "parallel"
+        self.sliding_window_size: int = 0          # 0=disabled, >0=window
+        self.use_mla: bool = False
+        self.kv_lora_rank: Optional[int] = None    # latent dim for MLA
+        self.num_mtp_heads: int = 0                # multi-token prediction heads
+        self.mtp_discount: float = 0.5             # discount per future token
+        self.mod_alpha: float = 0.0                # mixture-of-depth threshold (0=off)
+        self.mod_loss_weight: float = 0.01         # MoD aux loss weight
+        self.jamba_hybrid_layer_interval: int = 4  # Mamba every N layers
+        # rope_scaling is already set above (line 90)
+
         # Absorb any extra kwargs (forward compat)
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -386,12 +401,41 @@ class RotaryEmbedding(nn.Module):
     """
     Rotary Position Embeddings (RoPE).
     Applies rotation to query and key tensors based on position indices.
+
+    Supports optional YaRN / NTK-aware frequency scaling via ``rope_scaling``:
+        ``{"type": "yarn", "factor": 8.0}``
+        ``{"type": "ntk", "factor": 8.0}``
     """
 
-    def __init__(self, head_dim: int, theta: float = 1000000.0):
+    def __init__(self, head_dim: int, theta: float = 1000000.0,
+                 rope_scaling: Optional[Dict] = None):
         super().__init__()
         self.head_dim = head_dim
+        self.rope_scaling = rope_scaling
+
         inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+
+        # Apply frequency scaling for YaRN / NTK
+        if rope_scaling is not None:
+            scaling_type = rope_scaling.get("type", "")
+            factor = rope_scaling.get("factor", 1.0)
+            if factor <= 0:
+                factor = 1.0
+            if scaling_type == "ntk":
+                # NTK-aware: scale each frequency differently
+                # Higher frequencies are scaled less → better high-frequency preservation
+                dim = torch.arange(0, head_dim, 2, dtype=torch.float32)
+                inv_freq = 1.0 / (
+                    (theta * (factor ** (dim / (head_dim - 2)))) ** (dim / head_dim)
+                )
+            elif scaling_type == "yarn":
+                # YaRN: simple frequency scaling + attention logit scaling
+                inv_freq = inv_freq / factor
+                self.yarn_scale = max(1.0, 0.1 * math.log(factor) + 1.0)
+            else:
+                # Linear / default scaling
+                inv_freq = inv_freq / factor
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _compute_cos_sin(self, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -454,6 +498,42 @@ class RotaryEmbedding(nn.Module):
 
 
 # ======================================================================
+# Sliding Window helper
+# ======================================================================
+
+
+_SW_MASK_CACHE: Dict[Tuple[int, int, str], torch.Tensor] = {}
+
+def _build_sliding_window_mask(
+    seq_len: int,
+    window_size: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    Build a causal + sliding-window attention mask.
+
+    Caches masks keyed by ``(seq_len, window_size, device)`` so repeated calls
+    with the same shape avoid redundant ``torch.arange`` + ``torch.where``.
+
+    Returns ``(1, 1, T, T)`` float additive mask:
+        mask[i, j] = 0   if i >= j and i - j < window_size
+        mask[i, j] = -inf  otherwise
+    """
+    key = (seq_len, window_size, str(device))
+    if key in _SW_MASK_CACHE:
+        cached = _SW_MASK_CACHE[key]
+        if cached.dtype == dtype and cached.device == device:
+            return cached
+    i = torch.arange(seq_len, device=device).unsqueeze(1)
+    j = torch.arange(seq_len, device=device).unsqueeze(0)
+    mask = torch.where((i >= j) & (i - j < window_size), 0.0, float("-inf"))
+    mask = mask.to(dtype=dtype).view(1, 1, seq_len, seq_len)
+    _SW_MASK_CACHE[key] = mask
+    return mask
+
+
+# ======================================================================
 # Attention (GQA + QK-Norm + SDPA)
 # ======================================================================
 
@@ -466,7 +546,7 @@ class Attention(nn.Module):
     Supports both GQA (num_kv_heads < num_heads) and MHA (num_kv_heads == num_heads).
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, sliding_window_size: int = 0):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -477,6 +557,7 @@ class Attention(nn.Module):
         self.use_qk_norm = config.use_qk_norm
         self.attn_type = config.attn_type
         self.attention_dropout = config.attention_dropout
+        self.sliding_window_size = sliding_window_size
 
         # Projections
         self.q_proj = nn.Linear(
@@ -559,43 +640,62 @@ class Attention(nn.Module):
         if k.dtype != v.dtype:
             k = k.to(v.dtype)
 
-        # Scale factor for SDPA
+        # Scale factor for SDPA (YaRN applies an additional temperature scaling)
         scale = 1.0 / math.sqrt(self.head_dim)
+        if (self.config.rope_scaling is not None
+                and self.config.rope_scaling.get("type") == "yarn"):
+            yarn_factor = self.config.rope_scaling.get("factor", 1.0)
+            if yarn_factor > 1.0:
+                yarn_temp = 0.1 * math.log(yarn_factor) + 1.0
+                scale /= yarn_temp
 
-        # Determine if we can use is_causal fast path
-        is_causal = (
-            attention_mask is None
-            and past_key_value is None
-            and T > 1
-        )
+        # Determine if we can use the is_causal fast path
+        # Sliding window forces an explicit mask (no is_causal shortcut)
+        if self.sliding_window_size > 0:
+            current_len = k.shape[2]  # total length after KV-cache
+            sw_mask = _build_sliding_window_mask(
+                current_len, self.sliding_window_size, q.device, q.dtype
+            )
+            # Select the last T query positions from the full mask
+            attn_mask = sw_mask[:, :, -T:, :]
+            if attention_mask is not None:
+                # Combine padding mask (B, 1, 1, T) with sliding window mask (1, 1, T, T)
+                attn_mask = attention_mask + attn_mask
+            is_causal = False
+        elif attention_mask is not None:
+            attn_mask = attention_mask
+            is_causal = False
+        else:
+            attn_mask = None
+            is_causal = (past_key_value is None and T > 1)
 
-        # Explicitly pin the SDPA backend instead of letting PyTorch choose.
-        # Once we pass a custom float attn_mask (needed for left-padding),
-        # the flash-attention kernel is unavailable — fine, we want the
-        # memory-efficient (xFormers-style) kernel in that case, which is
-        # still ~linear in seq_len. What we must NOT allow is a silent
-        # fallback to the naive "math" kernel: that materializes the full
-        # (batch, heads, seq_len, seq_len) attention-probability matrix and
-        # keeps it around for backward on every layer, turning what should
-        # be linear memory into quadratic.
+        # Explicitly pin the SDPA backend to avoid a silent fallback to the
+        # naive "math" kernel that materialises the full attention matrix.
+        # Explicitly pin the SDPA backend to avoid a silent fallback to the
+        # naive "math" kernel that materialises the full attention matrix.
+        # On CPU we keep math as a last-resort fallback.
         backend_ctx = nullcontext()
         try:
             from torch.nn.attention import SDPBackend, sdpa_kernel
-            backends = ([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
-                        if is_causal else [SDPBackend.EFFICIENT_ATTENTION])
+            if is_causal:
+                backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+            else:
+                backends = [SDPBackend.EFFICIENT_ATTENTION]
+            backends.append(SDPBackend.MATH)  # always available as fallback
             backend_ctx = sdpa_kernel(backends)
         except ImportError:
-            # Older torch: same intent via the legacy context manager.
+            # Older torch: fallback via the legacy context manager.
+            # Keep math=True for CPU compatibility.
             backend_ctx = torch.backends.cuda.sdp_kernel(
                 enable_flash=is_causal,
-                enable_math=False,
+                enable_math=True,
                 enable_mem_efficient=True,
             )
 
         with backend_ctx:
             attn_output = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=attention_mask,
+                attn_mask=attn_mask,
                 dropout_p=self.attention_dropout if self.training else 0.0,
                 is_causal=is_causal,
                 scale=scale,
@@ -645,8 +745,344 @@ class MLP(nn.Module):
             return self.down_proj(F.gelu(self.up_proj(x)))
 
 
+def _build_attention(config: ModelConfig, sliding_window_size: int = 0) -> nn.Module:
+    """Dispatch to MLA or standard Attention based on config."""
+    if config.use_mla:
+        return MLAAttention(config, sliding_window_size=sliding_window_size)
+    return Attention(config, sliding_window_size=sliding_window_size)
+
+
 # ======================================================================
-# Decoder Layer
+# Multi-head Latent Attention (MLA) — DeepSeek-V2/V3 style
+# ======================================================================
+
+
+class MLAAttention(nn.Module):
+    """
+    Multi-head Latent Attention with low-rank KV joint compression.
+
+    Instead of projecting K and V independently, MLA compresses them into a
+    low-dimensional latent ``kv_c`` and expands on-the-fly. RoPE is applied
+    only to a decoupled ``rope_dim`` subset of dimensions (the "rope" part);
+    the remaining dimensions carry no position information ("nope").
+
+    KV-cache stores ``(kv_c, k_rope)`` instead of ``(k, v)`` — roughly 4×
+    smaller for typical latent_rank = hidden_size/4 and rope_dim = head_dim/2.
+    """
+
+    def __init__(self, config: ModelConfig, sliding_window_size: int = 0):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.num_kv_groups = config.num_key_value_groups
+        self.attention_dropout = config.attention_dropout
+        self.sliding_window_size = sliding_window_size
+
+        # Latent rank for KV compression
+        self.latent_rank = config.kv_lora_rank or (config.hidden_size // 4)
+
+        # RoPE is only applied to a subset of each head
+        self.rope_dim = config.head_dim // 2
+        self.nope_dim = config.head_dim - self.rope_dim
+
+        # --- Query projections ---
+        # Content (nope) part:  num_heads * nope_dim
+        self.q_nope = nn.Linear(
+            config.hidden_size, self.num_heads * self.nope_dim, bias=False
+        )
+        # Decoupled RoPE part:  num_heads * rope_dim
+        self.q_rope = nn.Linear(
+            config.hidden_size, self.num_heads * self.rope_dim, bias=False
+        )
+
+        # --- KV joint compression ---
+        # Compress: hidden_size → latent_rank
+        self.kv_c = nn.Linear(config.hidden_size, self.latent_rank, bias=False)
+
+        # Expand latent → K content (nope), V content, K RoPE
+        self.k_nope = nn.Linear(
+            self.latent_rank, self.num_kv_heads * self.nope_dim, bias=False
+        )
+        self.v = nn.Linear(
+            self.latent_rank, self.num_kv_heads * self.head_dim, bias=False
+        )
+        self.k_rope = nn.Linear(
+            self.latent_rank, self.num_kv_heads * self.rope_dim, bias=False
+        )
+
+        # Output projection
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, bias=False
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
+        rotary_emb: Optional[RotaryEmbedding] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        B, T, _ = hidden_states.shape
+
+        # --- Q: split into nope + rope ---
+        q_nope = self.q_nope(hidden_states)   # (B, T, H * nope_dim)
+        q_rope = self.q_rope(hidden_states)    # (B, T, H * rope_dim)
+
+        # --- KV joint compression (current tokens) ---
+        kv_c = self.kv_c(hidden_states)        # (B, T, latent_rank)
+        # Extract pre-RoPE k_rope from current kv_c
+        k_rope_current = self.k_rope(kv_c)      # (B, T, KV * rope_dim)
+
+        # --- Apply RoPE to rope parts (current tokens only) ---
+        if rotary_emb is not None and position_ids is not None:
+            q_rope_out, k_rope_embed_current = rotary_emb(q_rope, k_rope_current, position_ids)
+        else:
+            q_rope_out = q_rope
+            k_rope_embed_current = k_rope_current
+
+        # --- KV-cache (stores compressed kv_c + post-RoPE k_rope) ---
+        # The compressed kv_c is re-expanded on every forward so we never
+        # cache the expanded k_nope or v — only the compact latent.
+        if past_key_value is not None:
+            cached_kv_c, cached_k_rope = past_key_value
+            kv_c = torch.cat([cached_kv_c, kv_c], dim=1)        # (B, P+T, latent_rank)
+            k_rope_embed = torch.cat([cached_k_rope, k_rope_embed_current], dim=1)
+        else:
+            k_rope_embed = k_rope_embed_current
+
+        past_key_value_out = (kv_c, k_rope_embed) if use_cache else None
+
+        # --- Expand compressed kv_c to k_nope and v (full seq: past + present) ---
+        k_nope_full = self.k_nope(kv_c)          # (B, P+T, KV * nope_dim)
+        v_full = self.v(kv_c)                     # (B, P+T, KV * head_dim)
+
+        # --- Assemble K = [k_nope || k_rope_embed] and V ---
+        total_len = kv_c.shape[1]
+        k = torch.cat([k_nope_full, k_rope_embed], dim=-1)  # (B, P+T, KV * head_dim)
+        k = k.view(B, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v_full.view(B, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # --- Assemble Q = [q_nope || q_rope_out] (current tokens only) ---
+        q = torch.cat([q_nope, q_rope_out], dim=-1)  # (B, T, H * head_dim)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # --- GQA: expand KV heads ---
+        if self.num_kv_heads < self.num_heads:
+            k = k.repeat_interleave(self.num_kv_groups, dim=1)
+            v = v.repeat_interleave(self.num_kv_groups, dim=1)
+
+        # Sync dtypes
+        if q.dtype != v.dtype:
+            q = q.to(v.dtype)
+        if k.dtype != v.dtype:
+            k = k.to(v.dtype)
+
+        # --- SDPA ---
+        scale = 1.0 / math.sqrt(self.head_dim)
+
+        # Sliding window mask
+        if self.sliding_window_size > 0:
+            current_len = k.shape[2]
+            sw_mask = _build_sliding_window_mask(
+                current_len, self.sliding_window_size, q.device, q.dtype
+            )
+            attn_mask = sw_mask[:, :, -T:, :]
+            if attention_mask is not None:
+                attn_mask = attention_mask + attn_mask
+            is_causal = False
+        elif attention_mask is not None:
+            attn_mask = attention_mask
+            is_causal = False
+        else:
+            attn_mask = None
+            is_causal = (past_key_value is None and T > 1)
+
+        backend_ctx = nullcontext()
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            if is_causal:
+                backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+            else:
+                backends = [SDPBackend.EFFICIENT_ATTENTION]
+            backends.append(SDPBackend.MATH)
+            backend_ctx = sdpa_kernel(backends)
+        except ImportError:
+            backend_ctx = torch.backends.cuda.sdp_kernel(
+                enable_flash=is_causal,
+                enable_math=True,
+                enable_mem_efficient=True,
+            )
+
+        with backend_ctx:
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
+                scale=scale,
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, -1)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, past_key_value_out
+
+
+# ======================================================================
+# Mixture of Depth — router + MoD decoder layer
+# ======================================================================
+
+
+class MixtureOfDepthRouter(nn.Module):
+    """
+    Per-token router for Mixture-of-Depth (MoD).
+
+    A lightweight linear layer with sigmoid activation decides whether
+    each token passes through the FFN (``score > alpha``) or takes an
+    identity shortcut (``score <= alpha``). A straight-through estimator
+    keeps gradients flowing through the hard binary mask.
+
+    An auxiliary load-balancing loss encourages roughly ``alpha`` fraction
+    of tokens to be routed through the FFN.
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.router = nn.Linear(config.hidden_size, 1, bias=False)
+        self.alpha = config.mod_alpha
+        self.last_aux_loss: torch.Tensor = torch.tensor(0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: ``(B, T, D)`` — post-normalised hidden states.
+
+        Returns:
+            ``(B, T, 1)`` binary mask (with straight-through gradients).
+            ``self.last_aux_loss`` is set as a side-effect.
+        """
+        g = torch.sigmoid(self.router(x))  # (B, T, 1)
+        # Straight-through estimator: hard mask in forward, soft gradient in backward
+        mask = (g > self.alpha).float().detach() + g - g.detach()
+        # Auxiliary loss: encourage fraction_selected ≈ alpha
+        frac = g.mean()
+        self.last_aux_loss = (frac - self.alpha) ** 2
+        return mask
+
+
+class MixtureOfDepthDecoderLayer(nn.Module):
+    """
+    Decoder layer with Mixture-of-Depth routing on the MLP sub-layer.
+
+    Attention always runs on all tokens. The MLP only processes tokens
+    whose router score exceeds ``config.mod_alpha``; skipped tokens
+    take an identity shortcut (residual-only). This saves compute while
+    keeping the attention field global.
+
+    Composes with parallel mode: when ``config.layer_type == "parallel"``,
+    attention and MLP are computed from the *same* normalised input.
+    """
+
+    def __init__(self, config: ModelConfig, sliding_window_size: int = 0):
+        super().__init__()
+        self.self_attn = _build_attention(config, sliding_window_size=sliding_window_size)
+        self.mlp = MLP(config)
+        self.input_layernorm = _build_norm(config.hidden_size, config.norm_type, config.rms_norm_eps)
+        self.post_attention_layernorm = _build_norm(config.hidden_size, config.norm_type, config.rms_norm_eps)
+        self.router = MixtureOfDepthRouter(config)
+        self.parallel = config.layer_type == "parallel"
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
+        rotary_emb: Optional[RotaryEmbedding] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        residual = hidden_states
+        normed = self.input_layernorm(hidden_states)
+
+        if self.parallel:
+            # Delegate to shared helper so the parallel forward logic is
+            # identical across :class:`ParallelDecoderLayer` and this layer.
+            return _parallel_forward(
+                self, hidden_states,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                position_ids=position_ids,
+                rotary_emb=rotary_emb,
+                router=self.router,
+            )
+
+        # Sequential mode: attn → residual → MLP (with MoD routing)
+        attn_output, present_kv = self.self_attn(
+            normed,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            position_ids=position_ids,
+            rotary_emb=rotary_emb,
+        )
+        hidden_states = residual + attn_output
+
+        residual = hidden_states
+        mlp_input = self.post_attention_layernorm(hidden_states)
+        mlp_out = self.mlp(mlp_input)
+        mask = self.router(mlp_input)
+        mlp_out = mlp_out * mask
+        hidden_states = residual + mlp_out
+        return hidden_states, present_kv
+
+
+# ======================================================================
+# Shared helper: parallel-layer forward
+# ======================================================================
+
+
+def _parallel_forward(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    use_cache: bool = False,
+    position_ids: Optional[torch.Tensor] = None,
+    rotary_emb: Optional[RotaryEmbedding] = None,
+    router: Optional[nn.Module] = None,
+) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    """
+    Parallel attention + MLP forward shared by :class:`ParallelDecoderLayer`
+    and :class:`MixtureOfDepthDecoderLayer`.
+
+    The ``layer`` must have ``self_attn``, ``mlp``, ``input_layernorm``, and
+    ``post_attention_layernorm`` attributes.  When ``router`` is provided, the
+    MLP output is gated by the router's binary mask (Mixture-of-Depth).
+    """
+    residual = hidden_states
+    hidden_states = layer.input_layernorm(hidden_states)
+    attn_output, present_kv = layer.self_attn(
+        hidden_states,
+        attention_mask=attention_mask,
+        past_key_value=past_key_value,
+        use_cache=use_cache,
+        position_ids=position_ids,
+        rotary_emb=rotary_emb,
+    )
+    mlp_output = layer.mlp(layer.post_attention_layernorm(hidden_states))
+    if router is not None:
+        mlp_output = mlp_output * router(hidden_states)
+    hidden_states = residual + attn_output + mlp_output
+    return hidden_states, present_kv
+
+
+# ======================================================================
+# Decoder layers
 # ======================================================================
 
 
@@ -656,9 +1092,9 @@ class DecoderLayer(nn.Module):
     Uses the config's norm_type for both pre-attention and pre-MLP norms.
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, sliding_window_size: int = 0):
         super().__init__()
-        self.self_attn = Attention(config)
+        self.self_attn = _build_attention(config, sliding_window_size=sliding_window_size)
         self.mlp = MLP(config)
         self.input_layernorm = _build_norm(config.hidden_size, config.norm_type, config.rms_norm_eps)
         self.post_attention_layernorm = _build_norm(config.hidden_size, config.norm_type, config.rms_norm_eps)
@@ -692,6 +1128,343 @@ class DecoderLayer(nn.Module):
         return hidden_states, present_kv
 
 
+class ParallelDecoderLayer(nn.Module):
+    """
+    Pre-norm decoder layer with **parallel** attention + MLP computation.
+
+    Instead of sequential (attn → residual → mlp → residual), this computes:
+        normed = input_layernorm(x)
+        attn_out = attention(normed)
+        mlp_out = mlp(post_attention_layernorm(normed))
+        output = x + attn_out + mlp_out
+
+    Used in PaLM. ~15% faster than sequential at the same quality.
+    """
+
+    def __init__(self, config: ModelConfig, sliding_window_size: int = 0):
+        super().__init__()
+        self.self_attn = _build_attention(config, sliding_window_size=sliding_window_size)
+        self.mlp = MLP(config)
+        self.input_layernorm = _build_norm(config.hidden_size, config.norm_type, config.rms_norm_eps)
+        self.post_attention_layernorm = _build_norm(config.hidden_size, config.norm_type, config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
+        rotary_emb: Optional[RotaryEmbedding] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        return _parallel_forward(
+            self, hidden_states,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            position_ids=position_ids,
+            rotary_emb=rotary_emb,
+        )
+
+
+# ======================================================================
+# Mamba SSM block (pure PyTorch with optional mamba_ssm CUDA kernel)
+# ======================================================================
+
+# Optional fast kernel — fall back to pure PyTorch if unavailable
+try:
+    from mamba_ssm import Mamba as MambaSSMKernel
+    _HAS_MAMBA_SSM = True
+except ImportError:
+    _HAS_MAMBA_SSM = False
+
+
+def _selective_scan_py(
+    u: torch.Tensor,
+    delta: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Pure-PyTorch sequential selective scan (Mamba-1 style).
+
+    Args:
+        u: ``(B, L, D)`` — input
+        delta: ``(B, L, D)`` — step sizes
+        A: ``(D, N)`` — state-transition matrix (neglected exponentiated)
+        B: ``(B, L, N)`` — input matrix
+        C: ``(B, L, N)`` — output matrix
+        D: ``(D,)`` — skip connection
+
+    Returns:
+        ``(B, L, D)`` — SSM output
+    """
+    batch, seq_len, dim = u.shape
+    n = A.shape[1]
+    dtype = u.dtype
+
+    # Discretise: A_bar = exp(Δ·A), B_bar = Δ·B
+    delta_A = torch.exp(delta.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))  # (B, L, D, N)
+    delta_B = delta.unsqueeze(-1) * B.unsqueeze(2)                          # (B, L, D, N)
+
+    h = torch.zeros(batch, dim, n, device=u.device, dtype=dtype)
+    outs: List[torch.Tensor] = []
+    for t in range(seq_len):
+        # h ← A_bar[:,t]·h + B_bar[:,t]·u[:,t]
+        h = delta_A[:, t] * h + delta_B[:, t] * u[:, t].unsqueeze(-1)
+        # y_t = C[:,t]·h + D·u[:,t]
+        y_t = (h * C[:, t].unsqueeze(1)).sum(dim=-1) + D * u[:, t]  # (B, D)
+        outs.append(y_t)
+
+    return torch.stack(outs, dim=1)
+
+
+class MambaBlock(nn.Module):
+    """
+    Mamba state-space model block (Mamba-1).
+
+    Uses ``mamba_ssm`` CUDA kernel when available; falls back to a pure
+    PyTorch sequential scan (correct but slower).
+
+    Architecture:
+        in_proj → conv1d → SiLU → selective_scan → (× SiLU(z)) → out_proj
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.d_model = config.hidden_size
+        self.d_state: int = 16
+        self.d_conv: int = 4
+        self.expand: int = 2
+        self.d_inner = self.expand * self.d_model
+
+        # Input projection: x → (x_h, z)
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=False)
+
+        # Depth-wise 1D convolution
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            kernel_size=self.d_conv,
+            groups=self.d_inner,
+            padding=self.d_conv - 1,
+            bias=False,
+        )
+
+        # Selective SSM projections
+        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2 + self.d_inner, bias=False)
+        # Δ projection with explicit bias and softplus
+        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
+        # A (log-space) and D (skip)
+        self.A_log = nn.Parameter(torch.randn(self.d_inner, self.d_state))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: ``(B, L, D)`` — hidden states.
+
+        Returns:
+            ``(B, L, D)`` — Mamba-processed output.
+        """
+        batch, seq_len, _ = x.shape
+
+        # Input projection → split into (x_h, z)
+        xz = self.in_proj(x)
+        x_h, z = xz.chunk(2, dim=-1)  # each (B, L, d_inner)
+
+        # 1D convolution (permute to channels-first)
+        x_h = x_h.permute(0, 2, 1)  # (B, d_inner, L)
+        conv = self.conv1d(x_h)[..., :seq_len]  # remove right-padding
+        conv = F.silu(conv)                     # activation
+
+        # Selective SSM
+        u = conv.permute(0, 2, 1)  # (B, L, d_inner)
+
+        # Project to Δ, B, C
+        proj = self.x_proj(u)  # (B, L, d_state*2 + d_inner)
+        B = proj[..., :self.d_state]                          # (B, L, N)
+        C = proj[..., self.d_state:self.d_state * 2]          # (B, L, N)
+        delta = F.softplus(self.dt_proj(proj[..., -self.d_inner:]))  # (B, L, D)
+
+        # Use CUDA kernel when available, pure-PyTorch fallback otherwise
+        if _HAS_MAMBA_SSM:
+            # MambaSSMKernel expects different shapes; delegate to its forward
+            y = self._mamba_ssm_fwd(u, delta, B, C)
+        else:
+            A = -torch.exp(self.A_log)  # ensure A is negative-definite
+            y = _selective_scan_py(u, delta, A, B, C, self.D)
+
+        # Gate by z and project out
+        y = y * F.silu(z)
+        return self.out_proj(y)
+
+    def _mamba_ssm_fwd(
+        self, u: torch.Tensor, delta: torch.Tensor,
+        B: torch.Tensor, C: torch.Tensor,
+    ) -> torch.Tensor:
+        """Delegate to ``mamba_ssm`` package (fast CUDA kernel)."""
+        from mamba_ssm import selective_scan_fn
+        # selective_scan_fn(u, delta, A, B, C, D, z=None, ...)
+        A = -torch.exp(self.A_log)
+        y = selective_scan_fn(
+            u.permute(0, 2, 1).contiguous(),  # (B, D, L)
+            delta.permute(0, 2, 1).contiguous(),
+            A.contiguous(),
+            B.permute(0, 2, 1).contiguous(),  # (B, N, L)
+            C.permute(0, 2, 1).contiguous(),
+            self.D.contiguous(),
+            None,  # z
+            None,  # delta_bias
+            True,  # delta_softplus
+        )
+        return y.permute(0, 2, 1)  # (B, L, D)
+
+
+# ======================================================================
+# Jamba — hybrid SSM + Attention layers
+# ======================================================================
+
+
+class JambaLayer(nn.Module):
+    """
+    A single Jamba layer that can be either an Attention layer or a Mamba
+    (SSM) layer, followed by an MLP.
+
+    Attention layers appear every ``jamba_hybrid_layer_interval`` layers
+    (e.g. every 4th). All other layers are Mamba blocks. This hybrid design
+    gives the model global context through attention while keeping most
+    layers as efficient SSMs.
+    """
+
+    def __init__(self, config: ModelConfig, layer_idx: int):
+        super().__init__()
+        self.use_attention = (layer_idx % config.jamba_hybrid_layer_interval == 0)
+
+        if self.use_attention:
+            self.sublayer = _build_attention(config)
+        else:
+            self.sublayer = MambaBlock(config)
+
+        self.mlp = MLP(config)
+        self.input_norm = _build_norm(config.hidden_size, config.norm_type, config.rms_norm_eps)
+        self.post_norm = _build_norm(config.hidden_size, config.norm_type, config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
+        rotary_emb: Optional[RotaryEmbedding] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        residual = hidden_states
+        hidden_states = self.input_norm(hidden_states)
+
+        if self.use_attention:
+            hidden_states, kv = self.sublayer(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                position_ids=position_ids,
+                rotary_emb=rotary_emb,
+            )
+        else:
+            # Mamba — no positions, no KV-cache
+            hidden_states = self.sublayer(hidden_states)
+            kv = None
+
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_norm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states, kv
+
+
+class JambaModel(nn.Module):
+    """
+    Jamba hybrid model: embeddings → JambaLayers → final norm.
+
+    Attention layers receive RotaryEmbedding; pure-Mamba layers don't
+    need positional information.
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.scale_emb = config.scale_emb
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=0)
+        self.layers = nn.ModuleList([
+            JambaLayer(config, i) for i in range(config.num_hidden_layers)
+        ])
+        self.norm = _build_norm(config.hidden_size, config.norm_type, config.rms_norm_eps)
+        self.embed_scale = 1.0 / math.sqrt(config.hidden_size) if config.scale_emb else 1.0
+        self.gradient_checkpointing = False
+
+        # Create RoPE if at least one layer uses attention
+        if any(i % config.jamba_hybrid_layer_interval == 0 for i in range(config.num_hidden_layers)):
+            self.rotary_emb = RotaryEmbedding(
+                head_dim=config.head_dim,
+                theta=config.rope_theta,
+                rope_scaling=config.rope_scaling,
+            )
+        else:
+            self.rotary_emb = None
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+        use_cache: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        hidden_states = self.embed_tokens(input_ids) * self.embed_scale
+
+        if position_ids is None and self.rotary_emb is not None:
+            if past_key_values is not None and past_key_values[0] is not None:
+                past_len = past_key_values[0][0].shape[2]
+            else:
+                past_len = 0
+            position_ids = torch.arange(
+                past_len, past_len + seq_len,
+                device=device, dtype=torch.long,
+            ).unsqueeze(0).expand(batch_size, -1)
+
+        present_kv: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
+        for i, layer in enumerate(self.layers):
+            past_kv = past_key_values[i] if past_key_values is not None else None
+            hidden_states, kv = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_value=past_kv,
+                use_cache=use_cache,
+                position_ids=position_ids,
+                rotary_emb=self.rotary_emb,
+            )
+            present_kv.append(kv)
+
+        hidden_states = self.norm(hidden_states)
+        outputs: Dict[str, Any] = {"last_hidden_state": hidden_states}
+        if use_cache:
+            outputs["past_key_values"] = present_kv
+        return outputs
+
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
+        print("[GradCkpt][Jamba] gradient checkpointing enabled")
+
+
 # ======================================================================
 # Transformer Model (base, no LM head)
 # ======================================================================
@@ -708,13 +1481,26 @@ class TransformerModel(nn.Module):
         self.config = config
         self.scale_emb = config.scale_emb
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=0)
+        # Dispatch layer type
+        use_mod = config.mod_alpha > 0.0
+        is_parallel = config.layer_type == "parallel"
+        if use_mod:
+            layer_cls = MixtureOfDepthDecoderLayer  # handles parallel internally
+        elif is_parallel:
+            layer_cls = ParallelDecoderLayer
+        else:
+            layer_cls = DecoderLayer
+        # Build layers: when sliding_window_size > 0 alternate global/sw
+        sw_size = config.sliding_window_size
         self.layers = nn.ModuleList([
-            DecoderLayer(config) for _ in range(config.num_hidden_layers)
+            layer_cls(config, sliding_window_size=(sw_size if i % 2 == 1 else 0))
+            for i in range(config.num_hidden_layers)
         ])
         self.norm = _build_norm(config.hidden_size, config.norm_type, config.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(
             head_dim=config.head_dim,
             theta=config.rope_theta,
+            rope_scaling=config.rope_scaling,
         )
 
         # Embedding scale
@@ -773,6 +1559,7 @@ class TransformerModel(nn.Module):
 
         # Decode through layers with optional gradient checkpointing
         present_kv: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
+        moe_aux_loss: torch.Tensor = torch.tensor(0.0, device=device)
         for i, layer in enumerate(self.layers):
             past_kv = past_key_values[i] if past_key_values is not None else None
             if self.gradient_checkpointing and self.training:
@@ -789,12 +1576,18 @@ class TransformerModel(nn.Module):
                     rotary_emb=self.rotary_emb,
                 )
             present_kv.append(kv)
+            # Collect MoD auxiliary loss if layer has a router
+            if hasattr(layer, 'router') and hasattr(layer.router, 'last_aux_loss'):
+                moe_aux_loss = moe_aux_loss + layer.router.last_aux_loss
 
         hidden_states = self.norm(hidden_states)
 
         outputs = {"last_hidden_state": hidden_states}
         if use_cache:
             outputs["past_key_values"] = present_kv
+        # MoD auxiliary loss (scaled by config weight)
+        if self.config.mod_alpha > 0.0:
+            outputs["mod_aux_loss"] = moe_aux_loss * self.config.mod_loss_weight
         return outputs
 
     def enable_gradient_checkpointing(self):
@@ -806,6 +1599,142 @@ class TransformerModel(nn.Module):
         self.gradient_checkpointing = True
         print("[GradCkpt] gradient checkpointing enabled — activations will be "
               "recomputed on backward (saves VRAM, ~30% slower per step)")
+
+
+# ======================================================================
+# Multi-Token Prediction heads
+# ======================================================================
+
+
+class MTPHeads(nn.Module):
+    """
+    Multi-Token Prediction (MTP) heads — predict future tokens from
+    the final hidden states using additional lightweight LM heads.
+
+    Each head predicts ``k+1`` tokens ahead with a shared RMSNorm
+    and an independent linear projection. The loss is discounted by
+    ``gamma^k`` so the main next-token prediction dominates.
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.num_heads = config.num_mtp_heads
+        self.vocab_size = config.vocab_size
+        self.hidden_size = config.hidden_size
+        # Shared norm across all MTP heads
+        self.norm = _build_norm(config.hidden_size, config.norm_type, config.rms_norm_eps)
+        self.heads = nn.ModuleList([
+            nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            for _ in range(config.num_mtp_heads)
+        ])
+
+    def forward(self, hidden_states: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Args:
+            hidden_states: ``(B, T, D)`` — final-layer hidden states.
+
+        Returns:
+            List of ``(B, T, V)`` logit tensors, one per MTP head.
+        """
+        h = self.norm(hidden_states)
+        return [head(h) for head in self.heads]
+
+
+# ======================================================================
+# Shared MTP loss helper
+# ======================================================================
+
+
+def compute_mtp_loss(
+    mtp_logits: List[torch.Tensor],
+    labels: torch.Tensor,
+    discount: float = 0.5,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """
+    Compute Multi-Token Prediction (MTP) auxiliary loss.
+
+    Each MTP head :math:`k` predicts the token :math:`k+1` positions ahead.
+    Loss is discounted by :math:`\\gamma^{k+1}`.
+
+    Args:
+        mtp_logits: List of ``(B, T, V)`` tensors, one per MTP head.
+        labels: ``(B, T)`` target token ids.
+        discount: Discount factor :math:`\\gamma` (default 0.5).
+        ignore_index: Label index to ignore in cross-entropy (default -100).
+
+    Returns:
+        Scalar MTP loss (zero if no heads or sequence too short).
+    """
+    if not mtp_logits:
+        return torch.tensor(0.0, device=labels.device)
+    B, T = labels.shape
+    V = mtp_logits[0].size(-1)
+    total = torch.tensor(0.0, device=labels.device)
+    for k, mtp_k in enumerate(mtp_logits):
+        if T - 1 - k < 1:  # need at least one valid prediction position
+            continue
+        # mtp_k[:, t, :] predicts label at [t + 1 + k]
+        mtp_k_shift = mtp_k[:, :T - 1 - k, :].contiguous().view(-1, V)
+        mtp_labels_k = labels[:, 1 + k:].contiguous().view(-1)
+        total += F.cross_entropy(mtp_k_shift, mtp_labels_k, ignore_index=ignore_index) * (discount ** (k + 1))
+    return total
+
+
+# ======================================================================
+# Shared helpers: architecture variant CLI args
+# ======================================================================
+
+
+def add_architecture_args(parser: object) -> None:
+    """
+    Add architecture-variant arguments to an argparse.ArgumentParser.
+
+    Call from every training script to keep the option set in one place.
+    """
+    p = parser  # type: ignore[attr-defined]
+    p.add_argument("--arch", default="dense", choices=["dense", "jamba"],
+                   help="Architecture type: dense (default) or jamba.")
+    p.add_argument("--layer-type", default="sequential",
+                   choices=["sequential", "parallel"],
+                   help="Layer computation order: sequential (default) or parallel.")
+    p.add_argument("--sliding-window-size", type=int, default=0,
+                   help="Sliding window attention size (0 = disabled).")
+    p.add_argument("--num-mtp-heads", type=int, default=0,
+                   help="Multi-token prediction heads (0 = disabled).")
+    p.add_argument("--mtp-discount", type=float, default=0.5,
+                   help="Discount factor for MTP loss (default 0.5).")
+    p.add_argument("--mod-alpha", type=float, default=0.0,
+                   help="Mixture-of-Depth threshold (0 = disabled).")
+    p.add_argument("--mod-loss-weight", type=float, default=0.01,
+                   help="MoD auxiliary loss weight (default 0.01).")
+    p.add_argument("--use-mla", action="store_true",
+                   help="Enable Multi-head Latent Attention.")
+    p.add_argument("--kv-lora-rank", type=int, default=None,
+                   help="KV compression rank for MLA (default: hidden_size//4).")
+    p.add_argument("--jamba-interval", type=int, default=4,
+                   help="Place attention layer every N layers in Jamba (default 4).")
+
+
+def apply_architecture_args(config: ModelConfig, args: object) -> ModelConfig:
+    """
+    Copy architecture-variant fields from parsed args onto a ModelConfig.
+
+    Returns the config for chaining.
+    """
+    a = args  # type: ignore[attr-defined]
+    config.arch_type = a.arch
+    config.layer_type = a.layer_type
+    config.sliding_window_size = a.sliding_window_size
+    config.num_mtp_heads = a.num_mtp_heads
+    config.mtp_discount = a.mtp_discount
+    config.mod_alpha = a.mod_alpha
+    config.mod_loss_weight = getattr(a, "mod_loss_weight", 0.01)
+    config.use_mla = a.use_mla
+    if getattr(a, "kv_lora_rank", None) is not None:
+        config.kv_lora_rank = a.kv_lora_rank
+    config.jamba_hybrid_layer_interval = a.jamba_interval
+    return config
 
 
 # ======================================================================
@@ -822,7 +1751,11 @@ class TransformerForCausalLM(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.model = TransformerModel(config)
+        # Dispatch backbone: JambaModel for hybrid SSM+Attention, TransformerModel otherwise
+        if config.arch_type == "jamba":
+            self.model = JambaModel(config)
+        else:
+            self.model = TransformerModel(config)
         self.lm_head = nn.Linear(
             config.hidden_size, config.vocab_size, bias=False
         )
@@ -831,6 +1764,10 @@ class TransformerForCausalLM(nn.Module):
         # Weight tying
         if self.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+
+        # Multi-Token Prediction heads
+        if config.num_mtp_heads > 0:
+            self.mtp_heads = MTPHeads(config)
 
         # Initialise weights
         self.apply(self._init_weights)
@@ -917,6 +1854,13 @@ class TransformerForCausalLM(nn.Module):
         logits = self.lm_head(hidden_for_logits).float()
 
         result = {"logits": logits}
+
+        # MTP logits (multi-token prediction heads)
+        if hasattr(self, "mtp_heads") and self.config.num_mtp_heads > 0:
+            mtp_logits_list = self.mtp_heads(hidden_for_logits)
+            # Cast to float to match lm_head precision
+            result["mtp_logits"] = [mtp.float() for mtp in mtp_logits_list]
+
         if use_cache:
             result["past_key_values"] = outputs["past_key_values"]
 
@@ -929,6 +1873,15 @@ class TransformerForCausalLM(nn.Module):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
+            # MTP loss — each head predicts (k+1)-ahead with discount gamma^(k+1)
+            if hasattr(self, "mtp_heads") and self.config.num_mtp_heads > 0:
+                mtp_loss = compute_mtp_loss(
+                    result["mtp_logits"], labels,
+                    discount=self.config.mtp_discount, ignore_index=-100,
+                )
+                loss += mtp_loss
+            # MoD auxiliary loss
+            loss += outputs.get("mod_aux_loss", 0.0)
             result["loss"] = loss
 
         return result
@@ -1050,32 +2003,85 @@ def count_non_embedding_parameters(model: TransformerForCausalLM) -> int:
 # ======================================================================
 
 
+def smoke_test_variants():
+    """Run forward + backward pass for every architecture variant.
+
+    Returns True if all tests pass, False otherwise.
+    """
+    torch.manual_seed(42)
+    BASE = dict(vocab_size=1024, hidden_size=128, num_hidden_layers=2,
+                num_attention_heads=4, num_key_value_heads=2, head_dim=32,
+                max_position_embeddings=64)
+    tests = [
+        ("dense", {}),
+        ("parallel", {"layer_type": "parallel"}),
+        ("sliding_window", {"sliding_window_size": 16}),
+        ("mod", {"mod_alpha": 0.125}),
+        ("mtp", {"num_mtp_heads": 2}),
+        ("mla", {"use_mla": True, "kv_lora_rank": 16}),
+        ("jamba", {"arch_type": "jamba", "jamba_hybrid_layer_interval": 2}),
+        ("jamba+mla", {"arch_type": "jamba", "jamba_hybrid_layer_interval": 2,
+                       "use_mla": True, "kv_lora_rank": 16}),
+        ("parallel+mod", {"layer_type": "parallel", "mod_alpha": 0.125}),
+        ("sw+mla", {"sliding_window_size": 16, "use_mla": True, "kv_lora_rank": 16}),
+    ]
+    x = torch.randint(0, 1024, (2, 16))
+    all_ok = True
+    for name, kwargs in tests:
+        try:
+            cfg = ModelConfig(**BASE, **kwargs)
+            m = TransformerForCausalLM(cfg)
+            # Forward
+            out = m(x)
+            assert out["logits"].shape == (2, 16, 1024), f"logits shape mismatch"
+            # Forward with loss
+            out = m(x, labels=x)
+            assert "loss" in out, f"no loss in output"
+            loss = out["loss"]
+            # Backward
+            loss.backward()
+            grad_norm = sum(p.grad.norm().item()
+                           for p in m.parameters() if p.grad is not None)
+            # Verify specific outputs
+            if "mtp_logits" in out:
+                assert len(out["mtp_logits"]) == kwargs.get("num_mtp_heads", 0)
+            print(f"  [{name:>14s}] loss={loss.item():.4f}  "
+                  f"grad_norm={grad_norm:.3f}  OK")
+        except Exception as e:
+            print(f"  [{name:>14s}] FAILED: {e}")
+            all_ok = False
+    # Generation test (dense + jamba)
+    try:
+        cfg = ModelConfig(**BASE)
+        m = TransformerForCausalLM(cfg)
+        gen = m.generate(torch.randint(0, 1024, (1, 8)), max_new_tokens=5)
+        assert gen.shape == (1, 13), f"gen shape {gen.shape}"
+        print(f"  [       generate] dense OK")
+    except Exception as e:
+        print(f"  [       generate] FAILED: {e}")
+        all_ok = False
+    try:
+        cfg = ModelConfig(**BASE, arch_type="jamba", jamba_hybrid_layer_interval=2)
+        m = TransformerForCausalLM(cfg)
+        gen = m.generate(torch.randint(0, 1024, (1, 8)), max_new_tokens=5)
+        assert gen.shape == (1, 13), f"jamba gen shape {gen.shape}"
+        print(f"  [       generate] jamba OK")
+    except Exception as e:
+        print(f"  [       generate] jamba FAILED: {e}")
+        all_ok = False
+    return all_ok
+
+
 def smoke_test():
-    """Verify forward/backward pass works on random data."""
-    config = ModelConfig(
-        vocab_size=4096,
-        hidden_size=128,
-        intermediate_size=384,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=32,
-        max_position_embeddings=256,
-    )
-    model = TransformerForCausalLM(config)
-    x = torch.randint(0, 4096, (2, 64))
-    out = model(x, labels=x)
-    loss = out["loss"]
-    loss.backward()
-    n = count_parameters(model)
-    print(f"[smoke] Model params: {n:,} ({n/1e6:.2f}M)")
-    print(f"[smoke] Loss: {loss.item():.4f}")
-    print(f"[smoke] Forward + backward: OK")
-    return True
+    """Legacy single-config smoke test (calls smoke_test_variants)."""
+    return smoke_test_variants()
 
 
 if __name__ == "__main__":
+    import sys
+
     # Run architecture search across 10M → 3T
+    print("=== Auto-sizing search ===")
     test_cases = [
         ("10M", 10_000_000),
         ("100M", 100_000_000),
@@ -1104,5 +2110,8 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  {label:>5s} ({target:>13,}) → ERROR: {e}")
 
-    print()
-    smoke_test()
+    # Run variant smoke tests
+    print("\n=== Variant smoke tests ===")
+    ok = smoke_test_variants()
+    print(f"\n{'All tests passed!' if ok else 'SOME TESTS FAILED!'}")
+

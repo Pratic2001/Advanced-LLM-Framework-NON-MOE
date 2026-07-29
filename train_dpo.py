@@ -56,7 +56,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tokenizers import Tokenizer
 
-from model import ModelConfig, TransformerForCausalLM, count_parameters
+from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, count_parameters
 from recipe import TrainingRecipe, get_recipe, add_recipe_args, recipe_from_args
 
 # ---------------------------------------------------------------------------
@@ -445,7 +445,7 @@ def dpo_loss(
 def compute_sequence_logprobs(
     model: TransformerForCausalLM,
     input_ids: torch.Tensor,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute per-token log-probabilities for a sequence.
 
@@ -454,9 +454,11 @@ def compute_sequence_logprobs(
         input_ids: (B, T) token ids.
 
     Returns:
-        logprobs: (B, T) per-token log-probabilities.
-                  Position t has the logprob of token at position t+1
-                  (shifted internally). The last position is 0.
+        (logprobs, mod_aux_loss):
+            logprobs: (B, T) per-token log-probabilities.
+                      Position t has the logprob of token at position t+1
+                      (shifted internally). The last position is 0.
+            mod_aux_loss: scalar MoD auxiliary loss tensor (0.0 if disabled).
     """
     out = model(input_ids, use_cache=False)
     logits = out["logits"][:, :-1, :].float()  # (B, T-1, V)
@@ -465,7 +467,7 @@ def compute_sequence_logprobs(
     tok_lp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # (B, T-1)
     # Pad back to (B, T) with 0 for the last position
     tok_lp = F.pad(tok_lp, (0, 1), value=0.0)
-    return tok_lp
+    return tok_lp, out.get("mod_aux_loss", 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -627,13 +629,13 @@ def validate(
         rejected_mask = rejected_mask.to(device)
 
         # Policy logprobs
-        policy_c_logp = compute_sequence_logprobs(model, chosen_ids)
-        policy_r_logp = compute_sequence_logprobs(model, rejected_ids)
+        policy_c_logp, _ = compute_sequence_logprobs(model, chosen_ids)
+        policy_r_logp, _ = compute_sequence_logprobs(model, rejected_ids)
 
         # Reference logprobs
         ref_for_logprob = ref_model if ref_model is not None else model
-        ref_c_logp = compute_sequence_logprobs(ref_for_logprob, chosen_ids)
-        ref_r_logp = compute_sequence_logprobs(ref_for_logprob, rejected_ids)
+        ref_c_logp, _ = compute_sequence_logprobs(ref_for_logprob, chosen_ids)
+        ref_r_logp, _ = compute_sequence_logprobs(ref_for_logprob, rejected_ids)
 
         _, metrics = dpo_loss(
             policy_c_logp, policy_r_logp,
@@ -810,12 +812,12 @@ def smoke_test():
 
         # Reference logprobs
         with torch.no_grad():
-            ref_c_logp = compute_sequence_logprobs(ref or model, chosen_ids)
-            ref_r_logp = compute_sequence_logprobs(ref or model, rejected_ids)
+            ref_c_logp, _ = compute_sequence_logprobs(ref or model, chosen_ids)
+            ref_r_logp, _ = compute_sequence_logprobs(ref or model, rejected_ids)
 
         # Policy logprobs
-        policy_c_logp = compute_sequence_logprobs(model, chosen_ids)
-        policy_r_logp = compute_sequence_logprobs(model, rejected_ids)
+        policy_c_logp, _ = compute_sequence_logprobs(model, chosen_ids)
+        policy_r_logp, _ = compute_sequence_logprobs(model, rejected_ids)
 
         # DPO loss
         loss, metrics = dpo_loss(
@@ -893,6 +895,8 @@ def train(args: argparse.Namespace):
     ckpt_data = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = ModelConfig(**{k: v for k, v in ckpt_data["config"].items()
                             if k in ModelConfig.__init__.__code__.co_varnames})
+
+    apply_architecture_args(config, args)
 
     model = TransformerForCausalLM(config).to(device)
     model.load_state_dict(ckpt_data["model_state"])
@@ -1033,15 +1037,15 @@ def train(args: argparse.Namespace):
 
         # 2. reference log-probs (no_grad)
         with torch.no_grad():
-            ref_c_logp = compute_sequence_logprobs(ref_for_logprob, chosen_ids)
-            ref_r_logp = compute_sequence_logprobs(ref_for_logprob, rejected_ids)
+            ref_c_logp, _ = compute_sequence_logprobs(ref_for_logprob, chosen_ids)
+            ref_r_logp, _ = compute_sequence_logprobs(ref_for_logprob, rejected_ids)
 
         # 3. policy log-probs (with grad)
         with ctx:
             if _use_cudagraphs:
                 torch.compiler.cudagraph_mark_step_begin()
-            policy_c_logp = compute_sequence_logprobs(model, chosen_ids)
-            policy_r_logp = compute_sequence_logprobs(model, rejected_ids)
+            policy_c_logp, mod_aux_c = compute_sequence_logprobs(model, chosen_ids)
+            policy_r_logp, mod_aux_r = compute_sequence_logprobs(model, rejected_ids)
 
         # 4. DPO loss
         loss, metrics = dpo_loss(
@@ -1052,6 +1056,9 @@ def train(args: argparse.Namespace):
             label_smoothing=args.label_smoothing,
             clip_ratio=args.clip_ratio if args.clip_ratio > 0 else None,
         )
+
+        # MoD auxiliary loss
+        loss += mod_aux_c + mod_aux_r
 
         # 5. backward + step
         optimizer.zero_grad(set_to_none=True)
@@ -1169,6 +1176,8 @@ def parse_args():
     p.add_argument("--compile-mode", default="default",
                    choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--seed", type=int, default=42)
+
+    add_architecture_args(p)
 
     # Checkpointing
     p.add_argument("--save-every", type=int, default=50,

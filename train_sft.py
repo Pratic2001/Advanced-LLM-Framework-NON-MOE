@@ -81,7 +81,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from model import ModelConfig, TransformerForCausalLM, count_parameters
+from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, compute_mtp_loss, count_parameters
 from optim.build_optimizer import build_optimizer
 from optim.lr_schedule import build_scheduler
 from recipe import TrainingRecipe, get_recipe, add_recipe_args, recipe_from_args
@@ -782,6 +782,7 @@ def main():
     p.add_argument("--seq-len",        type=int,   default=2048)
     p.add_argument("--max-seq-len", type=int, default=None,
                    help="Max position embeddings (default 8192). Separate from --seq-len.")
+    add_architecture_args(p)
     p.add_argument("--batch-size",     type=int,   default=4)
     p.add_argument("--num-steps",      type=int,   default=10_000)
     p.add_argument("--grad-accum",     type=int,   default=4)
@@ -885,6 +886,8 @@ def main():
         raise ValueError(
             "Either --checkpoint-dir or --model-size must be provided."
         )
+
+    apply_architecture_args(config, args)
 
     # Store config fields in args for checkpoint round-trip
     args.vocab_size          = config.vocab_size
@@ -1154,6 +1157,17 @@ def main():
                 # Z-loss: penalise large logits for training stability
                 if args.z_loss_weight > 0:
                     loss = loss + (args.z_loss_weight * logits.float().square().mean() / args.grad_accum)
+                # MTP loss
+                if "mtp_logits" in out:
+                    pad_id_val = pad_id if isinstance(pad_id, int) else 0
+                    mtp_loss = compute_mtp_loss(
+                        out["mtp_logits"], y,
+                        discount=model.config.mtp_discount if hasattr(model, 'config') else 0.5,
+                        ignore_index=pad_id_val,
+                    )
+                    loss = loss + mtp_loss / args.grad_accum
+                # MoD loss
+                loss += out.get("mod_aux_loss", 0.0)
 
             scaler.scale(loss).backward()
             loss_accum  += loss.item()

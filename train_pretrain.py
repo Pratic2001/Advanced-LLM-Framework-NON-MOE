@@ -52,7 +52,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from model import ModelConfig, TransformerForCausalLM, count_parameters
+from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, compute_mtp_loss, count_parameters
 from optim.build_optimizer import build_optimizer
 from optim.lr_schedule import build_scheduler
 
@@ -104,11 +104,26 @@ def pretrain_loss(
         y.reshape(-1),
         ignore_index=pad_id,
     )
+    loss = ce_loss
+
+    # Multi-Token Prediction (MTP) auxiliary loss
+    if "mtp_logits" in out:
+        pad_id_val = pad_id if isinstance(pad_id, int) else 0
+        mtp_loss = compute_mtp_loss(
+            out["mtp_logits"], y,
+            discount=model.config.mtp_discount if hasattr(model, 'config') else 0.5,
+            ignore_index=pad_id_val,
+        )
+        loss = loss + mtp_loss
+
+    # Mixture-of-Depth auxiliary loss
+    loss += out.get("mod_aux_loss", 0.0)
+
     if z_loss_weight > 0:
         # Z-loss: penalise large logit magnitudes to stabilise softmax
         z_loss = z_loss_weight * logits.float().square().mean()
-        return ce_loss + z_loss
-    return ce_loss
+        loss += z_loss
+    return loss
 
 
 # ---------------------------------------------------------------------------
@@ -1358,6 +1373,8 @@ def _build_config(args: argparse.Namespace, vocab_size: int) -> ModelConfig:
             head_dim=args.head_dim or 128,
             max_position_embeddings=max_pos,
         )
+
+    apply_architecture_args(config, args)
     return config
 
 
@@ -1500,6 +1517,8 @@ def parse_args() -> argparse.Namespace:
                    help="Maximum position embeddings (default 8192). "
                         "Separate from --seq-len so the model can later "
                         "extend to longer contexts.")
+
+    add_architecture_args(p)
 
     # ---- data
     p.add_argument("--data-dir", default="./packed",

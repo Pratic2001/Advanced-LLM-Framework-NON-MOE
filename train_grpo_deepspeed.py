@@ -62,7 +62,7 @@ from tokenizers import Tokenizer
 
 import deepspeed
 
-from model import ModelConfig, TransformerForCausalLM, count_parameters
+from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, count_parameters
 
 # Re-use the GRPO machinery so this script stays focused on the engine swap.
 from train_grpo import (
@@ -607,6 +607,9 @@ def train(args):
     ckpt_data = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config    = ModelConfig(**ckpt_data["config"])
 
+    # ---- architecture variant passthrough
+    apply_architecture_args(config, args)
+
     # ---------------------------------------------------------------- auto LR scaling
     if not args.no_lr_scale:
         ref_hidden = 2048
@@ -889,6 +892,9 @@ def train(args):
             clip_ratio=args.clip_ratio,
         )
 
+        # ---- MoD auxiliary loss
+        loss = loss + out.get("mod_aux_loss", 0.0)
+
         # 8. DeepSpeed step (handles backward + ZeRO all-reduce + optimizer)
         engine.backward(loss)
         engine.step()
@@ -1016,6 +1022,8 @@ def parse_args():
     p.add_argument("--grad_clip",        type=float, default=1.0)
     p.add_argument("--dtype",   default="bf16", choices=["bf16", "fp32"])
     p.add_argument("--seed",    type=int, default=42)
+
+    add_architecture_args(p)
 
     # Logging / checkpointing
     p.add_argument("--log_interval",  type=int, default=1)

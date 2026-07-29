@@ -49,3 +49,4 @@ wandb/
 
 # Git
 *.orig
+audit_findings.json

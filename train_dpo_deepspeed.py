@@ -78,7 +78,7 @@ from tokenizers import Tokenizer
 
 import deepspeed
 
-from model import ModelConfig, TransformerForCausalLM, count_parameters
+from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, count_parameters
 
 # Re-use the DPO machinery so this script stays focused on the engine swap.
 from train_dpo import (
@@ -703,6 +703,9 @@ def train(args):
     ckpt_data = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config    = ModelConfig(**ckpt_data["config"])
 
+    # ---- architecture variant passthrough
+    apply_architecture_args(config, args)
+
     # ---------------------------------------------------------------- auto LR scaling
     if not args.no_lr_scale:
         ref_hidden = 2048
@@ -863,14 +866,15 @@ def train(args):
 
         # 2. reference log-probs (no_grad)
         with torch.no_grad():
-            ref_c_logp = compute_sequence_logprobs(ref_for_logprob, chosen_ids)
-            ref_r_logp = compute_sequence_logprobs(ref_for_logprob, rejected_ids)
+            ref_c_logp, _ = compute_sequence_logprobs(ref_for_logprob, chosen_ids)
+            ref_r_logp, _ = compute_sequence_logprobs(ref_for_logprob, rejected_ids)
 
         # 3. policy log-probs (with grad, through DeepSpeed engine)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
                             enabled=args.dtype == "bf16"):
-            policy_c_logp = compute_sequence_logprobs(engine, chosen_ids)
-            policy_r_logp = compute_sequence_logprobs(engine, rejected_ids)
+            policy_c_logp, c_mod_aux = compute_sequence_logprobs(engine, chosen_ids)
+            policy_r_logp, r_mod_aux = compute_sequence_logprobs(engine, rejected_ids)
+            mod_aux_loss = c_mod_aux + r_mod_aux
 
         # 4. DPO loss
         loss, metrics = dpo_loss(
@@ -881,6 +885,8 @@ def train(args):
             label_smoothing=args.label_smoothing,
             clip_ratio=args.clip_ratio if hasattr(args, 'clip_ratio') and args.clip_ratio > 0 else None,
         )
+        # ---- MoD auxiliary loss
+        loss = loss + mod_aux_loss
 
         # 5. DeepSpeed step (handles backward + ZeRO all-reduce + optimizer)
         engine.backward(loss)
@@ -990,6 +996,8 @@ def parse_args():
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
     p.add_argument("--seed", type=int, default=42)
+
+    add_architecture_args(p)
 
     # Checkpointing
     p.add_argument("--save-every", type=int, default=50,
