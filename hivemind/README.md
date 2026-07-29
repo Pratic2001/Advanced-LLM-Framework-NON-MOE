@@ -50,6 +50,10 @@ pip install -r hivemind/requirements-hivemind.txt
 
 ### 2. Prepare data (same as the base framework)
 
+> **Run this once on any single machine.**  The packed `.bin` files are fully
+> portable — copy them to other peers or put them on a shared network drive.
+> You do NOT need to run data preparation on every machine.
+
 ```bash
 # Tokenizer
 python tokenizer_train.py --data-dir ./data --output-dir ./tokenizer
