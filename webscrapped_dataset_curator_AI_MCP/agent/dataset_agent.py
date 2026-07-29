@@ -97,6 +97,9 @@ from quality import passes_prose_quality_filter as _passes_prose
 from quality import passes_sft_pair_quality_filter as _passes_sft_pair
 from quality import passes_code_quality_filter as _passes_code
 from quality import passes_transcript_quality_filter as _passes_transcript
+from quality import passes_extended_text_quality as _passes_ext_prose
+from quality import passes_extended_sft_quality as _passes_ext_sft
+from quality import detect_language
 from topics import HUB_SEARCH_KEYWORDS, TOPIC_SEEDS
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -441,25 +444,42 @@ def _format_specific_filter(record: dict) -> tuple[bool, str]:
     return True, ""
 
 
-def _make_heuristic_filter(mode: str, min_doc_chars: int, record: dict) -> tuple[bool, str]:
+def _make_heuristic_filter(
+    mode: str,
+    min_doc_chars: int,
+    record: dict,
+    use_extended: bool = True,
+    quality_kwargs: Optional[dict] = None,
+) -> tuple[bool, str]:
     text = record.get("text", "")
     if len(text) < min_doc_chars:
         return False, f"too short ({len(text)} < {min_doc_chars})"
-    if mode == "pretrain":
+
+    if use_extended:
+        kwargs = dict(quality_kwargs or {})
+        kwargs.setdefault("min_chars", min_doc_chars)
+        target_langs = kwargs.pop("target_langs", None)
+
+        if mode == "pretrain":
+            return _passes_ext_prose(text, target_langs=target_langs, **kwargs)
+        if mode in ("sft", "grpo"):
+            prompt = record.get("prompt") or record.get("extra", {}).get("prompt") or ""
+            answer = record.get("answer") or record.get("extra", {}).get("answer") or ""
+            if not prompt or not answer:
+                return False, f"{mode} mode needs both prompt and answer"
+            return _passes_ext_sft(prompt, answer, target_langs=target_langs, **kwargs)
+        return _passes_ext_prose(text, target_langs=target_langs, **kwargs)
+    else:
+        # Legacy basic filters
+        if mode == "pretrain":
+            return _passes_prose(text, min_doc_chars=min_doc_chars)
+        if mode in ("sft", "grpo"):
+            prompt = record.get("prompt") or record.get("extra", {}).get("prompt") or ""
+            answer = record.get("answer") or record.get("extra", {}).get("answer") or ""
+            if not prompt or not answer:
+                return False, f"{mode} mode needs both prompt and answer"
+            return _passes_sft_pair(prompt, answer, min_chars=min_doc_chars)
         return _passes_prose(text, min_doc_chars=min_doc_chars)
-    if mode == "sft":
-        prompt = record.get("prompt") or record.get("extra", {}).get("prompt") or ""
-        answer = record.get("answer") or record.get("extra", {}).get("answer") or ""
-        if not prompt or not answer:
-            return False, "sft mode needs both prompt and answer"
-        return _passes_sft_pair(prompt, answer, min_chars=min_doc_chars)
-    if mode == "grpo":
-        prompt = record.get("prompt") or record.get("extra", {}).get("prompt") or ""
-        answer = record.get("answer") or record.get("extra", {}).get("answer") or ""
-        if not prompt or not answer:
-            return False, "grpo mode needs prompt and answer"
-        return _passes_sft_pair(prompt, answer, min_chars=min_doc_chars)
-    return _passes_prose(text, min_doc_chars=min_doc_chars)
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +701,10 @@ class CategoryRunner:
     def __init__(self, category: str, budget_bytes: int, out_dir: str,
                  mode: str, min_doc_chars: int, concurrency: int,
                  use_llm_judge: bool, batcher: OllamaBatcher,
-                 memory_gov: MemoryGovernor, public_only: bool):
+                 memory_gov: MemoryGovernor, public_only: bool,
+                 use_extended_quality: bool = True,
+                 quality_thresholds: Optional[dict] = None,
+                 target_langs: Optional[set] = None):
         self.category = category
         self.budget_bytes = budget_bytes
         self.out_dir = out_dir
@@ -692,6 +715,9 @@ class CategoryRunner:
         self.batcher = batcher
         self.memory_gov = memory_gov
         self.public_only = public_only
+        self.use_extended_quality = use_extended_quality
+        self.quality_thresholds = quality_thresholds or {}
+        self.target_langs = target_langs
 
         # State built during run
         self.total_bytes: int = 0
@@ -737,8 +763,17 @@ class CategoryRunner:
         self.shard_writer.write(record)
 
     def _filter_and_dedup(self, record: dict) -> Optional[dict]:
-        # Heuristic filter
-        ok, reason = _make_heuristic_filter(self.mode, self.min_doc_chars, record)
+        # Heuristic filter (extended quality)
+        quality_kwargs = dict(self.quality_thresholds)
+        if self.target_langs:
+            quality_kwargs["target_langs"] = self.target_langs
+        ok, reason = _make_heuristic_filter(
+            self.mode,
+            self.min_doc_chars,
+            record,
+            use_extended=self.use_extended_quality,
+            quality_kwargs=quality_kwargs if self.use_extended_quality else None,
+        )
         if not ok:
             self.total_urls_filtered += 1
             return None
@@ -1071,6 +1106,9 @@ async def _run_category(
     public_only: bool,
     hf_datasets: Optional[dict[str, str]] = None,
     kaggle_datasets: Optional[dict[str, str]] = None,
+    use_extended_quality: bool = True,
+    quality_thresholds: Optional[dict] = None,
+    target_langs: Optional[set] = None,
 ) -> dict:
     runner = CategoryRunner(
         category=category,
@@ -1083,6 +1121,9 @@ async def _run_category(
         batcher=batcher,
         memory_gov=memory_gov,
         public_only=public_only,
+        use_extended_quality=use_extended_quality,
+        quality_thresholds=quality_thresholds,
+        target_langs=target_langs,
     )
     try:
         # Phase 1: Public sources (if enabled)
@@ -1134,6 +1175,9 @@ async def _run_categories(
     hf_datasets: Optional[dict[str, str]] = None,
     kaggle_datasets: Optional[dict[str, str]] = None,
     max_category_concurrency: int = 2,
+    use_extended_quality: bool = True,
+    quality_thresholds: Optional[dict] = None,
+    target_langs: Optional[set] = None,
 ) -> dict:
     """Run multiple categories, respecting max_category_concurrency."""
     server_path = _find_server_path()
@@ -1170,6 +1214,9 @@ async def _run_categories(
             public_only=public_only,
             hf_datasets=hf_datasets,
             kaggle_datasets=kaggle_datasets,
+            use_extended_quality=use_extended_quality,
+            quality_thresholds=quality_thresholds,
+            target_langs=target_langs,
         )
         results[cat_name] = result
 
@@ -1274,6 +1321,23 @@ def main() -> None:
                         help="Max categories running simultaneously (default 2)")
     parser.add_argument("--log-file", default=None,
                         help="Write log to this file in addition to stdout")
+    # Extended quality filter arguments
+    parser.add_argument("--no-extended-quality", action="store_true",
+                        help="Disable extended quality filters (compression ratio, vocab diversity, etc.)")
+    parser.add_argument("--max-compression-ratio", type=float, default=0.35,
+                        help="Max zlib compression ratio for text quality (default 0.35)")
+    parser.add_argument("--max-line-repetition", type=float, default=0.15,
+                        help="Max fraction of duplicate lines (default 0.15)")
+    parser.add_argument("--max-adjacent-repetition", type=float, default=0.15,
+                        help="Max fraction of adjacent near-identical lines (default 0.15)")
+    parser.add_argument("--min-vocab-diversity", type=float, default=0.15,
+                        help="Min unique/total word ratio (default 0.15)")
+    parser.add_argument("--max-short-line-ratio", type=float, default=0.50,
+                        help="Max fraction of short/navigation lines (default 0.50)")
+    parser.add_argument("--max-flagged-ngram-ratio", type=float, default=0.10,
+                        help="Max fraction of lines with flagged patterns (default 0.10)")
+    parser.add_argument("--target-langs", default=None,
+                        help="Comma-separated target languages for filtering, e.g. en,de (requires fasttext)")
     args = parser.parse_args()
 
     # Set up logging
@@ -1307,6 +1371,19 @@ def main() -> None:
                       if s.strip()] if args.public_sources else []
     use_llm_judge = not args.no_llm_judge
 
+    # Extended quality filter config
+    use_extended_quality = not args.no_extended_quality
+    quality_thresholds = {
+        "max_compression_ratio": args.max_compression_ratio,
+        "max_line_repetition": args.max_line_repetition,
+        "max_adjacent_repetition": args.max_adjacent_repetition,
+        "min_vocab_diversity": args.min_vocab_diversity,
+        "max_short_line_ratio": args.max_short_line_ratio,
+        "max_flagged_ngram_ratio": args.max_flagged_ngram_ratio,
+    } if use_extended_quality else None
+    target_langs = set(l.strip() for l in args.target_langs.split(",")
+                       if l.strip()) if args.target_langs else None
+
     # Build category configs
     category_configs = []
     for cat in categories:
@@ -1339,6 +1416,9 @@ def main() -> None:
         hf_datasets=hf_datasets if hf_datasets else None,
         kaggle_datasets=kaggle_datasets if kaggle_datasets else None,
         max_category_concurrency=args.category_concurrency,
+        use_extended_quality=use_extended_quality,
+        quality_thresholds=quality_thresholds,
+        target_langs=target_langs,
     ))
 
 

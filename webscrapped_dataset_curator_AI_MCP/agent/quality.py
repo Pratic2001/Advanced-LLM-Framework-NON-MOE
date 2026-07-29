@@ -3,24 +3,73 @@ quality.py
 
 Shared quality-filtering / dedup / shard-writing primitives, so the
 live-scraping agent applies the same bar as the HF-streaming pipeline.
+
+Filters (in increasing order of sophistication):
+  1. Length / alpha-ratio / repetition / junk markers (original)
+  2. Zlib compression ratio  -- catches boilerplate, logs, templates
+  3. Line-level repetition   -- catches nav bars, repeated headers/footers
+  4. Vocabulary diversity    -- catches spammy / low-info text
+  5. Short-line ratio        -- catches navigation-heavy pages
+  6. Flagged n-grams         -- known low-quality patterns (TOS, copyright, etc.)
+  7. Language detection      -- fasttext-based, optional
 """
 
 import hashlib
 import json
 import os
 import re
-from collections import deque
+import zlib
+from collections import deque, Counter
 from typing import Optional
 
 SHARD_MAX_BYTES = 256 * 1024 * 1024  # 256MB per shard file
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
+_LINE_RE = re.compile(r".*$", re.MULTILINE)
 
 _JUNK_MARKERS = (
     "enable javascript", "cookies to continue", "subscribe to continue",
     "404 not found", "access denied", "please verify you are a human",
     "add to cart", "sign in to your account", "captcha",
 )
+
+# ---------------------------------------------------------------------------
+# Flagged n-grams -- substrings that strongly correlate with low-quality text
+# regardless of domain.  These are checked as case-insensitive substring
+# matches; even a few hits flags the line as boilerplate.
+# ---------------------------------------------------------------------------
+_FLAGGED_NGRAMS = [
+    # copyright / terms boilerplate
+    "all rights reserved", "terms of service", "privacy policy",
+    "copyright ©", "all trademarks are", "subject to change without notice",
+    # navigation / layout
+    "click here", "read more", "learn more", "subscribe now",
+    "sign up for", "follow us on", "share this", "leave a comment",
+    "comments are closed", "related posts", "you might also like",
+    "top of page", "back to top", "scroll to", "table of contents",
+    # cookie / consent / GDPR
+    "accept cookies", "cookie policy", "we use cookies", "consent to",
+    "your privacy", "do not sell", "cookie settings", "accept all",
+    # ad / promotional
+    "advertisement", "sponsored content", "brought to you by",
+    "download now", "limited time offer", "buy now", "add to cart",
+    # pagination
+    "page 1 of", "next page", "previous page", "first page", "last page",
+    # generic low-effort
+    "lorem ipsum", "under construction", "coming soon",
+    "this is a placeholder", "your message has been sent",
+]
+
+# Regex for fast flagged-ngram matching (built once at import time)
+_FLAGGED_RE = re.compile(
+    "|".join(re.escape(ng) for ng in _FLAGGED_NGRAMS),
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Language detection helper (lazy-loaded)
+# ---------------------------------------------------------------------------
+_LANG_DETECTOR = None  # populated on first call to detect_language()
 
 
 def _alpha_ratio(text: str) -> float:
@@ -134,6 +183,374 @@ def passes_code_quality_filter(text: str, path: str, min_doc_chars: int = 500) -
     if avg_line_len > CODE_MAX_AVG_LINE_LEN:
         return False, "avg_line_too_long"
     return True, None
+
+
+# ---------------------------------------------------------------------------
+# Extended quality filters (v2)
+# ---------------------------------------------------------------------------
+
+def compression_ratio(text: str) -> float:
+    """Zlib compression ratio: compressed_size / raw_size.
+
+    Lower values = more compressible = more boilerplate / templated / spammy.
+    Typical ranges:
+        Normal prose English:     0.45 - 0.60
+        Boilerplate / navigation: 0.20 - 0.40
+        Log files / templates:    0.10 - 0.35
+        Code:                     0.35 - 0.55
+        Random / high-entropy:    0.60+
+    """
+    raw = text.encode("utf-8", errors="ignore")
+    if len(raw) < 50:
+        return 1.0  # too short to measure meaningfully
+    compressed = zlib.compress(raw, level=1)
+    return len(compressed) / max(1, len(raw))
+
+
+def line_repetition_score(text: str) -> float:
+    """Fraction of lines that appear more than once (exact duplicate).
+
+    A high score means the document is dominated by repeated boilerplate
+    lines (navigation, headers, footers, templates).  Normal prose
+    typically scores < 0.05.
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 5:
+        return 0.0
+    counts = Counter(lines)
+    repeated_lines = sum(c - 1 for c in counts.values() if c > 1)
+    return repeated_lines / max(1, len(lines))
+
+
+def adjacent_line_repetition_score(text: str) -> float:
+    """Fraction of adjacent line pairs that are nearly identical.
+
+    Catches content like:
+        Section 1: ...
+        Section 2: ...
+        Section 3: ...
+    where each line is unique but structurally repetitive.
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 5:
+        return 0.0
+    similar = 0
+    total = 0
+    for i in range(len(lines) - 1):
+        total += 1
+        # Simple similarity: same first 30 chars counts as "adjacent repeat"
+        if lines[i][:30] == lines[i + 1][:30]:
+            similar += 1
+    return similar / max(1, total)
+
+
+def vocabulary_diversity(text: str) -> float:
+    """Fraction of unique words over total words.
+
+    Normal prose:        0.30 - 0.55
+    Repetitive / spammy: 0.05 - 0.20
+    Code:                0.20 - 0.40
+    """
+    words = _WORD_RE.findall(text.lower())
+    if len(words) < 10:
+        return 1.0
+    return len(set(words)) / len(words)
+
+
+def short_line_ratio(text: str, max_len: int = 30) -> float:
+    """Fraction of lines shorter than *max_len* characters.
+
+    High ratio indicates navigation-heavy pages, tag clouds, or
+    link-list pages with little prose content.
+    """
+    lines = [l for l in text.split("\n") if l.strip()]
+    if len(lines) < 5:
+        return 0.0
+    short = sum(1 for l in lines if len(l.strip()) <= max_len)
+    return short / len(lines)
+
+
+def flagged_ngram_line_ratio(text: str) -> float:
+    """Fraction of lines that contain at least one flagged n-gram.
+
+    Uses a compiled regex over _FLAGGED_NGRAMS.  Even a few
+    flagged lines indicate boilerplate; > 0.10 is suspicious.
+    """
+    lines = [l for l in text.split("\n") if l.strip()]
+    if len(lines) < 3:
+        return 0.0
+    flagged = sum(1 for l in lines if _FLAGGED_RE.search(l))
+    return flagged / len(lines)
+
+
+# ---------------------------------------------------------------------------
+# Language detection (lightweight, optional)
+# ---------------------------------------------------------------------------
+
+def detect_language(
+    text: str,
+    target_langs: Optional[set] = None,
+    threshold: float = 0.5,
+    lazy_init: bool = True,
+) -> tuple:
+    """Detect document language using fasttext (if installed).
+
+    Args:
+        text:        Document text to classify.
+        target_langs: Set of ISO codes to accept (e.g. {"en"}, {"en", "de"}).
+                     If None, returns the detected language without filtering.
+        threshold:   Minimum probability to accept.  Below this, returns
+                     ("unknown", False).
+        lazy_init:   If True, the fasttext model is loaded on first call
+                     and cached thereafter.
+
+    Returns:
+        (lang_code: str, is_target: bool or None)
+        - lang_code is the detected ISO-639-1 code (e.g. "en", "de", "fr").
+        - is_target is True/False if target_langs is set, else None.
+    """
+    lang_code = _detect_lang_fasttext(text, lazy_init=lazy_init)
+    if lang_code is None:
+        return ("unknown", None)
+    if target_langs is not None:
+        return (lang_code, lang_code in target_langs)
+    return (lang_code, None)
+
+
+def _detect_lang_fasttext(text: str, lazy_init: bool = True) -> Optional[str]:
+    """Internal: run fasttext language ID on *text*.  Returns ISO code or None."""
+    global _LANG_DETECTOR
+    if lazy_init and _LANG_DETECTOR is None:
+        _LANG_DETECTOR = _load_fasttext_lang_detector()
+    detector = _LANG_DETECTOR
+    if detector is None:
+        return None
+    try:
+        sample = text.strip()[:2000]
+        if len(sample) < 20:
+            return None
+        predictions = detector.predict(sample, k=1)
+        lang = predictions[0][0].replace("__label__", "")
+        return lang
+    except Exception:
+        return None
+
+
+def _load_fasttext_lang_detector():
+    """Try to load fasttext's lid.176 model.  Returns None if unavailable."""
+    try:
+        import fasttext
+        import fasttext.util
+    except ImportError:
+        return None
+    # Common paths for the language identification model
+    candidates = [
+        "/usr/local/lib/python3.10/site-packages/fasttext/util/lid.176.ftz",
+        "/usr/local/lib/python3.11/site-packages/fasttext/util/lid.176.ftz",
+        "/usr/local/lib/python3.12/site-packages/fasttext/util/lid.176.ftz",
+        os.path.expanduser("~/.cache/fasttext/lid.176.ftz"),
+        os.path.expanduser("~/.fasttext/lid.176.ftz"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return fasttext.load_model(path)
+            except Exception:
+                continue
+    # Try auto-download
+    try:
+        fasttext.util.download_model("lid.176")  # noqa
+        path = fasttext.util.model_path("lid.176")
+        if os.path.exists(path):
+            return fasttext.load_model(path)
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Combined extended quality filters
+# ---------------------------------------------------------------------------
+
+# Sensible defaults for extended quality checks
+_EXTENDED_DEFAULTS = {
+    "min_chars": 500,
+    "max_compression_ratio": 0.35,   # zlib ratio; lower = more repetitive
+    "max_line_repetition": 0.15,     # fraction of duplicate lines
+    "max_adjacent_repetition": 0.15, # fraction of adjacent near-duplicate lines
+    "min_vocab_diversity": 0.15,     # unique / total words
+    "max_short_line_ratio": 0.50,    # fraction of lines < 30 chars
+    "max_flagged_ngram_ratio": 0.10, # fraction of lines with flagged n-grams
+}
+
+
+def passes_extended_text_quality(
+    text: str,
+    min_chars: int = 500,
+    max_compression_ratio: float = 0.35,
+    max_line_repetition: float = 0.15,
+    max_adjacent_repetition: float = 0.15,
+    min_vocab_diversity: float = 0.15,
+    max_short_line_ratio: float = 0.50,
+    max_flagged_ngram_ratio: float = 0.10,
+    target_langs: Optional[set] = None,
+) -> tuple:
+    """Multi-signal text quality gate for prose documents.
+
+    Returns (passed: bool, reason: str).  Each check returns a specific
+    reason so you can tune thresholds per dataset.
+
+    Extends the basic ``passes_prose_quality_filter`` with:
+      - Zlib compression ratio (boilerplate / logs / templates)
+      - Line-level repetition (nav bars, headers, footers)
+      - Adjacent-line repetition (templated vertical lists)
+      - Vocabulary diversity (spam / low-info text)
+      - Short-line ratio (navigation-heavy pages)
+      - Flagged n-gram ratio (copyright, cookie-consent, ad markers)
+      - Language detection (fasttext, optional / graceful fallback)
+    """
+    # --- Basic prose-level checks (original) ---
+    passed, reason = passes_prose_quality_filter(text, min_chars)
+    if not passed:
+        return False, reason
+
+    # --- Compression ratio (boilerplate / logs) ---
+    cr = compression_ratio(text)
+    if cr < max_compression_ratio:
+        return False, f"high_compressibility:{cr:.3f}"
+
+    # --- Line repetition (nav / footer) ---
+    lr = line_repetition_score(text)
+    if lr > max_line_repetition:
+        return False, f"high_line_repetition:{lr:.3f}"
+
+    # --- Adjacent line repetition (templates) ---
+    ar = adjacent_line_repetition_score(text)
+    if ar > max_adjacent_repetition:
+        return False, f"high_adjacent_repetition:{ar:.3f}"
+
+    # --- Vocabulary diversity (spam) ---
+    vd = vocabulary_diversity(text)
+    if vd < min_vocab_diversity:
+        return False, f"low_vocab_diversity:{vd:.3f}"
+
+    # --- Short line ratio (navigation) ---
+    sr = short_line_ratio(text)
+    if sr > max_short_line_ratio:
+        return False, f"high_short_line_ratio:{sr:.3f}"
+
+    # --- Flagged n-grams (boilerplate) ---
+    nr = flagged_ngram_line_ratio(text)
+    if nr > max_flagged_ngram_ratio:
+        return False, f"high_flagged_ngrams:{nr:.3f}"
+
+    # --- Language detection (optional) ---
+    if target_langs is not None:
+        _, is_target = detect_language(text, target_langs=target_langs)
+        if is_target is not None and not is_target:
+            return False, "wrong_language"
+
+    return True, None
+
+
+def passes_extended_sft_quality(
+    prompt: str,
+    answer: str,
+    min_chars: int = 20,
+    max_compression_ratio: float = 0.35,
+    max_flagged_ngram_ratio: float = 0.15,
+    target_langs: Optional[set] = None,
+) -> tuple:
+    """Multi-signal quality gate for (prompt, answer) pairs.
+
+    Applies the SFT pair filter first, then extended content checks on
+    the combined text.
+    """
+    passed, reason = passes_sft_pair_quality_filter(prompt, answer, min_chars)
+    if not passed:
+        return False, reason
+
+    combined = f"{prompt}\n\n{answer}"
+
+    # Compression ratio
+    cr = compression_ratio(combined)
+    if cr < max_compression_ratio:
+        return False, f"high_compressibility:{cr:.3f}"
+
+    # Flagged n-grams
+    nr = flagged_ngram_line_ratio(combined)
+    if nr > max_flagged_ngram_ratio:
+        return False, f"high_flagged_ngrams:{nr:.3f}"
+
+    # Language (optional)
+    if target_langs is not None:
+        _, is_target = detect_language(combined, target_langs=target_langs)
+        if is_target is not None and not is_target:
+            return False, "wrong_language"
+
+    return True, None
+
+
+def score_text_quality(
+    text: str,
+    min_chars: int = 500,
+    target_langs: Optional[set] = None,
+) -> float:
+    """Return a continuous quality score in [0, 1] for ranking / filtering.
+
+    Unlike the pass/fail gates above, this returns a score you can use
+    for weighted sampling.  Higher = better quality.
+
+    Heuristic components (each 0-1):
+      - Compression score: 1.0 if ratio >= 0.55, 0.0 if <= 0.30, linear ramp
+      - Vocabulary score:  1.0 if diversity >= 0.35, 0.0 if <= 0.10, linear ramp
+      - Line repetition:   1.0 if rep <= 0.05, 0.0 if >= 0.30, linear ramp
+      - Flagged n-gram:    1.0 if ratio <= 0.02, 0.0 if >= 0.15, linear ramp
+      - Length bonus:      ln(len) clamped to [0.3, 1.0] -- longer docs slightly preferred
+      - Language bonus:    +0.1 if target_langs match, no penalty if unset
+    """
+    if len(text) < min_chars:
+        return 0.0
+
+    scores = []
+
+    # Compression
+    cr = compression_ratio(text)
+    comp_score = max(0.0, min(1.0, (cr - 0.30) / 0.25))
+    scores.append(comp_score)
+
+    # Vocabulary diversity
+    vd = vocabulary_diversity(text)
+    vocab_score = max(0.0, min(1.0, (vd - 0.10) / 0.25))
+    scores.append(vocab_score)
+
+    # Line repetition
+    lr = line_repetition_score(text)
+    rep_score = max(0.0, min(1.0, (0.30 - lr) / 0.25))
+    scores.append(rep_score)
+
+    # Flagged n-grams
+    nr = flagged_ngram_line_ratio(text)
+    flag_score = max(0.0, min(1.0, (0.15 - nr) / 0.13))
+    scores.append(flag_score)
+
+    # Length bonus: log-scale preference for longer docs
+    length_bonus = max(0.3, min(1.0, len(text) / 10000.0 * 0.7 + 0.3))
+
+    combined = sum(scores) / len(scores) * length_bonus
+
+    # Language bonus
+    if target_langs is not None:
+        _, is_target = detect_language(text, target_langs=target_langs)
+        if is_target:
+            combined = min(1.0, combined + 0.1)
+
+    return max(0.0, min(1.0, combined))
+
+
+# ---------------------------------------------------------------------------
+# End of extended quality filters
+# ---------------------------------------------------------------------------
 
 
 class _BloomFilter:

@@ -124,6 +124,13 @@ python tokenizer_train.py \
 
 Three curation pipelines, each progressively more automated:
 
+All pipelines support a **two-tier data quality system**:
+
+- **Tier 1 — Legacy basic filters**: `passes_prose_quality_filter` checks minimum length, junk markers, and exact URL/email patterns.
+- **Tier 2 — Extended quality filters** (enabled by default): Adds zlib compression ratio detection (boilerplate/logs are highly compressible), duplicate/adjacent-line repetition detection (templates/nav bars), vocabulary diversity checks (spam/keyword-stuffing), short-line ratio (cookie banners/navigation), flagged n-gram patterns (copyright/ads/cookie-consent), and optional fasttext-based language detection. Each filter can be tuned independently via CLI flags.
+
+The extended filters are implemented in `webscrapped_dataset_curator_AI_MCP/agent/quality.py` and are applied either inline (dataset_agent) or as a programmatic post-filter pass (codegen_pipeline, hf_to_packed). Language detection is optional — all extended filters degrade gracefully when fasttext is not installed.
+
 ### 3A. Codegen Pipeline (simpler, recommended)
 
 Discovers public datasets, has Ollama write extraction scripts, runs them, and packs the output.
@@ -166,6 +173,23 @@ python webscrapped_dataset_curator_AI_MCP/agent/codegen_pipeline.py \
     --out-dir ./data \
     --public-only \
     --language "en,zh,de,fr"
+
+# With extended quality post-filter (stricter filtering)
+python webscrapped_dataset_curator_AI_MCP/agent/codegen_pipeline.py \
+    --target-size 1GB \
+    --out-dir ./data \
+    --public-only \
+    --mode pretrain \
+    --max-compression-ratio 0.30 \
+    --min-vocab-diversity 0.20 \
+    --max-flagged-ngram-ratio 0.05 \
+    --target-langs en
+
+# Disable extended quality post-filter (use only LLM-generated script filters)
+python webscrapped_dataset_curator_AI_MCP/agent/codegen_pipeline.py \
+    --target-size 500MB \
+    --out-dir ./data \
+    --no-extended-quality
 ```
 
 **Arguments:**
@@ -184,6 +208,14 @@ python webscrapped_dataset_curator_AI_MCP/agent/codegen_pipeline.py \
 | `--max-total-considered` | `40` | Safety ceiling per category |
 | `--reasoning-model` | `None` | LangGraph reasoning model (e.g. `deepseek-r1:7b`) |
 | `--language` | `en` | Comma-separated language codes for discovery |
+| `--no-extended-quality` | `False` | Disable programmatic extended-quality post-filter pass |
+| `--max-compression-ratio` | `0.35` | Max zlib compression ratio for post-filter |
+| `--max-line-repetition` | `0.15` | Max fraction of duplicate lines |
+| `--max-adjacent-repetition` | `0.15` | Max fraction of adjacent near-identical lines |
+| `--min-vocab-diversity` | `0.15` | Min unique/total word ratio |
+| `--max-short-line-ratio` | `0.50` | Max fraction of short/navigation lines |
+| `--max-flagged-ngram-ratio` | `0.10` | Max fraction of lines with flagged patterns |
+| `--target-langs` | `None` | Comma-separated target languages, e.g. `en,de` (requires fasttext) |
 
 ### 3B. Single Dataset: hf_to_packed (fastest for one dataset)
 
@@ -220,7 +252,52 @@ python webscrapped_dataset_curator_AI_MCP/agent/hf_to_packed.py \
     --tokenizer ./tokenizer \
     --out-dir ./packed \
     --keep-scripts
+
+# Extended quality post-filter (stricter filtering, filter out boilerplate)
+python webscrapped_dataset_curator_AI_MCP/agent/hf_to_packed.py \
+    --dataset c4 --config en \
+    --mode pretrain \
+    --tokenizer ./tokenizer \
+    --out-dir ./packed \
+    --max-compression-ratio 0.30 \
+    --min-vocab-diversity 0.20 \
+    --max-flagged-ngram-ratio 0.05 \
+    --target-langs en
+
+# Disable extended quality post-filter
+python webscrapped_dataset_curator_AI_MCP/agent/hf_to_packed.py \
+    --dataset gsm8k --config main \
+    --mode grpo \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_packed \
+    --no-extended-quality
 ```
+
+**Arguments:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dataset` | **(required)** | HuggingFace dataset ID (e.g. `c4`, `gsm8k`) |
+| `--config` | `None` | Dataset config/subset (e.g. `en` for c4) |
+| `--mode` | **(required)** | `pretrain`, `sft`, or `grpo` |
+| `--tokenizer` | `./tokenizer` | Path to tokenizer directory |
+| `--out-dir` | **(required)** | Output directory for packed memmap files |
+| `--seq-length` | `None` | Truncate to this many tokens |
+| `--target-size` | `None (stream all)` | Stop after this much data, e.g. `500MB` |
+| `--language` | `en` | Language code for metadata |
+| `--category` | `None (uses mode)` | Category label for output records |
+| `--val-fraction` | `0.005` | Fraction of tokens for validation |
+| `--min-doc-chars` | `500` | Minimum character count per record |
+| `--reasoning-model` | `None` | LangGraph reasoning model |
+| `--keep-scripts` | `False` | Keep generated scripts for debugging |
+| `--no-extended-quality` | `False` | Disable programmatic extended-quality post-filter |
+| `--max-compression-ratio` | `0.35` | Max zlib compression ratio for post-filter |
+| `--max-line-repetition` | `0.15` | Max fraction of duplicate lines |
+| `--max-adjacent-repetition` | `0.15` | Max fraction of adjacent near-identical lines |
+| `--min-vocab-diversity` | `0.15` | Min unique/total word ratio |
+| `--max-short-line-ratio` | `0.50` | Max fraction of short/navigation lines |
+| `--max-flagged-ngram-ratio` | `0.10` | Max fraction of lines with flagged patterns |
+| `--target-langs` | `None` | Comma-separated target languages (requires fasttext) |
 
 ### 3C. Full Dataset Agent (LLM-planned, most automated)
 
@@ -268,7 +345,50 @@ python webscrapped_dataset_curator_AI_MCP/agent/dataset_agent.py \
     --target-size 500MB \
     --out-dir ./data \
     --hf-datasets "code=bigcode/the-stack-dedup;knowledge=wiki_text"
+
+# With extended quality inline filtering (stricter quality gates)
+python webscrapped_dataset_curator_AI_MCP/agent/dataset_agent.py \
+    --target-size 1GB \
+    --out-dir ./data \
+    --mode pretrain \
+    --max-compression-ratio 0.30 \
+    --min-vocab-diversity 0.20 \
+    --max-flagged-ngram-ratio 0.05 \
+    --target-langs en
+
+# Disable extended quality filters (use only legacy basic filters)
+python webscrapped_dataset_curator_AI_MCP/agent/dataset_agent.py \
+    --target-size 500MB \
+    --out-dir ./data \
+    --no-extended-quality
 ```
+
+**Arguments:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--target-size` | **(required)** | Target dataset size, e.g. `500MB`, `2GB` |
+| `--out-dir` | `./data` | Output directory for JSONL shards |
+| `--categories` | `web,knowledge,reasoning,code,math,science` | Comma-separated category list |
+| `--mode` | `pretrain` | `pretrain`, `sft`, or `grpo` |
+| `--concurrency` | `5` | Max concurrent URL extractions per category |
+| `--min-doc-chars` | `500` | Minimum document length in characters |
+| `--no-llm-judge` | `False` | Skip Ollama quality judge pass |
+| `--mix` | `None` | Budget mix, e.g. `web=0.5,math=0.5` |
+| `--public-sources` | `""` | Comma-separated: `huggingface,kaggle` |
+| `--public-only` | `False` | Skip live web scraping entirely |
+| `--hf-datasets` | `""` | Semicolon-separated `cat=dataset` pairs |
+| `--kaggle-datasets` | `""` | Same format as `--hf-datasets` |
+| `--category-concurrency` | `2` | Max categories running simultaneously |
+| `--log-file` | `None` | Write log to file in addition to stdout |
+| `--no-extended-quality` | `False` | Disable extended quality inline filters |
+| `--max-compression-ratio` | `0.35` | Max zlib compression ratio |
+| `--max-line-repetition` | `0.15` | Max fraction of duplicate lines |
+| `--max-adjacent-repetition` | `0.15` | Max fraction of adjacent near-identical lines |
+| `--min-vocab-diversity` | `0.15` | Min unique/total word ratio |
+| `--max-short-line-ratio` | `0.50` | Max fraction of short/navigation lines |
+| `--max-flagged-ngram-ratio` | `0.10` | Max fraction of lines with flagged patterns |
+| `--target-langs` | `None` | Comma-separated target languages (requires fasttext) |
 
 > **Note:** The agent requires a running Ollama server (`ollama serve`) with a model like `llama3.1` pulled for codegen and quality judging.
 

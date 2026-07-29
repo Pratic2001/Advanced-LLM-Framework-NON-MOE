@@ -70,6 +70,7 @@ from codegen_pipeline import (
     discover_hf_configs,
     generate_and_validate_script,
     parse_size,
+    post_filter_shards,
     run_generated_script,
     sample_hf_dataset,
 )
@@ -208,6 +209,23 @@ def parse_args(argv: Optional[list[str]] = None):
     p.add_argument("--keep-scripts", action="store_true",
                    help="Don't delete the generated scripts directory after "
                         "packing (useful for debugging). Default: delete.")
+    # Extended quality filter CLI args
+    p.add_argument("--no-extended-quality", action="store_true",
+                   help="Disable programmatic extended-quality post-filter pass.")
+    p.add_argument("--max-compression-ratio", type=float, default=0.35,
+                   help="Max zlib compression ratio for post-filter (default 0.35)")
+    p.add_argument("--max-line-repetition", type=float, default=0.15,
+                   help="Max fraction of duplicate lines for post-filter (default 0.15)")
+    p.add_argument("--max-adjacent-repetition", type=float, default=0.15,
+                   help="Max fraction of adjacent near-identical lines for post-filter (default 0.15)")
+    p.add_argument("--min-vocab-diversity", type=float, default=0.15,
+                   help="Min unique/total word ratio for post-filter (default 0.15)")
+    p.add_argument("--max-short-line-ratio", type=float, default=0.50,
+                   help="Max fraction of short/navigation lines for post-filter (default 0.50)")
+    p.add_argument("--max-flagged-ngram-ratio", type=float, default=0.10,
+                   help="Max fraction of lines with flagged patterns for post-filter (default 0.10)")
+    p.add_argument("--target-langs", default=None,
+                   help="Comma-separated target languages for post-filter, e.g. en,de (requires fasttext)")
 
     return p.parse_args(argv)
 
@@ -235,6 +253,19 @@ def main() -> None:
 
     # Resolve category label
     category = args.category or args.mode
+
+    # Extended quality filter config (programmatic post-filter safety net)
+    use_ext_quality = not args.no_extended_quality
+    quality_thresholds = {
+        "max_compression_ratio": args.max_compression_ratio,
+        "max_line_repetition": args.max_line_repetition,
+        "max_adjacent_repetition": args.max_adjacent_repetition,
+        "min_vocab_diversity": args.min_vocab_diversity,
+        "max_short_line_ratio": args.max_short_line_ratio,
+        "max_flagged_ngram_ratio": args.max_flagged_ngram_ratio,
+    } if use_ext_quality else None
+    target_langs = set(l.strip() for l in args.target_langs.split(",")
+                       if l.strip()) if args.target_langs else None
 
     # ------------------------------------------------------------------
     # Step 1: Sample the dataset
@@ -321,6 +352,16 @@ def main() -> None:
 
         if actual_bytes > 0:
             print(f"  produced: {docs} docs, {actual_bytes:,} bytes of JSONL")
+            # Programmatic extended-quality post-filter (safety net)
+            if use_ext_quality and docs > 0:
+                pf_result = post_filter_shards(
+                    jsonl_dir, category, args.mode,
+                    min_doc_chars=args.min_doc_chars,
+                    quality_thresholds=quality_thresholds,
+                    target_langs=target_langs,
+                )
+                docs = pf_result.get("kept_docs", docs)
+                print(f"  after post-filter: {docs} docs kept")
             break  # success — exit the retry loop
 
         # --- Capture runtime error context for the next attempt ---

@@ -621,6 +621,32 @@ do not reimplement filtering or dedup logic yourself:
     passes_code_quality_filter(text: str, path: str, min_doc_chars: int = 500) -> (bool, reason)
         Use only if the category is "code".
 
+    passes_extended_text_quality(text, min_chars=500, max_compression_ratio=0.35,
+        max_line_repetition=0.15, max_adjacent_repetition=0.15, min_vocab_diversity=0.15,
+        max_short_line_ratio=0.50, max_flagged_ngram_ratio=0.10, target_langs=None) -> (bool, reason)
+        Stricter text quality gate for pretrain. Checks zlib compression ratio
+        (boilerplate/logs are highly compressible), duplicate/adjacent-line repetition
+        (templates/nav bars), vocabulary diversity (spam/keyword-stuffing),
+        short-line ratio (navigation/cookie-banner lines), flagged n-gram ratio
+        (copyright/ads/cookie-consent/nav patterns), and optional fasttext language
+        detection. Returns (True, "ok") or (False, "reason:value"). Prefer this over
+        passes_prose_quality_filter for higher-quality corpora.
+
+    passes_extended_sft_quality(prompt: str, answer: str, min_chars=20,
+        max_compression_ratio=0.35, max_flagged_ngram_ratio=0.15, target_langs=None) -> (bool, reason)
+        Extended quality gate for SFT/GRPO pairs. Same zlib compression, flagged
+        n-gram, and language checks applied to the answer text. Prefer this over
+        passes_sft_pair_quality_filter for higher-quality instruction data.
+
+    score_text_quality(text, min_chars=500, target_langs=None) -> float
+        Continuous quality score in [0, 1] for weighted sampling. Considers
+        compression ratio, vocabulary diversity, line/adjacent repetition, short
+        lines, and flagged n-grams. Higher = better.
+
+    detect_language(text, target_langs=None, threshold=0.5) -> (lang_or_None, scores)
+        Optional fasttext-based language detection. Returns None if fasttext is
+        not installed. Pass target_langs={"en"} to filter to English only.
+
     ExactDedup(persist_path: Optional[str] = None)
         .is_duplicate(text: str) -> bool   # call once per record on its
                                             # main text content before writing
@@ -986,6 +1012,135 @@ def _try_known_autofix(script_path: str, error: str) -> bool:
     return True
 
 
+def post_filter_shards(
+    out_dir: str,
+    category: str,
+    mode: str,
+    min_doc_chars: int = 500,
+    quality_thresholds: Optional[dict] = None,
+    target_langs: Optional[set] = None,
+) -> dict:
+    """Programmatic safety-net post-filter that re-reads output shards after a
+    generated script finishes and applies extended quality filters. This
+    catches rows the LLM-generated script may have missed (e.g. if it only used
+    the basic `passes_prose_quality_filter` instead of the stricter extended
+    filters). Reads each shard JSONL, applies the extended quality gate, writes
+    surviving rows to a new shard set, then atomically replaces the originals.
+
+    Args:
+        out_dir: Root output directory (shards live in <out_dir>/<category>/).
+        category: Dataset category name.
+        mode: One of "pretrain", "sft", "grpo".
+        min_doc_chars: Minimum character threshold for extended quality gate.
+        quality_thresholds: Dict of threshold overrides passed to the
+            extended quality functions, or None for defaults.
+        target_langs: Optional set of target language codes for language
+            detection filtering (requires fasttext).
+
+    Returns:
+        dict with keys: "input_docs", "kept_docs", "filtered_docs",
+        "input_bytes", "kept_bytes".
+    """
+    # Lazy-import here because quality.py is staged next to the generated
+    # scripts, not necessarily in this process's sys.path at import time.
+    # Insert the module directory so the import resolves.
+    _qlib_dir = os.path.dirname(QUALITY_PY_PATH)
+    if _qlib_dir not in sys.path:
+        sys.path.insert(0, _qlib_dir)
+    from quality import passes_extended_text_quality as _ext_prose
+    from quality import passes_extended_sft_quality as _ext_sft
+
+    shard_dir = os.path.join(out_dir, category)
+    if not os.path.isdir(shard_dir):
+        log_warn(f"[post-filter] no shard directory at {shard_dir} -- nothing to filter")
+        return {"input_docs": 0, "kept_docs": 0, "filtered_docs": 0,
+                "input_bytes": 0, "kept_bytes": 0}
+
+    # Gather existing shard files
+    shard_pattern = re.compile(rf"^{re.escape(category)}_(\d+)\.jsonl$")
+    shard_files = sorted(
+        f for f in os.listdir(shard_dir) if shard_pattern.match(f)
+    )
+    if not shard_files:
+        log_warn(f"[post-filter] no shard files found in {shard_dir}")
+        return {"input_docs": 0, "kept_docs": 0, "filtered_docs": 0,
+                "input_bytes": 0, "kept_bytes": 0}
+
+    # Prepare extended quality kwargs
+    q_kwargs = dict(quality_thresholds or {})
+    if target_langs is not None:
+        q_kwargs["target_langs"] = target_langs
+
+    # Temp directory for filtered output
+    tmp_dir = os.path.join(shard_dir, ".post_filter_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    from quality import ShardWriter
+
+    # Compute input bytes BEFORE deleting originals
+    input_bytes = sum(
+        os.path.getsize(os.path.join(shard_dir, sf)) for sf in shard_files
+    )
+
+    writer = ShardWriter(out_dir=out_dir, category=category)
+    input_docs = 0
+    kept_docs = 0
+
+    for sf in shard_files:
+        sf_path = os.path.join(shard_dir, sf)
+        with open(sf_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                input_docs += 1
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if mode == "pretrain":
+                    text = record.get("text", "")
+                    ok, _ = _ext_prose(text, min_chars=min_doc_chars, **q_kwargs)
+                else:
+                    prompt = record.get("prompt", "")
+                    answer = record.get("answer", "")
+                    ok, _ = _ext_sft(prompt, answer, min_chars=min_doc_chars, **q_kwargs)
+
+                if ok:
+                    writer.write(record)
+                    kept_docs += 1
+
+    writer.close()
+
+    # Remove originals and tmp dir if everything succeeded
+    for sf in shard_files:
+        os.remove(os.path.join(shard_dir, sf))
+    if os.path.isdir(tmp_dir):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Recalculate kept bytes from the new shards
+    new_shards = sorted(
+        f for f in os.listdir(shard_dir) if shard_pattern.match(f)
+    )
+    kept_bytes = sum(
+        os.path.getsize(os.path.join(shard_dir, f)) for f in new_shards
+    )
+
+    filtered_docs = input_docs - kept_docs
+    if filtered_docs > 0:
+        log_info(f"[post-filter] {category}: filtered {filtered_docs}/{input_docs} "
+                 f"docs via extended quality gate "
+                 f"({kept_bytes/1024**2:.1f} MB kept of {input_bytes/1024**2:.1f} MB)")
+    return {
+        "input_docs": input_docs,
+        "kept_docs": kept_docs,
+        "filtered_docs": filtered_docs,
+        "input_bytes": input_bytes,
+        "kept_bytes": kept_bytes,
+    }
+
+
 def generate_validate_and_run(prompt_fn, script_path: str, target_size: str, out_dir: str,
                                category: str, min_doc_chars: int, log_path: str,
                                extra_args: Optional[list] = None, max_repair: int = 2) -> dict:
@@ -1052,7 +1207,10 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
                         max_candidates_to_try: int = 3,
                         max_total_considered: int = 40,
                         language: str = "en",
-                        reasoning_model: Optional[str] = None) -> dict:
+                        reasoning_model: Optional[str] = None,
+                        use_extended_quality: bool = True,
+                        quality_thresholds: Optional[dict] = None,
+                        target_langs: Optional[set] = None) -> dict:
     """Tries candidate datasets one at a time until either budget_bytes is
     filled or max_candidates_to_try datasets have *actually contributed*
     data. A dataset that gets rejected -- whether pre-download (unsupported
@@ -1165,6 +1323,16 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
                     f"{budget_bytes/1024**2:.1f} MB, {total_docs} docs total "
                     f"({rejected} rejected so far)")
 
+    # Programmatic extended-quality post-filter (safety net for LLM-generated scripts)
+    if use_extended_quality and total_docs > 0:
+        _pf_result = post_filter_shards(
+            out_dir, category, mode,
+            min_doc_chars=min_doc_chars,
+            quality_thresholds=quality_thresholds,
+            target_langs=target_langs,
+        )
+        total_docs = _pf_result.get("kept_docs", total_docs)
+
     return {"target_bytes": budget_bytes, "actual_bytes": total_bytes, "docs": total_docs,
             "candidates_tried": tried, "candidates_rejected": rejected}
 
@@ -1172,7 +1340,10 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
 def run_category_web(category: str, budget_bytes: int, out_dir: str, mode: str,
                      min_doc_chars: int, raw_headroom: float = 1.4,
                      language: str = "en",
-                     reasoning_model: Optional[str] = None) -> dict:
+                     reasoning_model: Optional[str] = None,
+                     use_extended_quality: bool = True,
+                     quality_thresholds: Optional[dict] = None,
+                     target_langs: Optional[set] = None) -> dict:
     scripts_dir = os.path.join(out_dir, "_generated_scripts")
     logs_dir = os.path.join(out_dir, "_logs")
     raw_dir = os.path.join(out_dir, "_raw")
@@ -1218,8 +1389,17 @@ def run_category_web(category: str, budget_bytes: int, out_dir: str, mode: str,
             log_path=os.path.join(logs_dir, f"{safe_name}.log"),
             extra_args=["--raw-path", raw_path],
         )
+    result_docs = result.get("docs", 0)
+    if use_extended_quality and result_docs > 0:
+        _pf_result = post_filter_shards(
+            out_dir, category, mode,
+            min_doc_chars=min_doc_chars,
+            quality_thresholds=quality_thresholds,
+            target_langs=target_langs,
+        )
+        result_docs = _pf_result.get("kept_docs", result_docs)
     return {"target_bytes": budget_bytes, "actual_bytes": result.get("actual_bytes", 0),
-            "docs": result.get("docs", 0)}
+            "docs": result_docs}
 
 
 # ---------------------------------------------------------------------------
@@ -1272,6 +1452,23 @@ def main():
                              "used at dataset discovery time to find HF datasets "
                              "in those languages. Not used for content filtering. "
                              "Default: en.")
+    # Extended quality filter CLI args
+    parser.add_argument("--no-extended-quality", action="store_true",
+                        help="Disable the programmatic extended-quality post-filter pass.")
+    parser.add_argument("--max-compression-ratio", type=float, default=0.35,
+                        help="Max zlib compression ratio for post-filter (default 0.35)")
+    parser.add_argument("--max-line-repetition", type=float, default=0.15,
+                        help="Max fraction of duplicate lines for post-filter (default 0.15)")
+    parser.add_argument("--max-adjacent-repetition", type=float, default=0.15,
+                        help="Max fraction of adjacent near-identical lines for post-filter (default 0.15)")
+    parser.add_argument("--min-vocab-diversity", type=float, default=0.15,
+                        help="Min unique/total word ratio for post-filter (default 0.15)")
+    parser.add_argument("--max-short-line-ratio", type=float, default=0.50,
+                        help="Max fraction of short/navigation lines for post-filter (default 0.50)")
+    parser.add_argument("--max-flagged-ngram-ratio", type=float, default=0.10,
+                        help="Max fraction of lines with flagged patterns for post-filter (default 0.10)")
+    parser.add_argument("--target-langs", default=None,
+                        help="Comma-separated target languages for post-filter, e.g. en,de (requires fasttext)")
     args = parser.parse_args()
 
     _env_banner()
@@ -1290,6 +1487,19 @@ def main():
     manifest = {"target_bytes": target_bytes, "mode": args.mode,
                 "language": args.language, "mix": mix, "categories": {}}
 
+    # Extended quality filter config (used as programmatic post-filter pass)
+    use_ext_quality = not args.no_extended_quality
+    quality_thresholds = {
+        "max_compression_ratio": args.max_compression_ratio,
+        "max_line_repetition": args.max_line_repetition,
+        "max_adjacent_repetition": args.max_adjacent_repetition,
+        "min_vocab_diversity": args.min_vocab_diversity,
+        "max_short_line_ratio": args.max_short_line_ratio,
+        "max_flagged_ngram_ratio": args.max_flagged_ngram_ratio,
+    } if use_ext_quality else None
+    target_langs = set(l.strip() for l in args.target_langs.split(",")
+                       if l.strip()) if args.target_langs else None
+
     for category, frac in mix.items():
         budget = int(target_bytes * frac)
         if budget <= 0:
@@ -1303,12 +1513,18 @@ def main():
                 max_candidates_to_try=args.max_candidates_to_try,
                 max_total_considered=args.max_total_considered,
                 language=args.language,
-                reasoning_model=args.reasoning_model)
+                reasoning_model=args.reasoning_model,
+                use_extended_quality=not args.no_extended_quality,
+                quality_thresholds=quality_thresholds,
+                target_langs=target_langs)
         else:
             manifest["categories"][category] = run_category_web(
                 category, budget, args.out_dir, args.mode, args.min_doc_chars,
                 language=args.language,
-                reasoning_model=args.reasoning_model)
+                reasoning_model=args.reasoning_model,
+                use_extended_quality=not args.no_extended_quality,
+                quality_thresholds=quality_thresholds,
+                target_langs=target_langs)
 
     manifest_path = os.path.join(args.out_dir, "manifest.json")
     with open(manifest_path, "w") as f:
