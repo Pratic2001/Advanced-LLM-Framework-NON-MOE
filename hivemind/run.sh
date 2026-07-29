@@ -92,6 +92,64 @@ case "$MODE" in
       "$@"
     ;;
 
+  grpo-bootstrap)
+    echo "=== Starting Hivemind GRPO BOOTSTRAP peer ==="
+    echo ""
+
+    PORT="${PORT:-5678}"
+    exec python "$REPO_DIR/hivemind/train_grpo_hivemind.py" \
+      --hivemind \
+      --initial-peers "" \
+      --port "$PORT" \
+      "$@"
+    ;;
+
+  grpo-worker)
+    BOOTSTRAP_ADDR="${1}"
+    shift || {
+      echo "Usage: run.sh grpo-worker <bootstrap-ip:port> [args...]"
+      exit 1
+    }
+    echo "=== Starting Hivemind GRPO WORKER peer ==="
+    echo "    Connecting to bootstrap peer at $BOOTSTRAP_ADDR"
+    echo ""
+
+    exec python "$REPO_DIR/hivemind/train_grpo_hivemind.py" \
+      --hivemind \
+      --initial-peers "$BOOTSTRAP_ADDR" \
+      --port 0 \
+      "$@"
+    ;;
+
+  dpo-bootstrap)
+    echo "=== Starting Hivemind DPO BOOTSTRAP peer ==="
+    echo ""
+
+    PORT="${PORT:-5678}"
+    exec python "$REPO_DIR/hivemind/train_dpo_hivemind.py" \
+      --hivemind \
+      --initial-peers "" \
+      --port "$PORT" \
+      "$@"
+    ;;
+
+  dpo-worker)
+    BOOTSTRAP_ADDR="${1}"
+    shift || {
+      echo "Usage: run.sh dpo-worker <bootstrap-ip:port> [args...]"
+      exit 1
+    }
+    echo "=== Starting Hivemind DPO WORKER peer ==="
+    echo "    Connecting to bootstrap peer at $BOOTSTRAP_ADDR"
+    echo ""
+
+    exec python "$REPO_DIR/hivemind/train_dpo_hivemind.py" \
+      --hivemind \
+      --initial-peers "$BOOTSTRAP_ADDR" \
+      --port 0 \
+      "$@"
+    ;;
+
   average)
     # Run checkpoint averaging across the swarm (no training, just merge)
     echo "=== Averaging checkpoints across Hivemind swarm ==="
@@ -109,31 +167,55 @@ case "$MODE" in
     echo "============================================================================"
     echo ""
     echo " Commands:"
-    echo "   bootstrap              Start as bootstrap peer (first node)"
-    echo "   worker <ip:port>       Join as worker peer"
+    echo "   pretrain / training:"
+    echo "   bootstrap              Start as pretrain bootstrap peer (first node)"
+    echo "   worker <ip:port>       Join as pretrain worker peer"
+    echo "   average <ip:port> [dir]  Average checkpoints across swarm"
+    echo ""
+    echo "   SFT:"
     echo "   sft-bootstrap          Start SFT bootstrap peer"
     echo "   sft-worker <ip:port>   Join SFT worker peer"
-    echo "   average <ip:port> [dir]  Average checkpoints across swarm"
-    echo "   help                   Show this help"
+    echo ""
+    echo "   GRPO (reinforcement learning):"
+    echo "   grpo-bootstrap         Start GRPO bootstrap peer"
+    echo "   grpo-worker <ip:port>  Join GRPO worker peer"
+    echo ""
+    echo "   DPO (preference optimization):"
+    echo "   dpo-bootstrap          Start DPO bootstrap peer"
+    echo "   dpo-worker <ip:port>   Join DPO worker peer"
     echo ""
     echo " Environment variables:"
     echo "   PORT          Peer port (default 5678 for bootstrap)"
     echo ""
     echo " Examples:"
-    echo "   # Machine A (bootstrap):"
+    echo "   # Machine A (pretrain bootstrap):"
     echo "     PORT=5678 bash hivemind/run.sh bootstrap --model-size 300M \\"
     echo "       --data-dir ./packed --batch-size 4"
     echo ""
-    echo "   # Machine B (worker, points to A at 192.168.1.5):"
+    echo "   # Machine B (pretrain worker, points to A at 192.168.1.5):"
     echo "     bash hivemind/run.sh worker 192.168.1.5:5678 --model-size 300M \\"
     echo "       --data-dir ./packed --batch-size 2"
+    echo ""
+    echo "   # SFT swarm (bootstrap):"
+    echo "     bash hivemind/run.sh sft-bootstrap --model-size 300M \\"
+    echo "       --data-dir ./sft_packed --lora-rank 64"
+    echo ""
+    echo "   # GRPO swarm (worker):"
+    echo "     bash hivemind/run.sh grpo-worker 192.168.1.5:5678 \\"
+    echo "       --checkpoint ./sft_ckpts/latest.pt --data-dir ./grpo_packed \\"
+    echo "       --tokenizer ./tokenizer --batch-size 2"
+    echo ""
+    echo "   # DPO swarm (worker):"
+    echo "     bash hivemind/run.sh dpo-worker 192.168.1.5:5678 \\"
+    echo "       --checkpoint ./sft_ckpts/latest.pt --data-dir ./dpo_packed \\"
+    echo "       --tokenizer ./tokenizer --batch-size 2"
     echo ""
     echo "   # Machine C (laptop, CPU only, small batch):"
     echo "     bash hivemind/run.sh worker 192.168.1.5:5678 --model-size 300M \\"
     echo "       --data-dir ./packed --batch-size 1 --dtype fp32"
     echo ""
     echo " Notes:"
-    echo "   - All peers must use the same --model-size."
+    echo "   - All peers in the same swarm must use the same --model-size."
     echo "   - Each peer can have a different --batch-size / --grad-accum."
     echo "   - Data must be accessible by all peers (shared NFS or copy)."
     echo "   - Use a VPN (Tailscale, ZeroTier) if machines are on different networks."
@@ -142,7 +224,9 @@ case "$MODE" in
 
   *)
     echo "Unknown mode: $MODE"
-    echo "Usage: run.sh <bootstrap|worker|sft-bootstrap|sft-worker|average|help> [args...]"
+    echo "Usage: run.sh <bootstrap|worker|sft-bootstrap|sft-worker|"
+    echo "              grpo-bootstrap|grpo-worker|dpo-bootstrap|dpo-worker|"
+    echo "              average|help> [args...]"
     exit 1
     ;;
 esac

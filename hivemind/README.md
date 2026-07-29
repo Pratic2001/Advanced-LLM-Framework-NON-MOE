@@ -93,10 +93,219 @@ bash hivemind/run.sh average 192.168.1.100:5678 ./averaged_model
 | File | Purpose |
 |------|---------|
 | `hivemind_utils.py` | Shared utilities: peer setup, `build_hivemind_optimizer()`, checkpoint helpers |
-| `train_pretrain_hivemind.py` | Decentralized pretraining (main training entry point) |
-| `train_sft_hivemind.py` | Supervised fine-tuning with Hivemind (supports LoRA/DoRA) |
-| `run.sh` | Convenience launcher for bootstrap/worker modes |
+| `train_pretrain_hivemind.py` | Decentralized **pretraining** (main training entry point) |
+| `train_sft_hivemind.py` | **Supervised fine-tuning** with Hivemind (supports LoRA/DoRA) |
+| `train_grpo_hivemind.py` | **GRPO RL post-training** with Hivemind (policy-only averaging) |
+| `train_dpo_hivemind.py` | **DPO preference optimization** with Hivemind (policy-only averaging) |
+| `run.sh` | Convenience launcher for all training modes |
 | `requirements-hivemind.txt` | Additional dependencies |
+
+## Training Pipeline
+
+The full post-training pipeline matches the base framework:
+
+```
+Pretrain  ──→  SFT  ──→  GRPO or DPO
+(train_pretrain   (train_sft    (train_grpo_hivemind.py
+ _hivemind.py)     _hivemind.py)  or train_dpo_hivemind.py)
+```
+
+### Pretrain
+
+```bash
+# Bootstrap
+bash hivemind/run.sh bootstrap --model-size 300M --data-dir ./packed \
+  --batch-size 8 --grad-accum 4 --checkpoint-dir ./hivemind_ckpts
+
+# Worker
+bash hivemind/run.sh worker 192.168.1.100:5678 --model-size 300M \
+  --data-dir ./packed --batch-size 4 --checkpoint-dir ./hivemind_ckpts_b
+```
+
+### SFT
+
+```bash
+# Bootstrap
+bash hivemind/run.sh sft-bootstrap --model-size 300M \
+  --data-dir ./sft_packed --lora-rank 64 --checkpoint-dir ./sft_ckpts
+
+# Worker
+bash hivemind/run.sh sft-worker 192.168.1.100:5678 --model-size 300M \
+  --data-dir ./sft_packed --lora-rank 64 --checkpoint-dir ./sft_ckpts_b
+```
+
+### GRPO (Reinforcement Learning)
+
+```bash
+# Bootstrap
+bash hivemind/run.sh grpo-bootstrap \
+  --checkpoint ./sft_ckpts/latest.pt \
+  --data-dir ./grpo_packed --tokenizer ./tokenizer \
+  --out-dir ./grpo_ckpts --lora-rank 64
+
+# Worker
+bash hivemind/run.sh grpo-worker 192.168.1.100:5678 \
+  --checkpoint ./sft_ckpts/latest.pt \
+  --data-dir ./grpo_packed --tokenizer ./tokenizer \
+  --out-dir ./grpo_ckpts_b --batch-size 2
+```
+
+### DPO (Preference Optimization)
+
+```bash
+# Bootstrap
+bash hivemind/run.sh dpo-bootstrap \
+  --checkpoint ./sft_ckpts/latest.pt \
+  --data-dir ./dpo_packed --tokenizer ./tokenizer \
+  --out-dir ./dpo_ckpts --lora-rank 64
+
+# Worker
+bash hivemind/run.sh dpo-worker 192.168.1.100:5678 \
+  --checkpoint ./sft_ckpts/latest.pt \
+  --data-dir ./dpo_packed --tokenizer ./tokenizer \
+  --out-dir ./dpo_ckpts_b --batch-size 2
+```
+
+## Real-World Heterogeneous Setup
+
+Below are concrete examples for three very different machines pooling their
+compute on the same training run.  Adjust IPs, ports, and paths to match your
+network.
+
+> **Important**: All peers must share access to the same packed data directory
+> (NFS / network drive or a copy on each machine).  Each peer has its **own**
+> checkpoint directory so it can save and resume independently.
+
+### Machine A — Desktop (32 GB RAM, RTX 4090)
+
+This machine is the fastest — make it the **bootstrap** peer and use the most
+aggressive batch sizes.  Its Gradio 4090 can run BF16 and handle large batches,
+so it drives most of the training progress.
+
+```bash
+# ── Pretrain ────────────────────────────────────────────────────────
+PORT=5678 bash hivemind/run.sh bootstrap --model-size 300M \
+  --data-dir /mnt/nfs/packed \
+  --batch-size 16 --grad-accum 2 --dtype bf16 \
+  --checkpoint-dir /mnt/nfs/ckpts_a/pretrain
+
+# ── SFT ──────────────────────────────────────────────────────────────
+PORT=5678 bash hivemind/run.sh sft-bootstrap --model-size 300M \
+  --data-dir /mnt/nfs/sft_packed \
+  --batch-size 8 --grad-accum 4 --dtype bf16 \
+  --lora-rank 64 --checkpoint-dir /mnt/nfs/ckpts_a/sft
+
+# ── GRPO ──────────────────────────────────────────────────────────────
+PORT=5678 bash hivemind/run.sh grpo-bootstrap \
+  --checkpoint /mnt/nfs/ckpts_a/sft/latest.pt \
+  --data-dir /mnt/nfs/grpo_packed \
+  --tokenizer /mnt/nfs/tokenizer \
+  --batch-size 8 --num-generations 8 --max-new-tokens 512 \
+  --lora-rank 64 --out-dir /mnt/nfs/ckpts_a/grpo
+
+# ── DPO ───────────────────────────────────────────────────────────────
+PORT=5678 bash hivemind/run.sh dpo-bootstrap \
+  --checkpoint /mnt/nfs/ckpts_a/sft/latest.pt \
+  --data-dir /mnt/nfs/dpo_packed \
+  --tokenizer /mnt/nfs/tokenizer \
+  --batch-size 8 --beta 0.1 \
+  --lora-rank 64 --out-dir /mnt/nfs/ckpts_a/dpo
+```
+
+### Machine B — Older Desktop (16 GB RAM, RTX 3050)
+
+This machine has a smaller GPU with 4–6 GB VRAM.  Use smaller batch sizes,
+fewer GRPO generations, and FP32 (or mixed-precision if supported).  Point
+`--initial-peers` to Machine A's IP.
+
+```bash
+# ── Pretrain ────────────────────────────────────────────────────────
+bash hivemind/run.sh worker 192.168.1.100:5678 --model-size 300M \
+  --data-dir /mnt/nfs/packed \
+  --batch-size 4 --grad-accum 4 --dtype bf16 \
+  --checkpoint-dir /mnt/nfs/ckpts_b/pretrain
+
+# ── SFT ──────────────────────────────────────────────────────────────
+bash hivemind/run.sh sft-worker 192.168.1.100:5678 --model-size 300M \
+  --data-dir /mnt/nfs/sft_packed \
+  --batch-size 4 --grad-accum 8 --dtype bf16 \
+  --lora-rank 32 --checkpoint-dir /mnt/nfs/ckpts_b/sft
+
+# ── GRPO ──────────────────────────────────────────────────────────────
+bash hivemind/run.sh grpo-worker 192.168.1.100:5678 \
+  --checkpoint /mnt/nfs/ckpts_a/sft/latest.pt \
+  --data-dir /mnt/nfs/grpo_packed \
+  --tokenizer /mnt/nfs/tokenizer \
+  --batch-size 4 --num-generations 4 --max-new-tokens 256 \
+  --lora-rank 32 --out-dir /mnt/nfs/ckpts_b/grpo
+
+# ── DPO ───────────────────────────────────────────────────────────────
+bash hivemind/run.sh dpo-worker 192.168.1.100:5678 \
+  --checkpoint /mnt/nfs/ckpts_a/sft/latest.pt \
+  --data-dir /mnt/nfs/dpo_packed \
+  --tokenizer /mnt/nfs/tokenizer \
+  --batch-size 4 --beta 0.1 \
+  --lora-rank 32 --out-dir /mnt/nfs/ckpts_b/dpo
+```
+
+### Machine C — Laptop (8 GB RAM, CPU only)
+
+The humblest peer contributes whatever it can — every local step still counts
+toward the global model.  Use `--dtype fp32`, `--batch-size 1`, and tiny
+checkpoint intervals so you don't lose work if the laptop goes to sleep.
+
+```bash
+# ── Pretrain ────────────────────────────────────────────────────────
+bash hivemind/run.sh worker 192.168.1.100:5678 --model-size 300M \
+  --data-dir /mnt/nfs/packed \
+  --batch-size 1 --grad-accum 1 --dtype fp32 \
+  --checkpoint-dir /home/user/ckpts_c/pretrain
+
+# ── SFT ──────────────────────────────────────────────────────────────
+bash hivemind/run.sh sft-worker 192.168.1.100:5678 --model-size 300M \
+  --data-dir /mnt/nfs/sft_packed \
+  --batch-size 1 --grad-accum 1 --dtype fp32 \
+  --lora-rank 8 --checkpoint-dir /home/user/ckpts_c/sft
+
+# ── GRPO ──────────────────────────────────────────────────────────────
+bash hivemind/run.sh grpo-worker 192.168.1.100:5678 \
+  --checkpoint /mnt/nfs/ckpts_a/sft/latest.pt \
+  --data-dir /mnt/nfs/grpo_packed \
+  --tokenizer /mnt/nfs/tokenizer \
+  --batch-size 1 --num-generations 2 --max-new-tokens 128 \
+  --lora-rank 8 --out-dir /home/user/ckpts_c/grpo
+
+# ── DPO ───────────────────────────────────────────────────────────────
+bash hivemind/run.sh dpo-worker 192.168.1.100:5678 \
+  --checkpoint /mnt/nfs/ckpts_a/sft/latest.pt \
+  --data-dir /mnt/nfs/dpo_packed \
+  --tokenizer /mnt/nfs/tokenizer \
+  --batch-size 1 --beta 0.1 \
+  --lora-rank 8 --out-dir /home/user/ckpts_c/dpo
+```
+
+### What to expect
+
+| Machine | Est. relative throughput | Contributes |
+|---------|------------------------|-------------|
+| A (4090, 32 GB) | ~100% (baseline) | ~75% of all gradient updates |
+| B (3050, 16 GB) | ~40% | ~20% of all gradient updates |
+| C (CPU, 8 GB) | ~1–2% | ~5% of all gradient updates |
+
+Even the slow CPU laptop adds value — its parameter updates are applied and
+averaged just like the GPU peers', and the async all-reduce means nobody waits
+for it.  The 4090 will do 10–15 local steps per CPU step, which is exactly
+how Hivemind is designed to work.
+
+### Tips for CPU peers
+
+- Use `--save-every` every 10–20 steps so partial progress is preserved if the
+  laptop goes to sleep.
+- The CPU peer may lag behind by thousands of steps — this is fine.  Hivemind's
+  `load_state_from_peers()` call on startup catches it up to the current swarm
+  average.
+- GRPO rollout generation is especially slow on CPU.  Reduce `--num-generations`
+  to 1 or 2 and `--max-new-tokens` to 128.
 
 ## CLI Reference
 
@@ -125,6 +334,33 @@ bash hivemind/run.sh average 192.168.1.100:5678 ./averaged_model
 --lr / --min-lr               Learning rate (auto-scaled by model size)
 ```
 
+## Multi-Model Training (GRPO / DPO)
+
+GRPO and DPO involve **two** models — a **policy** (trainable) and a **reference** (frozen). Only the policy's optimizer should be wrapped in `DecentralizedOptimizer`:
+
+```
+┌─────────────────────────────────────────────┐
+│  Peer                                       │
+│                                             │
+│  ┌──────────┐    ┌──────────────┐           │
+│  │  Policy   │    │  Reference   │           │
+│  │  Model    │    │  Model       │           │
+│  │  (train)  │    │  (frozen)    │           │
+│  └─────┬────┘    └──────────────┘           │
+│        │                                    │
+│  ┌─────▼──────┐                              │
+│  │ Decentralized │  ← async all-reduce       │
+│  │ Optimizer   │    with other peers         │
+│  └─────────────┘                              │
+└─────────────────────────────────────────────┘
+```
+
+Key points:
+- **Policy model**: trainable parameters are averaged across peers via `DecentralizedOptimizer`
+- **Reference model**: fully local and frozen — **not** averaged (each peer keeps its own copy)
+- **Data sharding**: each peer sees a different subset of prompts/preference-pairs via endpoint-hash sharding
+- **Checkpoints**: save the inner (unwrapped) optimizer state so checkpoints are portable across Hivemind/non-Hivemind runs
+
 ## Heterogeneous Training Tips
 
 ### Batch sizes
@@ -147,7 +383,7 @@ python hivemind/train_pretrain_hivemind.py --hivemind \
 The bootstrap peer needs port `--port` (default random, but set it explicitly for bootstrap) reachable from workers.
 
 ### Data access
-Every peer needs access to the packed data files. Options:
+Every peer needs access to the data files. Options:
 1. **Shared NFS / network drive** — simplest
 2. **Copy data to each machine** — works, no network dependency
 3. **Different shards** — each peer can have a unique subset; Hivemind only averages parameters
@@ -155,9 +391,9 @@ Every peer needs access to the packed data files. Options:
 ### Resuming
 Each peer resumes from its **own** checkpoint directory:
 ```bash
-python hivemind/train_pretrain_hivemind.py --hivemind \
+python hivemind/train_grpo_hivemind.py --hivemind \
   --initial-peers "192.168.1.100:5678" \
-  --resume ./hivemind_ckpts_c
+  --resume ./grpo_ckpts/grpo_step0000050.pt
 ```
 
 ## How It Works Under the Hood
@@ -185,6 +421,26 @@ Each call to `step()`:
 3. Returns immediately — the training loop continues
 4. When the all-reduce finishes, averaged parameters are written into the model
 
+### Multi-model support (GRPO/DPO)
+
+For GRPO and DPO, only the policy model's parameters should be wrapped:
+
+```python
+# Policy optimizer — wrapped in Hivemind for async averaging
+policy_opt = torch.optim.AdamW(policy_model.parameters(), lr=lr)
+hopt = DecentralizedOptimizer(
+    params=policy_model.parameters(),
+    opt=policy_opt,
+    peer=peer,
+    target_group_size=8,
+    averaging_period=1,
+)
+
+# Reference model — stays local, not averaged
+ref_model = build_reference("two", config, checkpoint_path, device)
+# ref_model is frozen and used only for KL / log-ratio computation
+```
+
 ### Data Sharding
 
 Each peer deterministically derives a shard index from its endpoint hash, ensuring different peers see different data. The total number of shards is estimated from `target_group_size` + visible peers.
@@ -205,20 +461,4 @@ After training (or periodically), `average_checkpoints_via_hivemind()` performs 
 | Checkpoint | One per group | One per peer (independently) |
 | Complexity | Simple (torchrun) | Slightly more (swarm setup) |
 | Fault tolerance | Low (one fails = all fail) | High (peers join/leave freely) |
-
-## Extending to GRPO / DPO
-
-The same `DecentralizedOptimizer` pattern can wrap GRPO and DPO optimizers.
-The key difference is that GRPO and DPO involve multiple models (policy,
-reference, reward) — only the policy model's parameters should be averaged
-across peers:
-
-```python
-# Example pattern for GRPO with Hivemind
-policy_opt = torch.optim.AdamW(policy_model.parameters(), lr=lr)
-hopt = build_hivemind_optimizer(policy_model, policy_opt, peer, ...)
-# Reference model and reward model stay local (not averaged)
-```
-
-See `train_sft_hivemind.py` for a complete LoRA/DoRA example that can
-serve as the template for GRPO/DPO adaptation.
+| Multi-model (GRPO/DPO) | All models in DDP | Only policy averaged |
