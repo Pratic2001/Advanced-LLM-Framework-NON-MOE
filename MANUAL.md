@@ -1,566 +1,284 @@
-# Advanced LLM Framework — Complete User Manual
+# 📖 Advanced LLM Framework — Complete User Manual
 
-> **Dense, Non-MoE Transformer** with a full three-stage training pipeline
-> (pretrain → SFT → GRPO) and an integrated data curation agent.
-
-![Pipeline Overview](https://via.placeholder.com/800x150?text=Pretrain+->+SFT+->+GRPO+Post-Training+Pipeline)
+> **Command examples for every feature** in the dense (non-MoE) LLM training pipeline.
+>
+> Tokenizer → Data Curation → Packing → Pretrain → SFT → GRPO/DPO → Inference
 
 ---
 
 ## Table of Contents
 
-1. [Quick Start](#1-quick-start)
-2. [Architecture Overview](#2-architecture-overview)
-3. [Recipe System](#3-recipe-system)
-4. [Training a Tokenizer](#4-training-a-tokenizer)
-5. [Data Pipeline (Curating Datasets)](#5-data-pipeline)
-   - 5.1  Using the Data Curation Agent
-   - 5.2  Public Dataset Sources (HF / Kaggle)
-   - 5.3  Codegen Pipeline (Simpler Alternative)
-   - 5.4  Web Scraping MCP Server
-6. [Packing Data for Training](#6-packing-data-for-training)
-   - 6.1  Pretrain Packing
-   - 6.2  SFT Packing
-   - 6.3  GRPO Packing
-   - 6.4  DPO Packing
-7. [Training: Pretraining](#7-training-pretraining)
-   - 7.1  Torch DDP (train_pretrain.py)
-   - 7.2  DeepSpeed (train_pretrain_deepspeed.py)
-8. [Training: Supervised Fine-Tuning (SFT)](#8-training-sft)
-   - 8.1  Torch DDP (train_sft.py)
-   - 8.2  DeepSpeed (train_sft_deepspeed.py)
-9. [Training: GRPO Reinforcement Learning](#9-training-grpo)
-   - 9.1  Torch DDP (train_grpo.py)
-   - 9.2  DeepSpeed (train_grpo_deepspeed.py)
-10. [Training: DPO Direct Preference Optimization](#10-training-dpo)
-   - 10.1 Ollama Judge (ollama_judge.py)
-   - 10.2 Torch DDP (train_dpo.py)
-   - 10.3 DeepSpeed (train_dpo_deepspeed.py)
-11. [Inference](#11-inference)
-12. [Model Architecture](#12-model-architecture)
-13. [Troubleshooting & FAQ](#13-troubleshooting--faq)
+1. [Quick Reference: Smoke Tests](#1-quick-reference-smoke-tests)
+2. [Tokenizer Training](#2-tokenizer-training)
+3. [Data Curation](#3-data-curation)
+4. [Data Packing](#4-data-packing)
+5. [Pretraining](#5-pretraining)
+6. [Supervised Fine-Tuning (SFT)](#6-supervised-fine-tuning-sft)
+7. [GRPO (Reinforcement Learning)](#7-grpo-reinforcement-learning)
+8. [DPO (Preference Optimization)](#8-dpo-preference-optimization)
+9. [Inference](#9-inference)
+10. [Architecture Variants](#10-architecture-variants)
+11. [Recipe System](#11-recipe-system)
+12. [Optimizer & LR Schedules](#12-optimizer--lr-schedules)
+13. [PEFT: LoRA / DoRA / rsLoRA](#13-peft-lora--dora--rslora)
+14. [RoPE Scaling (YaRN / NTK)](#14-rope-scaling-yarn--ntk)
+15. [Ollama DPO Judge](#15-ollama-dpo-judge)
+16. [Distributed Multi-GPU](#16-distributed-multi-gpu)
+17. [Decentralized Hivemind Training](#17-decentralized-hivemind-training)
+18. [Checkpoint Save / Resume](#18-checkpoint-save--resume)
+19. [Model Architecture Reference](#19-model-architecture-reference)
+20. [Appendix A: Full CLI Reference](#appendix-a-full-cli-reference)
 
 ---
 
-## 1. Quick Start
+## 1. Quick Reference: Smoke Tests
+
+Every script has a `--smoke-test` mode that runs a tiny end-to-end test with synthetic data — no real checkpoints or data needed:
 
 ```bash
-# 1. Train a tokenizer
-python tokenizer_train.py --data-dir ./data --output-dir ./tokenizer --mode reasoning
+# Pretrain smoke test
+python train_pretrain.py --smoke-test
 
-# 2. Curate a dataset (200 MB of pretraining data)
-python webscrapped_dataset_curator_AI_MCP/agent/dataset_agent.py \
-    --target-size 200MB --categories web,knowledge,math \
-    --out-dir ./data --mode pretrain --concurrency 5
+# Pretrain + DeepSpeed smoke test
+python train_pretrain_deepspeed.py --smoke-test
 
-# 3. Pack it
-python data/pack_pretrain.py --data-dir ./data --tokenizer ./tokenizer --cache-dir ./packed
+# SFT smoke test (creates a small model + synthetic data)
+python train_sft.py --smoke-test
 
-# 4. Pretrain (single GPU, 0.3B model)
-python train_pretrain.py --model-size 0.3B --data-dir ./packed --checkpoint-dir ./checkpoints
+# SFT + DeepSpeed smoke test
+python train_sft_deepspeed.py --smoke-test
 
-# 5. Generate text
-python infer.py --checkpoint ./checkpoints/latest_checkpoint --prompt "Hello, world!"
-```
+# GRPO smoke test
+python train_grpo.py --smoke-test
 
----
+# GRPO + DeepSpeed smoke test
+python train_grpo_deepspeed.py --smoke-test
 
-## 2. Architecture Overview
+# DPO smoke test
+python train_dpo.py --smoke-test
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                      TrainingRecipe                          │
-│  (mode, chat template, special tokens, model_name)           │
-└─────┬──────────────────────┬──────────────────┬──────────────┘
-      │                      │                  │
-      ▼                      ▼                  ▼
-┌──────────┐        ┌──────────────┐    ┌──────────────┐
-│ Tokenizer│───────▶│  Pack Data   │───▶│  Train       │
-│ Trainer  │        │ pretrain/sft │    │ DDP / DS     │
-│          │        │ /grpo        │    │              │
-└──────────┘        └──────────────┘    └──────┬───────┘
-                                               │
-                                               ▼
-┌──────────┐                            ┌──────────────┐
-│  Data    │◀───────────────────────────│    Infer     │
-│  Agent   │                            │  (Load ckpt) │
-└──────────┘                            └──────────────┘
-```
+# DPO + DeepSpeed smoke test
+python train_dpo_deepspeed.py --smoke-test
 
-### Directory Layout
-
-```
-.
-├── recipe.py                          # TrainingRecipe — single source of truth
-├── model.py                           # Dense transformer (ModelConfig + TransformerForCausalLM)
-├── tokenizer_train.py                 # BBPE tokenizer trainer
-│
-├── train_pretrain.py                  # Pretrain — torch DDP
-├── train_pretrain_deepspeed.py        # Pretrain — DeepSpeed
-├── train_sft.py                       # SFT — torch DDP (+ LoRA/DoRA)
-├── train_sft_deepspeed.py             # SFT — DeepSpeed
-├── train_grpo.py                      # GRPO RL — torch DDP
-├── train_grpo_deepspeed.py            # GRPO RL — DeepSpeed
-├── train_dpo.py                       # DPO — torch DDP (preference optimization)
-├── train_dpo_deepspeed.py             # DPO — DeepSpeed
-├── ollama_judge.py                    # Ollama remote judge for DPO pair generation
-├── infer.py                           # Inference (quant, streaming, REPL)
-│
-├── model.py                           # Model definitions
-├── optim/
-│   ├── build_optimizer.py             # AdamW, FusedAdam, Muon
-│   └── lr_schedule.py                 # Cosine, WSD schedules
-├── peft/
-│   └── lora.py                        # LoRA / DoRA / rsLoRA
-├── data/
-│   ├── pack_pretrain.py               # Pack pretrain JSONL → .bin
-│   ├── pack_sft.py                    # Pack SFT JSONL → .bin + mask
-│   ├── pack_grpo.py                   # Pack GRPO prompts → .bin + answers
-   └── pack_dpo.py                    # Pack DPO preference triples → .bin
-├── configs/                           # Training config files
-├── tests/
-│   └── test_model.py                  # Forward/backward smoke tests
-│
-└── webscrapped_dataset_curator_AI_MCP/
-    ├── README.md
-    ├── agent/
-    │   ├── dataset_agent.py           # Self-directed curation agent
-    │   ├── codegen_pipeline.py        # Alternative simpler pipeline
-    │   ├── public_sources.py          # HF Hub / Kaggle connectors
-    │   ├── quality.py                 # Filters, dedup, shard writer
-    │   └── topics.py                  # Topic seeds per category
-    └── web_scraper_mcp/
-        ├── server.py                  # FastMCP server (tools: search, fetch, extract…)
-        ├── extractors.py              # Multi-format extractors
-        ├── crawl4ai_backend.py        # Headless browser backend
-        └── net_utils.py               # Retry, proxy, user-agent pool
+# Inference smoke test (no checkpoint needed)
+python infer.py --smoke-test
 ```
 
 ---
 
-## 3. Recipe System
+## 2. Tokenizer Training
 
-> **`recipe.py`** is the single source of truth that every script imports.
-> Instead of hardcoding template strings, special tokens, or model names
-> in each script, define them once in a `TrainingRecipe`.
-
-### Three Training Modes
-
-Mode | `<think>` tags? | Use case
----|---|---
-`reasoning` | Required | Math, code, logic — model must show chain-of-thought
-`non_reasoning` | Forbidden | General chat, instruction following, creative writing
-`hybrid` | Per-example | Mix of reasoning and non-reasoning examples in same training run
-
-### Creating a Recipe
-
-```python
-from recipe import TrainingRecipe
-
-# Default — reasoning mode
-recipe = TrainingRecipe()
-
-# Explicit
-recipe = TrainingRecipe(
-    mode="hybrid",
-    turn_prefix_user="<|im_start|>user\n",
-    turn_suffix_user="<|im_end|>\n",
-)
-
-print(recipe.special_tokens)
-# ['<|endoftext|>', '<|pad|>', '<|im_start|>', '<|im_end|>', '<think>', '</think>', '<|think_on|>', '<|think_off|>']
-```
-
-### Sample Recipe File
-
-A reference `recipe.json` is provided at the project root:
-
-```json
-{
-    "comment": "Sample TrainingRecipe for the Advanced LLM Framework",
-    "description": "Hybrid mode recipe with ChatML template.",
-
-    "mode": "hybrid",
-
-    "chat_template": "chatml",
-
-    "turn_prefix_user": "<|im_start|>user\n",
-    "turn_suffix_user": "<|im_end|>\n",
-
-    "turn_prefix_assistant": "<|im_start|>assistant\n",
-    "turn_suffix_assistant": "<|im_end|>\n",
-
-    "think_open": "<think>",
-    "think_close": "</think>",
-
-    "hybrid_think_token": "<|think_on|>",
-    "hybrid_nothink_token": "<|think_off|>",
-
-    "base_special_tokens": [
-        "<|endoftext|>",
-        "<|pad|>",
-        "<|im_start|>",
-        "<|im_end|>"
-    ],
-
-    "model_name": "DenseLLM"
-}
-```
-
-Copy and edit this file to create your own recipe variants for different
-training runs.
-
-### Saving / Loading
+Train a Byte-level BPE tokenizer from JSONL text files.
 
 ```bash
-python train_sft.py --recipe ./recipe.json ...   # loads saved recipe
-python train_sft.py --mode hybrid ...             # OR: infer from --mode
+# Basic: train a 65K vocabulary tokenizer
+python tokenizer_train.py \
+    --data-dir ./raw_data \
+    --output-dir ./tokenizer
+
+# With explicit vocabulary size and minimum frequency
+python tokenizer_train.py \
+    --data-dir ./raw_data \
+    --output-dir ./tokenizer \
+    --vocab-size 131072 \
+    --min-frequency 3
+
+# With a recipe (defines special tokens like <think>, </think>, etc.)
+python tokenizer_train.py \
+    --data-dir ./raw_data \
+    --output-dir ./tokenizer \
+    --recipe ./recipe.json
+
+# With only mode (no recipe.json — uses default special tokens for that mode)
+python tokenizer_train.py \
+    --data-dir ./raw_data \
+    --output-dir ./tokenizer \
+    --mode reasoning
+
+# Supported modes: reasoning, non_reasoning, hybrid
+python tokenizer_train.py \
+    --data-dir ./raw_data \
+    --output-dir ./tokenizer \
+    --mode hybrid
+
+python tokenizer_train.py \
+    --data-dir ./raw_data \
+    --output-dir ./tokenizer \
+    --mode non_reasoning
 ```
 
-Recipes are auto-saved alongside every checkpoint. Inference auto-loads them:
-
-```bash
-python infer.py --checkpoint ./sft_checkpoints/latest.pt
-# 👆 automatically loads ./sft_checkpoints/recipe.json
-```
-
-### Formatting Conversations
-
-```python
-# Format a full conversation as a training string
-text = recipe.format_full_conversation(
-    prompt="What is 2+2?",
-    thinking="2 plus 2 equals 4",
-    answer="4",
-    system="You are a math tutor.",
-)
-# → "<|im_start|>system\nYou are a math tutor.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n2 plus 2 equals 4\n</think>\n4<|im_end|>\n"
-```
-
----
-
-## 4. Training a Tokenizer
-
-The framework uses a **Byte-level BPE** tokenizer that reads from the same
-JSONL files your data agent produces.
-
-```bash
-# Basic usage
-python tokenizer_train.py --data-dir ./data --output-dir ./tokenizer
-
-# With a recipe (defines special tokens)
-python tokenizer_train.py --data-dir ./data --recipe ./recipe.json --vocab-size 131072
-
-# With a mode (uses default special tokens for that mode)
-python tokenizer_train.py --data-dir ./data --mode reasoning
-```
-
-### Input Format
-
-Reads **all `.jsonl` files** recursively under `--data-dir`. Each line must
-have either a `text` field (pretrain) or `prompt` + optionally `answer` (SFT):
-
-```jsonl
-{"text": "The quick brown fox jumps over the lazy dog."}
-{"prompt": "What is 2+2?", "answer": "4"}
-```
-
-### Arguments
-
-| Argument | Default | Description |
-|---|---|---|
-| `--data-dir` | `./data` | Directory of .jsonl files |
-| `--output-dir` | `./tokenizer` | Where to save `tokenizer.json` |
-| `--vocab-size` | `65536` | Target vocabulary size |
-| `--min-frequency` | `2` | Minimum token frequency |
-| `--recipe` | `None` | Path to recipe.json for special tokens |
-| `--mode` | `None` | Fallback training mode |
-
-### Loading for Later Use
-
-```python
-from tokenizer_train import load_tokenizer
-tokenizer = load_tokenizer("./tokenizer")  # loads tokenizer.json
-ids = tokenizer.encode("Hello!").ids       # → list of ints
-text = tokenizer.decode(ids)               # → "Hello!"
-```
-
----
-
-## 5. Data Pipeline
-
-The data pipeline has **two parallel paths** — you can use either or both:
-
-- **`dataset_agent.py`** — self-directed async agent with LLM planning + judging
-- **`codegen_pipeline.py`** — simpler alternative: generates standalone Python scripts
-
-Both produce the **same JSONL shard format** that the packers read.
-
-### 5.1 Using the Data Curation Agent (`dataset_agent.py`)
-
-The agent uses:
-1. An **Ollama model** (local) to plan search queries and judge quality
-2. An **MCP server** (`server.py`) with DuckDuckGo search + multi-format extraction
-3. Optionally **HuggingFace Hub / Kaggle** public datasets
-
-#### 🔧 Setup
-
-```bash
-# Start Ollama
-ollama serve
-
-# Pull a model for planning + judging
-ollama pull llama3.1
-# or: ollama pull qwen2.5:7b-instruct
-
-# Run the MCP server (or let dataset_agent.py auto-start it)
-cd webscrapped_dataset_curator_AI_MCP
-pip install httpx mcp duckduckgo-search
-python web_scraper_mcp/server.py
-```
-
-#### Basic Usage
-
-```bash
-# Curate 500 MB of pretraining data across 3 categories
-python agent/dataset_agent.py \
-    --target-size 500MB \
-    --categories web,knowledge,math \
-    --out-dir ./data \
-    --mode pretrain \
-    --concurrency 8
-```
-
-#### SFT Mode
-
-```bash
-# Curate 300 MB of SFT data (prompt + thinking + answer triples)
-python agent/dataset_agent.py \
-    --target-size 300MB \
-    --categories math,code,reasoning \
-    --out-dir ./sft_data \
-    --mode sft
-```
-
-#### GRPO Mode
-
-```bash
-# Curate 100 MB of GRPO data (prompt + answer pairs)
-python agent/dataset_agent.py \
-    --target-size 100MB \
-    --categories math \
-    --out-dir ./grpo_data \
-    --mode grpo
-```
-
-#### Resuming a Run
-
-```bash
-# Just re-run the same command — the agent resumes automatically
-python agent/dataset_agent.py --target-size 500MB --categories web --out-dir ./data
-```
-
-`RunState` per category persists to `.run_state_<category>.json`. Used queries
-and seen URLs are saved so the next iteration generates new queries.
-
-#### Important Flags
+**Arguments:**
 
 | Flag | Default | Description |
-|---|---|---|
-| `--target-size` | **(required)** | Target dataset size: `500MB`, `2GB`, etc. |
-| `--categories` | `web,knowledge,reasoning,code,math,science` | Categories to curate |
-| `--out-dir` | `./data` | Output directory for JSONL shards |
-| `--mode` | `pretrain` | `pretrain` / `sft` / `grpo` |
-| `--concurrency` | `5` | Concurrent URL extractions |
-| `--public-sources` | `""` | enable: `huggingface,kaggle` |
-| `--public-only` | `false` | Skip web scraping (public datasets only) |
-| `--no-llm-judge` | `false` | Disable Ollama quality judge (faster) |
-| `--mix` | `equal` | Budget split: `web=0.2,knowledge=0.3,code=0.5` |
-| `--category-concurrency` | `2` | Max categories running simultaneously |
-
-### 5.2 Public Dataset Sources (HF / Kaggle)
-
-Topping up from existing public datasets is **faster and more reliable** than
-scraping the open web — no robots.txt, no rate limiting, no HTML boilerplate.
-
-#### Auto-Discovery Mode
-
-```bash
-# Let the agent find datasets matching each category
-python agent/dataset_agent.py \
-    --target-size 1GB --mode pretrain \
-    --categories web,knowledge,code,math \
-    --out-dir ./data \
-    --public-sources huggingface,kaggle
-```
-
-The agent searches HuggingFace datasets and Kaggle using each category's topic
-keywords from `agent/topics.py`. Datasets whose columns don't match known
-patterns (text/prompt/answer/code/conversation) are auto-rejected.
-
-#### Named Datasets
-
-```bash
-# Pin specific datasets per category
-export KAGGLE_USERNAME=you KAGGLE_KEY=xxxx
-export HF_TOKEN=hf_your_token  # for gated datasets
-
-python agent/dataset_agent.py \
-    --target-size 500MB --mode sft \
-    --categories math,code \
-    --public-sources huggingface,kaggle \
-    --hf-datasets "math=openai/gsm8k;code=codeparrot/apps" \
-    --kaggle-datasets "code=owner/some-code-qa-dataset"
-```
-
-#### Public-Only Mode
-
-```bash
-# Skip scraping entirely — public datasets only
-python agent/dataset_agent.py \
-    --target-size 2GB --mode pretrain \
-    --categories knowledge,science \
-    --public-sources huggingface \
-    --public-only
-```
-
-#### Column Mapping (Auto)
-
-When a dataset is streamed, the agent calls Ollama once to map its columns
-to the target schema. For example, a dataset with `input` and `output` columns
-gets mapped to `prompt` and `answer`. This happens once per dataset, not per row.
-
-#### Credentials
-
-| Source | Required |
-|---|---|
-| HuggingFace (public) | None |
-| HuggingFace (gated) | `HF_TOKEN` env var |
-| Kaggle | `KAGGLE_USERNAME` + `KAGGLE_KEY` or `~/.kaggle/kaggle.json` |
-
-Missing credentials for one backend won't break the run — that backend is
-silently skipped with a log warning.
-
-### 5.3 Codegen Pipeline (`codegen_pipeline.py`)
-
-An **alternative** to `dataset_agent.py` when you prefer a simpler
-discover→codegen→run approach instead of per-row async orchestration.
-
-**How it works:**
-
-```
-  PUBLIC DATASETS               LIVE WEB CRAWL
-  ──────────────                ─────────────
-  1. discover (HF search)       1. crawl-raw batch via scraper
-  2. sample first N rows        2. show Ollama samples
-  3. codegen: Ollama writes     → Ollama writes a script that
-     a standalone script that      reads raw JSONL, filters,
-     streams the full dataset,     dedups, and writes shards
-     maps columns, filters,     3. validate + run
-     dedups, writes shards
-  4. validate + run
-```
-
-#### Usage
-
-```bash
-# Public datasets only
-python agent/codegen_pipeline.py \
-    --target-size 500MB --public-only \
-    --categories web,knowledge,math \
-    --out-dir ./data --mode pretrain
-
-# With budget tuning
-python agent/codegen_pipeline.py \
-    --target-size 5GB --public-only \
-    --categories web,math \
-    --discover-limit 20 --max-candidates-to-try 8
-
-# Live web crawl (default)
-python agent/codegen_pipeline.py \
-    --target-size 200MB \
-    --categories web,knowledge --out-dir ./data
-```
-
-Each generated script is saved to `./data/_generated_scripts/` and its
-full Ollama transcript to `./data/_logs/` for debugging.
-
-### 5.4 Web Scraping MCP Server (`server.py`)
-
-The MCP server provides tools that both `dataset_agent.py` and
-`codegen_pipeline.py` use under the hood. You can also use it directly.
-
-#### Starting the Server
-
-```bash
-cd webscrapped_dataset_curator_AI_MCP
-
-# Default (auto HTMX/crawl4ai backend)
-python web_scraper_mcp/server.py
-
-# Force httpx-only (lighter, no headless browser)
-SCRAPER_HTML_BACKEND=httpx python web_scraper_mcp/server.py
-```
-
-#### Tools
-
-| Tool | Description |
-|---|---|
-| `web_search(query, max_results)` | DuckDuckGo search |
-| `fetch_page(url)` | Fetch HTML text |
-| `fetch_binary(url)` | Fetch raw bytes |
-| `extract_content(url)` | Auto-detect & extract (HTML/PDF/DOCX/PPTX/XLSX/image/video/audio) |
-| `deep_crawl(seed, max_pages, max_depth)` | BFS crawl with link extraction |
-| `transcribe_media(url)` | Video/audio → transcript |
-| `healthcheck()` | Check which format backends are available |
-
-#### Supported Formats
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                    extract_content(url)                   │
-│                                                          │
-│  url ──► detect_content_kind(url, content_type)          │
-│           │                                              │
-│           ├── html ───► trafilatura → readability fallback│
-│           │            OR crawl4ai (Playwright)          │
-│           ├── pdf ────► pdfplumber → OCR fallback        │
-│           ├── docx ───► python-docx (+ tables)           │
-│           ├── pptx ───► python-pptx (+ speaker notes)    │
-│           ├── xlsx ───► openpyxl                          │
-│           ├── csv ────► raw decode                       │
-│           ├── image ──► pytesseract OCR                  │
-│           ├── video ──► yt-dlp captions → whisper ASR    │
-│           └── audio ──► faster-whisper transcription     │
-│                                                          │
-│  Returns: {title, text, author, date, content_type,      │
-│            url, error, extra}                            │
-└──────────────────────────────────────────────────────────┘
-```
-
-#### Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `SCRAPER_HTML_BACKEND` | `auto` | `auto` / `crawl4ai` / `httpx` |
-| `SCRAPER_ALLOWED_DOMAINS` | `""` | Comma-separated allow list |
-| `SCRAPER_BLOCKED_DOMAINS` | `""` | Comma-separated block list |
-| `SCRAPER_MIN_HOST_INTERVAL` | `2.0` | Seconds between same-host requests |
-| `SCRAPER_EXTRACT_WORKERS` | CPUs | Pool size for CPU-bound extraction |
-| `SCRAPER_MEDIA_WORKERS` | CPUs/2 | Pool size for ASR transcription |
-| `PROXY_LIST` | `""` | Comma-separated proxy URLs for rotation |
-| `WHISPER_MODEL` | `base` | Whisper model size (tiny/base/small/medium/large-v3) |
+|------|---------|-------------|
+| `--data-dir` | `./data` | Directory of `.jsonl` files with `text` or `prompt` fields |
+| `--output-dir` | `./tokenizer` | Where to save `tokenizer.json` |
+| `--vocab-size` | `65536` | Target vocabulary size |
+| `--min-frequency` | `2` | Minimum token frequency to include |
+| `--recipe` | `None` | Path to `recipe.json` (defines special tokens and mode) |
+| `--mode` | `None` | Training mode when `--recipe` is not given: `reasoning`, `non_reasoning`, `hybrid` |
 
 ---
 
-## 6. Packing Data for Training
+## 3. Data Curation
 
-Each training script reads **packed memmap `.bin` files**, not raw JSONL.
-Run the appropriate packer first.
+Three curation pipelines, each progressively more automated:
 
-### 6.1 Pretrain Packing (`pack_pretrain.py`)
+### 3A. Codegen Pipeline (simpler, recommended)
 
-Converts JSONL with `text` fields into uint16 `.bin` files.
+Discovers public datasets, has Ollama write extraction scripts, runs them, and packs the output.
+
+```bash
+# Public datasets only (HF + Kaggle)
+python webscrapped_dataset_curator_AI_MCP/agent/codegen_pipeline.py \
+    --target-size 2GB \
+    --out-dir ./data \
+    --mode pretrain \
+    --public-only
+
+# With web crawling (no --public-only → live crawl + public datasets)
+python webscrapped_dataset_curator_AI_MCP/agent/codegen_pipeline.py \
+    --target-size 500MB \
+    --out-dir ./data \
+    --categories web,knowledge,code,math \
+    --mode pretrain \
+    --min-doc-chars 500
+
+# With LangGraph reasoning codegen
+python webscrapped_dataset_curator_AI_MCP/agent/codegen_pipeline.py \
+    --target-size 1GB \
+    --out-dir ./data \
+    --public-only \
+    --reasoning-model deepseek-r1:7b \
+    --mode pretrain
+
+# Custom category mix
+python webscrapped_dataset_curator_AI_MCP/agent/codegen_pipeline.py \
+    --target-size 1GB \
+    --out-dir ./data \
+    --public-only \
+    --mode sft \
+    --mix "web=0.3,knowledge=0.3,code=0.2,math=0.2"
+
+# Multi-language dataset discovery
+python webscrapped_dataset_curator_AI_MCP/agent/codegen_pipeline.py \
+    --target-size 500MB \
+    --out-dir ./data \
+    --public-only \
+    --language "en,zh,de,fr"
+```
+
+**Arguments:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--target-size` | **(required)** | Target dataset size, e.g. `500MB`, `2GB` |
+| `--out-dir` | `./data` | Output directory for JSONL shards |
+| `--categories` | `web,knowledge,reasoning,code,math,science` | Comma-separated category list |
+| `--mode` | `pretrain` | `pretrain`, `sft`, or `grpo` |
+| `--min-doc-chars` | `500` | Minimum document length in characters |
+| `--public-only` | `False` | Use only public HF/Kaggle datasets (skip live crawl) |
+| `--mix` | `None` | Budget mix, e.g. `web=0.5,math=0.5` |
+| `--discover-limit` | `5` | HF Hub search results per keyword |
+| `--max-candidates-to-try` | `3` | Datasets that must contribute per category |
+| `--max-total-considered` | `40` | Safety ceiling per category |
+| `--reasoning-model` | `None` | LangGraph reasoning model (e.g. `deepseek-r1:7b`) |
+| `--language` | `en` | Comma-separated language codes for discovery |
+
+### 3B. Single Dataset: hf_to_packed (fastest for one dataset)
+
+Takes one HuggingFace dataset and goes end-to-end: sample → codegen → pack.
+
+```bash
+# Raw text for pretraining
+python webscrapped_dataset_curator_AI_MCP/agent/hf_to_packed.py \
+    --dataset c4 --config en \
+    --mode pretrain \
+    --tokenizer ./tokenizer \
+    --out-dir ./packed \
+    --seq-length 2048
+
+# Instruction data for SFT
+python webscrapped_dataset_curator_AI_MCP/agent/hf_to_packed.py \
+    --dataset databricks/databricks-dolly-15k \
+    --mode sft \
+    --tokenizer ./tokenizer \
+    --out-dir ./sft_packed
+
+# Math problems for GRPO
+python webscrapped_dataset_curator_AI_MCP/agent/hf_to_packed.py \
+    --dataset gsm8k --config main \
+    --mode grpo \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_packed \
+    --target-size 200MB
+
+# Keep generated scripts for debugging
+python webscrapped_dataset_curator_AI_MCP/agent/hf_to_packed.py \
+    --dataset c4 --config en \
+    --mode pretrain \
+    --tokenizer ./tokenizer \
+    --out-dir ./packed \
+    --keep-scripts
+```
+
+### 3C. Full Dataset Agent (LLM-planned, most automated)
+
+Self-directed agent that plans and executes data collection using MCP web scraping.
+
+```bash
+# Basic: web crawl + LLM quality judge
+python webscrapped_dataset_curator_AI_MCP/agent/dataset_agent.py \
+    --target-size 1GB \
+    --out-dir ./data
+
+# Skip LLM quality judge for speed
+python webscrapped_dataset_curator_AI_MCP/agent/dataset_agent.py \
+    --target-size 500MB \
+    --out-dir ./data \
+    --no-llm-judge
+
+# Public datasets only (huggingface + kaggle)
+python webscrapped_dataset_curator_AI_MCP/agent/dataset_agent.py \
+    --target-size 2GB \
+    --out-dir ./data \
+    --public-only
+
+# With specific public sources
+python webscrapped_dataset_curator_AI_MCP/agent/dataset_agent.py \
+    --target-size 1GB \
+    --out-dir ./data \
+    --public-sources "huggingface,kaggle" \
+    --mode sft
+
+# Custom category budget mix
+python webscrapped_dataset_curator_AI_MCP/agent/dataset_agent.py \
+    --target-size 2GB \
+    --out-dir ./data \
+    --mix "web=0.3,knowledge=0.4,code=0.3"
+
+# Log to file
+python webscrapped_dataset_curator_AI_MCP/agent/dataset_agent.py \
+    --target-size 1GB \
+    --out-dir ./data \
+    --log-file ./curation.log
+
+# Pre-specified HF datasets per category (semicolon-separated cat=dataset pairs)
+python webscrapped_dataset_curator_AI_MCP/agent/dataset_agent.py \
+    --target-size 500MB \
+    --out-dir ./data \
+    --hf-datasets "code=bigcode/the-stack-dedup;knowledge=wiki_text"
+```
+
+> **Note:** The agent requires a running Ollama server (`ollama serve`) with a model like `llama3.1` pulled for codegen and quality judging.
+
+---
+
+## 4. Data Packing
+
+Raw JSONL shards must be packed into memmap `.bin` files before training.
+
+### 4A. Pretrain Packing
 
 ```bash
 # Basic
@@ -569,36 +287,54 @@ python data/pack_pretrain.py \
     --tokenizer ./tokenizer \
     --cache-dir ./packed
 
-# With validation split (last 1% of records)
+# With validation split
 python data/pack_pretrain.py \
     --data-dir ./data \
     --tokenizer ./tokenizer \
     --cache-dir ./packed \
     --val-fraction 0.01
 
-# Multi-worker (4 parallel processes)
-python data/pack_pretrain.py --data-dir ./data --tokenizer ./tokenizer --worker 0 --num-workers 4 &
-python data/pack_pretrain.py --data-dir ./data --tokenizer ./tokenizer --worker 1 --num-workers 4 &
-python data/pack_pretrain.py --data-dir ./data --tokenizer ./tokenizer --worker 2 --num-workers 4 &
-python data/pack_pretrain.py --data-dir ./data --tokenizer ./tokenizer --worker 3 --num-workers 4 &
-wait
+# Multi-worker parallel packing (4 workers)
+python data/pack_pretrain.py --worker 0 --num-workers 4 --data-dir ./data \
+    --tokenizer ./tokenizer --cache-dir ./packed &
+python data/pack_pretrain.py --worker 1 --num-workers 4 --data-dir ./data \
+    --tokenizer ./tokenizer --cache-dir ./packed &
+python data/pack_pretrain.py --worker 2 --num-workers 4 --data-dir ./data \
+    --tokenizer ./tokenizer --cache-dir ./packed &
+python data/pack_pretrain.py --worker 3 --num-workers 4 --data-dir ./data \
+    --tokenizer ./tokenizer --cache-dir ./packed
+
+# Short-context training (e.g., 512 tokens per window)
+python data/pack_pretrain.py \
+    --data-dir ./data \
+    --tokenizer ./tokenizer \
+    --cache-dir ./packed \
+    --seq-length 512
+
+# Longer max tokens per document before EOS truncation
+python data/pack_pretrain.py \
+    --data-dir ./data \
+    --tokenizer ./tokenizer \
+    --cache-dir ./packed \
+    --max-seq-len-pretrain 8192
 ```
 
-**Output in `--cache-dir`:**
-- `pretrain_tokens_train.bin` — training tokens
-- `pretrain_tokens_val.bin` — validation tokens (if `--val-fraction > 0`)
-- `meta_train.json` / `meta_val.json`
+**Arguments:**
 
-**Input JSONL format:**
-```jsonl
-{"text": "The quick brown fox jumps over the lazy dog."}
-{"text": "This is another document that will be tokenized."}
-```
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--data-dir` | **(required)** | Directory tree of `.jsonl` with `text` field |
+| `--tokenizer` | **(required)** | Path to tokenizer directory or `tokenizer.json` |
+| `--cache-dir` | `./packed` | Output directory |
+| `--val-fraction` | `0.0` | Fraction for validation (0 = no split) |
+| `--worker` | `0` | Worker index for multi-process |
+| `--num-workers` | `1` | Total workers |
+| `--max-seq-len-pretrain` | `4096` | Max tokens per document before EOS truncation |
+| `--seq-length` | `None` | Shorthand for `--max-seq-len-pretrain` |
 
-### 6.2 SFT Packing (`pack_sft.py`)
+### 4B. SFT Packing
 
-Converts JSONL with `prompt` + `answer` (optionally `thinking`) into
-token `.bin` + loss-mask `.bin` pairs.
+Packs `{prompt, thinking, answer}` JSONL into tokens + loss-mask memmap with recipe-aware formatting.
 
 ```bash
 # Basic
@@ -607,41 +343,50 @@ python data/pack_sft.py \
     --tokenizer ./tokenizer \
     --cache-dir ./sft_packed
 
-# With recipe mode awareness
+# With recipe/mode (adds <think> tags for reasoning mode)
 python data/pack_sft.py \
     --data-dir ./sft_data \
     --tokenizer ./tokenizer \
     --cache-dir ./sft_packed \
     --mode reasoning
 
-# Validation split
 python data/pack_sft.py \
     --data-dir ./sft_data \
     --tokenizer ./tokenizer \
     --cache-dir ./sft_packed \
-    --val-fraction 0.05
+    --mode non_reasoning
+
+# Multi-worker
+python data/pack_sft.py \
+    --data-dir ./sft_data \
+    --tokenizer ./tokenizer \
+    --cache-dir ./sft_packed \
+    --worker 0 --num-workers 4
+
+# Set max tokens per example
+python data/pack_sft.py \
+    --data-dir ./sft_data \
+    --tokenizer ./tokenizer \
+    --cache-dir ./sft_packed \
+    --max-len-per-example 1024
 ```
 
-**Output in `--cache-dir`:**
-- `sft_train_tokens.bin` — uint16 token ids
-- `sft_train_mask.bin` — uint8 loss mask (1 = train, 0 = ignore)
-- `sft_train_manifest.json`
+**Arguments:**
 
-**Input JSONL format:**
-```jsonl
-{"prompt": "What is 2+2?", "thinking": "Let's calculate... 2+2=4", "answer": "4"}
-{"prompt": "Explain gravity", "answer": "Gravity is a force...", "want_thinking": false}
-```
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--data-dir` | **(required)** | Directory tree with `prompt`, `thinking`, `answer` JSONL |
+| `--tokenizer` | **(required)** | Path to tokenizer |
+| `--cache-dir` | `./packed` | Output directory |
+| `--val-fraction` | `0.01` | Validation fraction |
+| `--worker` / `--num-workers` | `0` / `1` | Multi-process packing |
+| `--max-len-per-example` | `2048` | Max tokens per example before truncation |
+| `--seq-length` | `None` | Shorthand for `--max-len-per-example` |
+| `--recipe` / `--mode` | `None` | Recipe or mode |
 
-Each record is formatted using the `TrainingRecipe`:
-```
-user_turn (mask=0) + assistant_turn (mask=1) + EOS (mask=0)
-```
+### 4C. GRPO Packing
 
-### 6.3 GRPO Packing (`pack_grpo.py`)
-
-Converts JSONL with `prompt` + `answer` into length-prefixed uint32 `.bin`
-prompt files + JSON answer sidecar files.
+Packs `{prompt, answer}` JSONL into memmap + answer strings for reward computation.
 
 ```bash
 # Basic
@@ -650,33 +395,42 @@ python data/pack_grpo.py \
     --tokenizer ./tokenizer \
     --cache-dir ./grpo_packed
 
-# Reasoning mode (includes <think> tags in recipe awareness)
+# With reasoning mode
 python data/pack_grpo.py \
     --data-dir ./grpo_data \
     --tokenizer ./tokenizer \
     --cache-dir ./grpo_packed \
     --mode reasoning
+
+# Multi-worker
+python data/pack_grpo.py \
+    --data-dir ./grpo_data \
+    --tokenizer ./tokenizer \
+    --cache-dir ./grpo_packed \
+    --worker 0 --num-workers 4
+
+# Validation split
+python data/pack_grpo.py \
+    --data-dir ./grpo_data \
+    --tokenizer ./tokenizer \
+    --cache-dir ./grpo_packed \
+    --val-fraction 0.005
 ```
 
-**Output in `--cache-dir`:**
-- `grpo_prompt_tokens.bin` — uint32 length-prefixed prompt tokens
-- `grpo_answers.json` — JSON array of answer strings (for reward computation)
-- `grpo_manifest.json`
+**Arguments:**
 
-**Input JSONL format:**
-```jsonl
-{"prompt": "Solve: 2+2", "thinking": "2+2=4", "answer": "4"}
-{"prompt": "What is the capital of France?", "answer": "Paris"}
-```
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--data-dir` | **(required)** | Directory tree with `prompt`, `answer` JSONL |
+| `--tokenizer` | **(required)** | Path to tokenizer |
+| `--cache-dir` | `./packed` | Output directory |
+| `--val-fraction` | `0.0` | Validation fraction |
+| `--worker` / `--num-workers` | `0` / `1` | Multi-process packing |
+| `--max-len-per-example` | `2048` | Max tokens per example before truncation |
 
-The prompt is tokenized as `user_turn + assistant_prefix + EOS`. The model
-generates the assistant answer during GRPO training.
+### 4D. DPO Packing
 
-### 6.4 DPO Packing (`pack_dpo.py`)
-
-Converts preference pair JSONL (`prompt`, `chosen`, `rejected`, optional
-`chosen_thinking`, `rejected_thinking`) into packed binary format for DPO
-training.
+Packs `{prompt, chosen, rejected}` preference triples into three memmap files.
 
 ```bash
 # Basic
@@ -685,68 +439,47 @@ python data/pack_dpo.py \
     --tokenizer ./tokenizer \
     --cache-dir ./dpo_packed
 
-# With recipe mode awareness
+# With reasoning mode (adds <think> tags)
 python data/pack_dpo.py \
     --data-dir ./dpo_data \
     --tokenizer ./tokenizer \
     --cache-dir ./dpo_packed \
     --mode reasoning
 
-# With validation split
+# Multi-worker
 python data/pack_dpo.py \
     --data-dir ./dpo_data \
     --tokenizer ./tokenizer \
     --cache-dir ./dpo_packed \
-    --val-fraction 0.05
+    --worker 0 --num-workers 4
 
-# Multi-worker (4 parallel processes)
-python data/pack_dpo.py --data-dir ./dpo_data --tokenizer ./tokenizer --worker 0 --num-workers 4 &
-python data/pack_dpo.py --data-dir ./dpo_data --tokenizer ./tokenizer --worker 1 --num-workers 4 &
-python data/pack_dpo.py --data-dir ./dpo_data --tokenizer ./tokenizer --worker 2 --num-workers 4 &
-python data/pack_dpo.py --data-dir ./dpo_data --tokenizer ./tokenizer --worker 3 --num-workers 4 &
-wait
+# Validation split
+python data/pack_dpo.py \
+    --data-dir ./dpo_data \
+    --tokenizer ./tokenizer \
+    --cache-dir ./dpo_packed \
+    --val-fraction 0.01
 ```
 
-**Output in `--cache-dir`:**
-- `dpo_prompts_train.bin` / `dpo_prompts_val.bin` — uint16 length-prefixed prompt tokens
-- `dpo_chosen_train.bin` / `dpo_chosen_val.bin` — uint16 chosen completion tokens (prompt + chosen)
-- `dpo_rejected_train.bin` / `dpo_rejected_val.bin` — uint16 rejected completion tokens (prompt + rejected)
-- `dpo_prompt_lens_train.json` / `dpo_prompt_lens_val.json` — per-record prompt lengths for masking
-- `dpo_manifest_train.json` / `dpo_manifest_val.json` — metadata
+**Arguments:**
 
-**Input JSONL format:**
-```jsonl
-{"prompt": "What is 2+2?", "chosen": "4", "rejected": "5",
- "chosen_thinking": "2 plus 2 equals 4", "rejected_thinking": "Maybe 5?"}
-{"prompt": "What is the capital of France?", "chosen": "Paris", "rejected": "London"}
-```
-
-The `thinking` fields are optional. When present, they are wrapped in
-`<think>...</think>` tags inside the assistant turn using the recipe format.
-If absent, the answer appears directly without think tags.
-
-Each record is formatted using `TrainingRecipe` into:
-```
-user_turn + assistant_prefix + (think_open + thinking + think_close + answer | answer) + EOS
-```
-
-The data loader uses prompt lengths from `dpo_prompt_lens.json` to mask
-prompt tokens during loss computation, so only the completion portion
-(chosen or rejected) contributes to log-probability differences.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--data-dir` | **(required)** | Directory tree with `prompt`, `chosen`, `rejected` JSONL |
+| `--tokenizer` | **(required)** | Path to tokenizer |
+| `--cache-dir` | `./dpo_packed` | Output directory |
+| `--val-fraction` | `0.0` | Validation fraction |
+| `--worker` / `--num-workers` | `0` / `1` | Multi-process packing |
+| `--recipe` / `--mode` | `None` | Recipe or mode |
 
 ---
 
-## 7. Training: Pretraining
+## 5. Pretraining
 
-Two variants: **torch DDP** (simpler, good for single/multi-GPU) and
-**DeepSpeed** (ZeRO auto-selection, CPU offload for larger models).
-
-### 7.1 Torch DDP (`train_pretrain.py`)
-
-#### Single GPU
+### 5A. DDP (Single/Multi-GPU)
 
 ```bash
-# 0.3B model (fits RTX 4090)
+# Single GPU, 300M model (fits RTX 4090)
 python train_pretrain.py \
     --model-size 0.3B \
     --data-dir ./packed \
@@ -756,889 +489,2091 @@ python train_pretrain.py \
     --grad-accum 4 \
     --jit
 
-# 1.7B model (fits on 24 GB GPU with gradient checkpointing)
-python train_pretrain.py \
-    --model-size 1.7B \
-    --data-dir ./packed \
-    --gradient-checkpointing \
-    --batch-size 4 --grad-accum 8 \
-    --jit
-```
-
-#### Multi-GPU (torchrun)
-
-```bash
-# 4 GPUs
+# Multi-GPU (4 GPUs via torchrun)
 torchrun --nproc_per_node=4 train_pretrain.py \
     --model-size 1.7B \
     --data-dir ./packed \
-    --batch-size 8 --grad-accum 4 \
+    --checkpoint-dir ./checkpoints \
+    --batch-size 16 \
+    --grad-accum 4 \
     --jit
-```
 
-#### Resume from Checkpoint
+# Large model with gradient checkpointing (saves ~35% VRAM)
+torchrun --nproc_per_node=8 train_pretrain.py \
+    --model-size 13B \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --batch-size 4 \
+    --grad-accum 8 \
+    --gradient-checkpointing \
+    --jit
 
-```bash
-# Resume from directory (finds latest step)
-python train_pretrain.py \
-    --resume ./checkpoints \
-    --data-dir ./packed
-
-# Resume from specific step
-python train_pretrain.py \
-    --resume ./checkpoints/step_10000.pt \
-    --data-dir ./packed
-```
-
-#### Advanced: Muon Optimizer
-
-```bash
+# WSD schedule with Muon optimizer (2-3× faster convergence)
 python train_pretrain.py \
     --model-size 0.6B \
     --data-dir ./packed \
-    --optimizer muon \
-    --lr 1e-4 \
-    --jit
-```
-
-Muon (from the Moonlight paper) often trains 2-3× faster than AdamW for
-the same compute budget. It uses two optimizers internally: Muon for
-embedding-free parameters and AdamW for embeddings/norms.
-
-#### Advanced: WSD Schedule
-
-```bash
-python train_pretrain.py \
-    --model-size 0.3B \
-    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --batch-size 32 \
+    --grad-accum 4 \
     --schedule wsd \
     --stable-ratio 0.8 \
-    --lr 3e-4 \
+    --optimizer muon \
     --jit
-```
 
-WSD (Warmup-Stable-Decay) keeps LR constant during the stable phase, then
-decays at the end — often yields better final loss than cosine.
+# Override architecture manually (no auto-size)
+python train_pretrain.py \
+    --hidden-size 2048 \
+    --num-layers 24 \
+    --num-heads 16 \
+    --num-kv-heads 4 \
+    --intermediate-size 8192 \
+    --head-dim 128 \
+    --max-seq-len 8192 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
 
-#### Logging with W&B
-
-```bash
+# With W&B logging
 python train_pretrain.py \
     --model-size 0.3B \
     --data-dir ./packed \
-    --wandb-project my-project \
-    --wandb-run-name dense-0.3B-v1
-```
+    --checkpoint-dir ./checkpoints \
+    --wandb-project my-llm-pretrain \
+    --wandb-run-name run-001
 
-#### VRAM Estimation
+# Longer context (extends max_position_embeddings)
+python train_pretrain.py \
+    --model-size 0.3B \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --seq-len 4096 \
+    --max-seq-len 16384 \
+    --batch-size 16 \
+    --grad-accum 4
 
-At startup the script prints a VRAM estimate and suggests adjustments:
+# Z-loss for training stability (penalises large logit magnitudes)
+python train_pretrain.py \
+    --model-size 0.3B \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --z-loss-weight 1e-4
 
-```
-VRAM         : 24.0 GB total
-  static     : ~5.2 GB  (weights + grads + Adam)
-  activations: ~3.8 GB  (batch=32, seq=2048)
-  headroom   : ~15.0 GB
-```
+# FP32 precision (instead of BF16)
+python train_pretrain.py \
+    --model-size 0.3B \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --dtype fp32
 
-If headroom is low, the script warns and suggests a safe batch size.
+# Custom LR with auto-scaling disabled
+python train_pretrain.py \
+    --model-size 0.3B \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --lr 1e-3 \
+    --no-lr-scale
 
-#### Pretrain Loss (Double-Shift Fix)
-
-> **⚠️ Important:** The data loader produces **pre-shifted targets**:
-> `y[t] = data[i+1+t]`. Calling `model(x, labels=y)` would shift again
-> internally and produce wrong gradients. The loss is computed externally
-> in `pretrain_loss()` to avoid this double shift.
-
-### 7.2 DeepSpeed (`train_pretrain_deepspeed.py`)
-
-#### Launch
-
-```bash
-# Single GPU
-deepspeed train_pretrain_deepspeed.py \
+# torch.compile with reduce-overhead mode (CUDAGraphs)
+python train_pretrain.py \
     --model-size 0.6B \
-    --data-dir ./packed
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --jit \
+    --compile-mode reduce-overhead
 
-# Multi-GPU (single node)
-deepspeed --num_gpus 4 train_pretrain_deepspeed.py \
-    --model-size 1.7B \
-    --data-dir ./packed
+# max-autotune mode (slowest compile, fastest run)
+python train_pretrain.py \
+    --model-size 0.3B \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --jit \
+    --compile-mode max-autotune
 
-# Multi-node (requires hostfile)
-deepspeed --hostfile hostfile.txt train_pretrain_deepspeed.py \
-    --model-size 8B \
-    --data-dir ./packed
+# Resume from a specific checkpoint step
+python train_pretrain.py \
+    --model-size 0.3B \
+    --data-dir ./packed \
+    --resume ./checkpoints/step_00050000.pt
 ```
 
-#### Automatic ZeRO Stage Selection
-
-The DeepSpeed variant runs a **hardware audit** on first launch and
-auto-selects the optimal ZeRO configuration:
-
-```
-   ZeRO-1  → shard optimizer states only
-              (≥40 GB VRAM per GPU, abundant headroom)
-
-   ZeRO-2  → shard optimizer states + gradients
-              (16–40 GB, default for consumer/data-center GPUs)
-
-   ZeRO-3  → shard optimizer states + gradients + params
-              (model params > 2× VRAM per GPU)
-
-   CPU offload → optimizer states (and optionally params) moved to CPU RAM
-                 (VRAM severely constrained)
-```
-
-#### Override Auto-Selection
-
-```bash
-# Force ZeRO-3 with CPU offload
-deepspeed train_pretrain_deepspeed.py \
-    --model-size 4B \
-    --zero-stage 3 \
-    --cpu-offload-optimizer \
-    --data-dir ./packed
-```
-
-#### Mixed Precision
-
-Uses `torch.amp.autocast(bf16)` instead of DeepSpeed's native bf16 handler
-for consistency with the DDP variant. DeepSpeed is used for ZeRO sharding,
-gradient clipping, and optimizer stepping.
-
----
-
-## 8. Training: Supervised Fine-Tuning (SFT)
-
-### 8.1 Torch DDP (`train_sft.py`)
-
-Supports **full fine-tune**, **LoRA**, and **DoRA** (Weight-Decomposed
-Low-Rank Adaptation).
-
-#### Full Fine-Tune (small model)
-
-```bash
-python train_sft.py \
-    --checkpoint-dir ./pretrained_checkpoints \
-    --data-dir ./sft_packed \
-    --output-dir ./sft_checkpoints \
-    --lr 2e-5 \
-    --num-steps 10000
-```
-
-#### LoRA Fine-Tune (recommended for 1B+ models on single GPU)
-
-```bash
-python train_sft.py \
-    --checkpoint-dir ./pretrained_checkpoints \
-    --data-dir ./sft_packed \
-    --lora-rank 64 \
-    --lora-alpha 128 \
-    --output-dir ./sft_checkpoints \
-    --lr 2e-4
-```
-
-#### DoRA Fine-Tune
-
-```bash
-python train_sft.py \
-    --checkpoint-dir ./pretrained_checkpoints \
-    --data-dir ./sft_packed \
-    --lora-rank 64 --lora-alpha 128 --lora-type dora \
-    --output-dir ./sft_checkpoints
-```
-
-#### Train from Scratch (no pretrained checkpoint)
-
-```bash
-python train_sft.py \
-    --model-size 1.7B \
-    --data-dir ./sft_packed \
-    --output-dir ./sft_checkpoints
-```
-
-#### Resume
-
-```bash
-python train_sft.py \
-    --resume ./sft_checkpoints/sft_step0005000.pt \
-    --data-dir ./sft_packed \
-    --output-dir ./sft_checkpoints
-```
-
-#### Merge LoRA → Saved Full Model
-
-After LoRA training, merge adapters back into base weights for inference:
-
-```bash
-python train_sft.py --merge-and-save \
-    --checkpoint-dir ./sft_checkpoints \
-    --output-dir ./sft_merged
-```
-
-Then use `./sft_merged/merged_model.pt` with `infer.py`.
-
-#### Key Flags
+**Pretrain Arguments:**
 
 | Flag | Default | Description |
-|---|---|---|
-| `--lora-rank` | `64` | LoRA rank (0 = full fine-tune) |
-| `--lora-type` | `lora` | `lora` or `dora` |
-| `--lora-alpha` | `128.0` | LoRA scaling alpha |
-| `--lora-target-modules` | `q_proj,k_proj,...` | Which projections to adapt |
-| `--use-rslora` | `false` | Rank-stabilized scaling |
-| `--lora-lr-ratio` | `1.0` | LR multiplier for LoRA params |
-| `--neftune-alpha` | `0.0` | NEFTune noise (0 = disabled) |
-| `--compile` | `false` | Enable torch.compile |
-| `--ckpt-interval` | `1000` | Checkpoint frequency in steps |
+|------|---------|-------------|
+| `--model-size` | `None` | Target size, e.g. `0.3B`, `1.7B`, `70B`, `1T` |
+| `--vocab-size` | `None` | Override vocab size (reads from `meta.json`) |
+| `--hidden-size` | `None` | Manual override (no auto-size) |
+| `--num-layers` | `None` | Manual override |
+| `--num-heads` | `None` | Manual override |
+| `--num-kv-heads` | `None` | Manual override for GQA |
+| `--intermediate-size` | `None` | MLP intermediate size |
+| `--head-dim` | `128` | Head dimension |
+| `--max-seq-len` | `None` | Max position embeddings (default 8192) |
+| `--data-dir` | `./packed` | Packed data directory |
+| `--seq-len` | `2048` | Training sequence length |
+| `--val-fraction` | `0.01` | Validation fraction |
+| `--batch-size` | `8` | Per-GPU batch size |
+| `--grad-accum` | `4` | Gradient accumulation steps |
+| `--num-steps` | `100000` | Total training steps |
+| `--warmup-steps` | `2000` | LR warmup steps |
+| `--lr` | `3e-4` | Peak learning rate |
+| `--min-lr` | `3e-5` | Minimum LR |
+| `--no-lr-scale` | `False` | Disable auto LR scaling |
+| `--z-loss-weight` | `1e-4` | Z-loss coefficient (0 = disabled) |
+| `--weight-decay` | `0.1` | AdamW weight decay |
+| `--grad-clip` | `1.0` | Gradient clipping max norm |
+| `--dtype` | `bf16` | `bf16` or `fp32` |
+| `--schedule` | `cosine` | `cosine` or `wsd` |
+| `--stable-ratio` | `0.8` | WSD stable phase fraction |
+| `--optimizer` | `adamw` | `adamw` or `muon` |
+| `--jit` | `False` | Enable `torch.compile` |
+| `--compile-mode` | `default` | `default`, `reduce-overhead`, `max-autotune` |
+| `--num-workers` | `2` | Data loader workers |
+| `--gradient-checkpointing` | `False` | Save VRAM (~35%) at compute cost (~30%) |
+| `--checkpoint-dir` | `./checkpoints` | Checkpoint output directory |
+| `--resume` | `None` | Resume from path (file or dir) |
+| `--save-every` | `5000` | Save checkpoint every N steps |
+| `--keep-ckpts` | `3` | Recent checkpoints to keep |
+| `--log-interval` | `10` | Log every N steps |
+| `--val-every` / `--eval-every` | `500` | Validate every N steps |
+| `--eval-steps` | `50` | Validation batches |
+| `--wandb-project` | `None` | W&B project name |
+| `--wandb-run-name` | `None` | W&B run name |
+| `--seed` | `42` | Random seed |
 
-#### Understanding Loss Masking
-
-SFT uses a **loss mask** — only assistant tokens contribute to the gradient:
-
-```
-User: "What is 2+2?"      → mask=0  (no loss computed)
-Assistant: "<think>\n...\n</think>\n4"  → mask=1 (model learns this)
-<EOS>                     → mask=0  (no loss)
-```
-
-This is why `pack_sft.py` writes a separate mask `.bin` alongside the token
-`.bin`. The `masked_cross_entropy` function applies the mask before computing
-the mean.
-
-### 8.2 DeepSpeed (`train_sft_deepspeed.py`)
+### 5B. DeepSpeed Pretrain
 
 ```bash
-deepspeed --num_gpus 4 train_sft_deepspeed.py \
-    --checkpoint-dir ./pretrained_checkpoints \
-    --data-dir ./sft_packed \
-    --lora-rank 64 \
-    --output-dir ./sft_checkpoints
+# ZeRO-2, single node
+deepspeed train_pretrain_deepspeed.py \
+    --model-size 1.7B \
+    --data-dir ./packed \
+    --out-dir ./checkpoints_ds \
+    --batch-size 8 \
+    --grad-accum-steps 8 \
+    --zero-stage 2 \
+    --compile
+
+# ZeRO-3 with CPU offload (for large models on constrained GPUs)
+deepspeed train_pretrain_deepspeed.py \
+    --model-size 7B \
+    --data-dir ./packed \
+    --out-dir ./checkpoints_ds \
+    --batch-size 4 \
+    --grad-accum-steps 16 \
+    --zero-stage 3 \
+    --cpu-offload-optimizer \
+    --cpu-offload-param \
+    --compile
+
+# Automatic ZeRO stage selection (hardware audit)
+deepspeed train_pretrain_deepspeed.py \
+    --model-size 0.6B \
+    --data-dir ./packed \
+    --out-dir ./checkpoints_ds
+
+# WSD schedule
+deepspeed train_pretrain_deepspeed.py \
+    --model-size 0.6B \
+    --data-dir ./packed \
+    --out-dir ./checkpoints_ds \
+    --schedule wsd \
+    --stable-ratio 0.8 \
+    --compile
+
+# TensorBoard logging
+deepspeed train_pretrain_deepspeed.py \
+    --model-size 0.3B \
+    --data-dir ./packed \
+    --out-dir ./checkpoints_ds \
+    --tensorboard
+
+# With recipe and mode
+deepspeed train_pretrain_deepspeed.py \
+    --model-size 0.3B \
+    --data-dir ./packed \
+    --out-dir ./checkpoints_ds \
+    --recipe ./recipe.json
+
+# Multi-node (requires hostfile)
+deepspeed --hostfile ./hostfile train_pretrain_deepspeed.py \
+    --model-size 70B \
+    --data-dir ./packed \
+    --out-dir ./checkpoints_ds \
+    --batch-size 2 \
+    --grad-accum-steps 32 \
+    --zero-stage 3
 ```
 
-Same auto-ZeRO logic as the pretrain DeepSpeed variant.
+**DeepSpeed Pretrain Arguments:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--zero-stage` | `None` | `1`, `2`, or `3` (auto-selected by hardware audit when `None`) |
+| `--cpu-offload-optimizer` | `False` | Offload optimizer states to CPU |
+| `--cpu-offload-param` | `False` | Offload model parameters to CPU (ZeRO-3 only) |
+| `--out-dir` | `./checkpoints_ds` | Output directory |
+| `--ckpt-interval` | `100` | Save checkpoint every N steps |
+| `--tensorboard` | `False` | Enable TensorBoard logging |
+| `--recipe` | `None` | Path to `recipe.json` |
+| `--mode` | `None` | Training mode |
+
+*(All pretrain DDP arguments also apply.)*
 
 ---
 
-## 9. Training: GRPO Reinforcement Learning
+## 6. Supervised Fine-Tuning (SFT)
 
-GRPO (Group Relative Policy Optimization) is the **second stage** of
-post-training. It takes an SFT checkpoint and applies RL to improve
-reasoning and correctness.
-
-### 9.1 Torch DDP (`train_grpo.py`)
+### 6A. DDP SFT
 
 ```bash
+# Full fine-tune
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --batch-size 4 \
+    --num-steps 10000
+
+# LoRA fine-tune (recommended for 1B+ models on single GPU)
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --lora-rank 64 \
+    --lora-alpha 128 \
+    --batch-size 8
+
+# DoRA (weight-decomposed LoRA)
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --lora-rank 32 \
+    --lora-alpha 64 \
+    --lora-type dora \
+    --batch-size 8
+
+# rsLoRA (rank-stabilized)
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --lora-rank 128 \
+    --lora-alpha 256 \
+    --use-rslora \
+    --batch-size 8
+
+# Custom LoRA target modules (all linear projections)
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --lora-rank 64 \
+    --lora-target-modules "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+
+# Merge LoRA weights into base model and save
+python train_sft.py \
+    --output-dir ./sft_checkpoints \
+    --merge-and-save
+
+# With NEFTune noise (for chat datasets — improves diversity)
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --neftune-alpha 5.0 \
+    --batch-size 4
+
+# With torch.compile
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --compile \
+    --compile-mode max-autotune \
+    --batch-size 8
+
+# With W&B
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --wandb-project my-sft \
+    --batch-size 4
+
+# Extended context (reuse pretrained model at longer sequence)
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --seq-len 4096 \
+    --max-seq-len 16384 \
+    --batch-size 2 \
+    --grad-accum 8
+
+# With recipe/mode
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --mode reasoning
+
+# Higher LoRA LR ratio (base params learn slower than adapters)
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --lora-rank 64 \
+    --lora-lr-ratio 2.0
+
+# Z-loss during SFT (for stability with high learning rates)
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --z-loss-weight 1e-4
+```
+
+**SFT Arguments:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint-dir` | `None` | Pretrained checkpoint directory |
+| `--data-dir` | `./sft_packed` | Packed SFT data |
+| `--output-dir` | `./sft_checkpoints` | Output directory |
+| `--resume` | `None` | Resume from checkpoint |
+| `--merge-and-save` | `False` | Merge LoRA → base and save |
+| `--model-size` | `None` | When no checkpoint, create from scratch |
+| `--lora-rank` | `64` | LoRA rank (0 = full fine-tune) |
+| `--lora-alpha` | `128.0` | LoRA alpha scaling |
+| `--lora-target-modules` | `(attention defaults)` | Comma-separated module names |
+| `--lora-type` | `lora` | `lora` or `dora` |
+| `--use-rslora` | `False` | Enable rank-stabilized LoRA |
+| `--lora-lr-ratio` | `1.0` | LoRA params vs base LR ratio |
+| `--neftune-alpha` | `0.0` | NEFTune noise magnitude (0 = disabled) |
+| `--seq-len` | `2048` | Training sequence length |
+| `--max-seq-len` | `None` | Override model max_position_embeddings |
+| `--batch-size` | `4` | Per-GPU batch size |
+| `--num-steps` | `10000` | Total training steps |
+| `--grad-accum` | `4` | Gradient accumulation |
+| `--lr` | `2e-5` | Peak learning rate |
+| `--min-lr` | `2e-6` | Minimum LR |
+| `--z-loss-weight` | `1e-4` | Z-loss coefficient |
+| `--weight-decay` | `0.01` | Weight decay |
+| `--warmup-steps` | `200` | LR warmup steps |
+| `--grad-clip` | `1.0` | Gradient clipping |
+| `--compile` | `False` | Enable `torch.compile` |
+| `--compile-mode` | `default` | Compilation mode |
+| `--ckpt-interval` | `1000` | Checkpoint interval |
+| `--eval-interval` | `200` | Evaluation interval |
+| `--eval-steps` | `20` | Validation batches |
+| `--val-fraction` | `0.05` | Validation split |
+
+### 6B. DeepSpeed SFT
+
+```bash
+# ZeRO-2 LoRA fine-tune
+deepspeed train_sft_deepspeed.py \
+    --checkpoint-dir ./checkpoints \
+    --cache-dir ./sft_packed \
+    --out-dir ./sft_checkpoints_ds \
+    --lora-rank 64 \
+    --batch-size 8 \
+    --zero-stage 2
+
+# ZeRO-3 full fine-tune
+deepspeed train_sft_deepspeed.py \
+    --checkpoint-dir ./checkpoints \
+    --cache-dir ./sft_packed \
+    --out-dir ./sft_checkpoints_ds \
+    --batch-size 4 \
+    --grad-accum-steps 8 \
+    --zero-stage 3 \
+    --compile
+
+# With CPU offload for large model
+deepspeed train_sft_deepspeed.py \
+    --checkpoint-dir ./checkpoints \
+    --cache-dir ./sft_packed \
+    --out-dir ./sft_checkpoints_ds \
+    --batch-size 4 \
+    --zero-stage 3 \
+    --cpu-offload-optimizer
+
+# Convenience: --cpu-offload enables both optimizer + params
+deepspeed train_sft_deepspeed.py \
+    --checkpoint-dir ./checkpoints \
+    --cache-dir ./sft_packed \
+    --out-dir ./sft_checkpoints_ds \
+    --batch-size 4 \
+    --zero-stage 3 \
+    --cpu-offload
+
+# Custom architecture + SFT
+deepspeed train_sft_deepspeed.py \
+    --checkpoint-dir ./checkpoints \
+    --cache-dir ./sft_packed \
+    --out-dir ./sft_checkpoints_ds \
+    --arch jamba \
+    --jamba-interval 4
+```
+
+---
+
+## 7. GRPO (Reinforcement Learning)
+
+### 7A. DDP GRPO
+
+```bash
+# Basic GRPO
 python train_grpo.py \
     --checkpoint ./sft_checkpoints/latest.pt \
     --data-dir ./grpo_packed \
     --tokenizer ./tokenizer \
     --out-dir ./grpo_checkpoints \
     --num-steps 500
-```
 
-#### Smoke Test
-
-```bash
-python train_grpo.py --smoke-test
-```
-
-This runs a self-contained end-to-end test with a tiny random model,
-synthetic data, one rollout batch, reward computation, and loss,
-then does a checkpoint round-trip.
-
-#### How GRPO Works (Illustrated)
-
-```
-                         ┌────────────────────────┐
-                         │    Prompt: "Solve 2+2"  │
-                         │    Answer: "4"          │
-                         └────────┬───────────────┘
-                                  │
-                    ┌─────────────┼─────────────┐
-                    │             │              │
-               ┌────▼────┐  ┌────▼────┐   ┌────▼────┐
-               │ Rollout │  │ Rollout │   │ Rollout │  ... (G=8)
-               │   1     │  │   2     │   │   3     │
-               └────┬────┘  └────┬────┘   └────┬────┘
-                    │             │              │
-               ┌────▼────┐  ┌────▼────┐   ┌────▼────┐
-               │"2+2=4"   │  │"It's 4"  │   │"5"      │  ...
-               │<think>.. │  │           │   │         │
-               └────┬────┘  └────┬────┘   └────┬────┘
-                    │             │              │
-               ┌────▼────────────▼──────────────▼─────┐
-               │  Reward Function (recipe-aware)       │
-               │  - tier 1: correct + think format     │
-               │  - tier 2: correct but no think tags  │
-               │  - tier 3: format + has answer        │
-               │  - tier 4: wrong                      │
-               └────────────────┬─────────────────────┘
-                                │
-               ┌────────────────▼─────────────────────┐
-               │  Group-normalized advantages          │
-               │  r̄_g = mean(rewards in group)          │
-               │  A_i = (r_i - r̄_g) / σ_g              │
-               └────────────────┬─────────────────────┘
-                                │
-               ┌────────────────▼─────────────────────┐
-               │  GRPO Loss                            │
-               │  L = -E[min(ratio·A, clip(ratio)·A)]  │
-               │     + λ_KL · KL(π || π_ref)           │
-               └──────────────────────────────────────┘
-```
-
-#### Reward Function — Three Tiers
-
-| Condition | Reward | Purpose |
-|---|---|---|
-| Correct answer + balanced think tags | 1.0 | Perfect |
-| Correct but no/malformed think tags | 0.5 | Encourages format |
-| Wrong but has think + answer | 0.3 | Encourages trying |
-| Wrong or truncated | 0.0 | No reward |
-
-The recipe mode controls whether think-format is checked:
-
-| Recipe Mode | Think Check |
-|---|---|
-| `reasoning` | **Always** required |
-| `non_reasoning` | **Never** checked |
-| `hybrid` | Only if `want_thinking=True` |
-
-#### Reward Weights
-
-```bash
-# Custom reward weights
+# With LoRA
 python train_grpo.py \
-    --checkpoint ./sft.pt \
-    --data-dir ./grpo_packed \
-    --reward-correct 1.5 \
-    --reward-format 0.5
-```
-
-Answer extraction supports `\boxed{...}` (LaTeX) and last-numeric-fallback:
-
-```
-Extraction priority:
-  1. \boxed{answer}   → "\\boxed{4}" → 4.0
-  2. Last numeric     → "... equals 4.5" → 4.5
-  3. Last token       → "Four" → str match
-```
-
-#### Reference Policy
-
-```bash
-# Single model (default) — reuse trainable model under no_grad
-python train_grpo.py --ref-policy single ...
-
-# Two-model — separate frozen copy (more stable but 2× memory)
-python train_grpo.py --ref-policy two --checkpoint ./sft.pt ...
-```
-
-Two-model is more stable because the reference never drifts from the initial
-SFT policy. Single-model is more memory-efficient.
-
-#### Generation Hyperparameters
-
-```bash
-python train_grpo.py \
-    --num-generations 8 \      # G completions per prompt
-    --max-new-tokens 512 \     # Max tokens per completion
-    --temperature 1.0 \        # Sampling temp
-    --top-p 0.95               # Nucleus sampling
-```
-
-#### GRPO Loss Parameters
-
-```bash
-python train_grpo.py \
-    --kl-coef 0.02 \            # KL penalty strength
-    --clip-range 0.2 \          # PPO clipping
-    --entropy-coeff 0.01        # Entropy bonus (exploration)
-```
-
-### 9.2 DeepSpeed (`train_grpo_deepspeed.py`)
-
-```bash
-deepspeed --num_gpus 4 train_grpo_deepspeed.py \
-    --checkpoint ./sft.pt \
+    --checkpoint ./sft_checkpoints/latest.pt \
     --data-dir ./grpo_packed \
     --tokenizer ./tokenizer \
     --out-dir ./grpo_checkpoints \
-    --lora
+    --lora --lora-rank 64 \
+    --num-steps 500
+
+# Custom reward tiers
+python train_grpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_checkpoints \
+    --reward-correct 2.0 \
+    --reward-format 0.5 \
+    --num-generations 16
+
+# KL penalty and clipping
+python train_grpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_checkpoints \
+    --kl-coef 0.05 \
+    --clip-range 0.3 \
+    --num-steps 1000
+
+# With entropy bonus (encourages exploration)
+python train_grpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_checkpoints \
+    --entropy-coeff 0.01 \
+    --num-steps 500
+
+# Two-model reference policy (more stable, 2× memory)
+python train_grpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_checkpoints \
+    --ref-policy two
+
+# Custom generation parameters
+python train_grpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_checkpoints \
+    --num-generations 8 \
+    --max-new-tokens 1024 \
+    --temperature 1.2 \
+    --top-p 0.9
+
+# With torch.compile
+python train_grpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_checkpoints \
+    --compile \
+    --num-steps 500
+
+# Custom model size (for fine-tuning a different architecture)
+python train_grpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_checkpoints \
+    --model-size 0.6B \
+    --num-steps 500
+```
+
+**GRPO Arguments:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint` | `None` | Path to pretrained checkpoint |
+| `--tokenizer` | `./tokenizer` | Tokenizer directory |
+| `--data-dir` | `./grpo_packed` | Packed GRPO data |
+| `--out-dir` | `./grpo_checkpoints` | Output directory |
+| `--resume` | `None` | Resume from checkpoint |
+| `--lora` | `False` | Enable LoRA |
+| `--lora-rank` | `64` | LoRA rank |
+| `--lora-alpha` | `128.0` | LoRA alpha |
+| `--ref-policy` | `single` | `single` or `two` (two-model reference) |
+| `--num-generations` | `8` | G — completions per prompt |
+| `--max-new-tokens` | `512` | Max generation tokens |
+| `--temperature` | `1.0` | Sampling temperature |
+| `--top-p` | `0.95` | Top-p sampling |
+| `--reward-correct` | `1.0` | Reward for correct answer |
+| `--reward-format` | `0.3` | Reward for correct `<think>` format |
+| `--kl-coef` | `0.02` | KL penalty coefficient |
+| `--clip-range` | `0.2` | PPO clipping range |
+| `--entropy-coeff` | `0.0` | Entropy bonus coefficient |
+| `--batch-size` | `4` | Per-GPU batch size |
+| `--num-steps` | `500` | Total training steps |
+| `--warmup-steps` | `20` | LR warmup steps |
+| `--lr` | `1e-6` | Peak learning rate |
+| `--min-lr` | `1e-7` | Minimum LR |
+| `--no-lr-scale` | `False` | Disable auto LR scaling |
+| `--weight-decay` | `0.0` | Weight decay |
+| `--grad-clip` | `1.0` | Gradient clipping |
+| `--compile` | `False` | Enable `torch.compile` |
+| `--compile-mode` | `default` | Compilation mode |
+| `--save-every` | `50` | Save interval |
+| `--log-interval` | `1` | Log interval |
+
+### 7B. DeepSpeed GRPO
+
+```bash
+# ZeRO-2 GRPO
+deepspeed train_grpo_deepspeed.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --cache_dir ./grpo_packed \
+    --out_dir ./grpo_checkpoints_ds \
+    --tokenizer ./tokenizer \
+    --batch_size 8 \
+    --zero-stage 2
+
+# ZeRO-3 with LoRA
+deepspeed train_grpo_deepspeed.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --cache_dir ./grpo_packed \
+    --out_dir ./grpo_checkpoints_ds \
+    --tokenizer ./tokenizer \
+    --lora --lora_rank 64 \
+    --zero-stage 3 \
+    --batch_size 4
+
+# Custom reward tiers
+deepspeed train_grpo_deepspeed.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --cache_dir ./grpo_packed \
+    --out_dir ./grpo_checkpoints_ds \
+    --tokenizer ./tokenizer \
+    --reward_correct 2.0 \
+    --reward_format 0.5
+
+# Merge LoRA after training
+deepspeed train_grpo_deepspeed.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --cache_dir ./grpo_packed \
+    --out_dir ./grpo_checkpoints_ds \
+    --tokenizer ./tokenizer \
+    --merge_lora
 ```
 
 ---
 
-## 10. Training: DPO Direct Preference Optimization
+## 8. DPO (Preference Optimization)
 
-DPO (Direct Preference Optimization) is an **alternative to GRPO** for
-post-training alignment. Instead of generating rollouts and scoring them with
-a reward function, DPO works with **static preference pairs**: for each prompt,
-you have one "chosen" completion and one "rejected" completion. The model learns
-to maximize the probability gap between chosen and rejected completions relative
-to a frozen reference model.
-
-The framework provides a complete DPO pipeline:
-
-```
-Ollama Judge (remote server)         OR        Human-labeled .jsonl
-         │                                          │
-         ▼                                          ▼
-   data/pack_dpo.py ──► packed .bin files
-         │
-         ▼
-   train_dpo.py (DDP) / train_dpo_deepspeed.py (DeepSpeed)
-         │
-         ▼
-   dpo_checkpoints/latest.pt
-```
-
-### 10.1 Ollama Judge (`ollama_judge.py`)
-
-Instead of human annotators, you can use an **Ollama model running on a remote
-server** to generate and rank completions into preference pairs.
+### 8A. DDP DPO
 
 ```bash
-# Connectivity test
-python ollama_judge.py --test
-
-# Generate preference pairs for a single prompt
-python ollama_judge.py --prompt "What is 2+2?" \
-    --url http://remote-server:11434 \
-    --model qwen2.5:7b
-
-# Batch mode: read prompts from JSONL, write preference pairs
-python ollama_judge.py \
-    --input ./prompts.jsonl \
-    --output ./prefs.jsonl \
-    --url http://remote-server:11434 \
-    --gen-model qwen2.5:7b \
-    --judge-model qwen2.5:7b-instruct \
-    --num-candidates 4
-
-# Batch mode with custom temperature and max tokens
-python ollama_judge.py \
-    --input ./prompts.jsonl \
-    --output ./prefs.jsonl \
-    --num-candidates 6 \
-    --temperature 0.8 \
-    --max-tokens 1024
-```
-
-#### How the Judge Works
-
-1. **Generation**: For each prompt, `ollama_judge.py` calls `POST /api/generate`
-   on the remote Ollama server to produce N candidate completions (using
-   `--gen-model`). Generation is parallelised via `ThreadPoolExecutor` for speed.
-
-2. **Judging**: Each pair of candidates is sent to a **judge model** (using
-   `POST /api/chat`) with a structured prompt that asks: *"Which completion is
-   better, A or B? Output JSON: {"verdict": "A" or "B", "reasoning": "..."}"*
-
-   The judge prompt includes quality dimensions: correctness, clarity, helpfulness,
-   instruction following, and conciseness.
-
-3. **Pair Selection**: After a round-robin tournament of pairwise comparisons,
-   the top-ranked completion becomes `chosen` and the lowest-ranked becomes
-   `rejected`. The output JSONL is ready for `data/pack_dpo.py`.
-
-#### Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Remote Ollama server URL |
-| `OLLAMA_JUDGE_MODEL` | `qwen2.5:7b-instruct` | Model used for pairwise judging |
-| `OLLAMA_GEN_MODEL` | (same as judge) | Model used for candidate generation |
-
-#### Output JSONL Format
-
-```jsonl
-{"prompt": "What is 2+2?", "chosen": "4", "rejected": "5",
- "chosen_thinking": "2 plus 2 equals 4", "rejected_thinking": "I think it might be 5"}
-{"prompt": "Explain gravity", "chosen": "Gravity is an attractive force...",
- "rejected": "Gravity makes things fall...",
- "chosen_thinking": "Gravity is one of the four fundamental forces...",
- "rejected_thinking": "Um, gravity is what pulls things down..."}
-```
-
-#### Practical Considerations
-
-- **Latency**: Remote Ollama adds network round-trip time per request.
-  Use `--num-candidates 4` for reasonable speed; higher values produce
-  more pairs but take longer.
-- **Judge model quality**: An instruction-tuned model (e.g.
-  `qwen2.5:7b-instruct`, `llama3.1:8b-instruct`) works best for judging.
-  Using the same model for generation and judging is acceptable but may
-  introduce bias.
-- **No internet required**: Everything runs against your own Ollama server.
-  No data leaves your infrastructure.
-
-### 10.2 Torch DDP (`train_dpo.py`)
-
-DPO training with standard torch DDP, LoRA support, and the standard DPO loss.
-
-```bash
-# Basic
+# Basic DPO
 python train_dpo.py \
     --checkpoint ./sft_checkpoints/latest.pt \
     --data-dir ./dpo_packed \
     --tokenizer ./tokenizer \
     --out-dir ./dpo_checkpoints \
-    --beta 0.1 \
-    --max-steps 500
+    --num-steps 500
 
 # With LoRA
 python train_dpo.py \
     --checkpoint ./sft_checkpoints/latest.pt \
     --data-dir ./dpo_packed \
     --tokenizer ./tokenizer \
-    --lora --lora-rank 64 --lora-alpha 128 \
-    --lr 1e-5 \
-    --max-steps 500
+    --out-dir ./dpo_checkpoints \
+    --lora --lora-rank 64 \
+    --num-steps 500
 
-# Multi-GPU (torchrun)
-torchrun --nproc_per_node=4 train_dpo.py \
-    --checkpoint ./sft.pt \
-    --data-dir ./dpo_packed \
-    --batch-size 4
-
-# With label smoothing and clipping
-python train_dpo.py \
-    --checkpoint ./sft.pt \
-    --data-dir ./dpo_packed \
-    --beta 0.2 \
-    --label-smoothing 0.1 \
-    --clip-ratio 0.2
-
-# Smoke test
-python train_dpo.py --smoke-test
-```
-
-#### How DPO Works
-
-The DPO loss directly optimises the policy on preference pairs:
-
-```
-For each preference triple (prompt, chosen, rejected):
-
-  1. Compute logπ(chosen) — logπ_ref(chosen)  = chosen_log_ratio
-  2. Compute logπ(rejected) — logπ_ref(rejected) = rejected_log_ratio
-  3. logits = β × (chosen_log_ratio - rejected_log_ratio)
-  4. loss = -log σ(logits)
-
-  where logprobs are summed over completion tokens only
-  (prompt tokens are masked out)
-```
-
-**Key differences from GRPO:**
-- No rollout generation needed (static pairs)
-- No reward function — preference is baked into the data
-- Reference model anchors the policy to prevent divergence
-- Simpler, more stable training
-
-#### DPO Loss Parameters
-
-| Parameter | Default | Description |
-|---|---|---|
-| `--beta` | `0.1` | DPO temperature — higher = more emphasis on preferring chosen |
-| `--label-smoothing` | `0.0` | Smooths the preference label (epsilon in DPO formula) |
-| `--clip-ratio` | `0.0` | PPO-style clipping on implicit reward ratio (0 = disabled) |
-
-#### Reference Policy
-
-```bash
-# Single model (default) — reuse trainable model under no_grad
-python train_dpo.py --ref-policy single ...
-
-# Two-model — separate frozen copy (more stable but 2× memory)
-python train_dpo.py --ref-policy two --checkpoint ./sft.pt ...
-```
-
-Two-model is more stable because the reference never drifts from the initial
-SFT policy. Single-model is more memory-efficient and works well for short runs.
-
-#### Key Flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `--beta` | `0.1` | DPO temperature parameter |
-| `--label-smoothing` | `0.0` | DPO label smoothing epsilon |
-| `--clip-ratio` | `0.0` | PPO-style clipping on implicit reward |
-| `--lora` | `false` | Enable LoRA adapters |
-| `--lora-rank` | `64` | LoRA rank |
-| `--lora-alpha` | `128.0` | LoRA scaling alpha |
-| `--ref-policy` | `single` | `single` or `two` — reference model strategy |
-| `--batch-size` | `4` | Preference triples per step |
-| `--compile` | `false` | Enable torch.compile |
-| `--save-every` | `50` | Checkpoint interval in steps |
-
-#### Logging
-
-```python
-# Per-step logging output:
-step     0 | loss +0.6931 | acc 48.00% | r_margin 0.0012 | lr 1.00e-06 | g 0.00 | 2.50 step/s
-step    50 | loss +0.6523 | acc 58.00% | r_margin 0.0387 | lr 7.35e-06 | g 0.15 | 3.10 step/s
-step   100 | loss +0.6110 | acc 63.00% | r_margin 0.0874 | lr 1.56e-07 | g 0.12 | 3.05 step/s
-```
-
-Metrics:
-- `loss` — DPO loss (decreasing = policy separating chosen from rejected)
-- `acc` — accuracy (fraction of batch where chosen_reward > rejected_reward)
-- `r_margin` — average reward margin (chosen_reward - rejected_reward)
-- `lr` — current learning rate
-- `g` — gradient norm
-
-### 10.3 DeepSpeed (`train_dpo_deepspeed.py`)
-
-DeepSpeed variant with auto-selected ZeRO stages and hardware audit.
-
-```bash
-# Single GPU
-deepspeed --num_gpus 1 train_dpo_deepspeed.py \
-    --checkpoint ./sft.pt \
-    --data-dir ./dpo_packed \
-    --tokenizer ./tokenizer
-
-# Multi-GPU
-deepspeed --num_gpus 4 train_dpo_deepspeed.py \
-    --checkpoint ./sft.pt \
-    --data-dir ./dpo_packed \
-    --tokenizer ./tokenizer \
-    --lora --lora-rank 64
-
-# Force ZeRO-3 with CPU offload
-deepspeed train_dpo_deepspeed.py \
-    --checkpoint ./sft.pt \
-    --data-dir ./dpo_packed \
-    --tokenizer ./tokenizer \
-    --zero-stage 3 --cpu-offload-optimizer
-
-# Resume from full-FT checkpoint
-deepspeed train_dpo_deepspeed.py \
-    --checkpoint ./sft.pt \
-    --data-dir ./dpo_packed \
-    --resume ./dpo_checkpoints/latest_ds
-```
-
-#### End-to-End DPO Pipeline
-
-```bash
-# Step 1: Generate preference pairs using Ollama judge
-python ollama_judge.py \
-    --input ./prompts.jsonl \
-    --output ./prefs.jsonl \
-    --url http://remote:11434 \
-    --num-candidates 4
-
-# Step 2: Pack for training
-python data/pack_dpo.py \
-    --data-dir ./prefs \
-    --tokenizer ./tokenizer \
-    --cache-dir ./dpo_packed \
-    --mode reasoning
-
-# Step 3: Train (DDP)
+# Two-model reference (separate frozen reference network)
 python train_dpo.py \
     --checkpoint ./sft_checkpoints/latest.pt \
     --data-dir ./dpo_packed \
     --tokenizer ./tokenizer \
-    --lora \
-    --beta 0.1 \
-    --max-steps 300
+    --out-dir ./dpo_checkpoints \
+    --ref-policy two \
+    --num-steps 500
 
-# Step 3 (alternative): Train (DeepSpeed)
-deepspeed --num_gpus 4 train_dpo_deepspeed.py \
-    --checkpoint ./sft.pt \
+# With label smoothing (epsilon in DPO formula)
+python train_dpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
     --data-dir ./dpo_packed \
     --tokenizer ./tokenizer \
-    --lora \
-    --beta 0.1 \
-    --max-steps 300
+    --out-dir ./dpo_checkpoints \
+    --beta 0.2 \
+    --label-smoothing 0.1 \
+    --num-steps 500
 
-# Step 4: Inference
-python infer.py \
-    --checkpoint ./dpo_checkpoints/latest.pt \
-    --base-checkpoint ./sft.pt \
-    --prompt "What is 2+2?"
+# With KL anchoring to reference (extra stability)
+python train_dpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./dpo_checkpoints \
+    --kl-coef 0.01 \
+    --beta 0.1 \
+    --num-steps 500
+
+# Adaptive clipping (PPO-style clipping of implicit reward)
+python train_dpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./dpo_checkpoints \
+    --clip-ratio 0.5 \
+    --num-steps 500
+
+# With torch.compile
+python train_dpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./dpo_checkpoints \
+    --compile \
+    --num-steps 500
+
+# Multi-GPU (torchrun)
+torchrun --nproc_per_node=4 train_dpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --batch-size 4
+```
+
+**DPO Arguments:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint` | `None` | Path to pretrained checkpoint |
+| `--tokenizer` | `./tokenizer` | Tokenizer directory |
+| `--data-dir` | `./dpo_packed` | Packed DPO data |
+| `--out-dir` | `./dpo_checkpoints` | Output directory |
+| `--resume` | `None` | Resume from checkpoint |
+| `--lora` | `False` | Enable LoRA |
+| `--lora-rank` | `64` | LoRA rank |
+| `--lora-alpha` | `128.0` | LoRA alpha |
+| `--ref-policy` | `single` | `single` or `two` |
+| `--beta` | `0.1` | DPO beta (inverse temperature) |
+| `--label-smoothing` | `0.0` | DPO label smoothing epsilon |
+| `--clip-ratio` | `0.0` | Adaptive clipping (0 = disabled) |
+| `--kl-coef` | `0.0` | KL penalty (0 = disabled) |
+| `--batch-size` | `4` | Per-GPU batch size |
+| `--num-steps` | `500` | Total steps |
+| `--max-steps` | `None` | Alternative to `--num-steps` |
+| `--warmup-steps` | `20` | LR warmup |
+| `--lr` | `1e-6` | Peak LR |
+| `--min-lr` | `1e-7` | Minimum LR |
+| `--weight-decay` | `0.0` | Weight decay |
+| `--grad-clip` | `1.0` | Gradient clipping |
+| `--save-every` | `50` | Save interval |
+| `--log-interval` | `1` | Log interval |
+
+### 8B. DeepSpeed DPO
+
+```bash
+# ZeRO-2 DPO
+deepspeed train_dpo_deepspeed.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --out-dir ./dpo_checkpoints_ds \
+    --tokenizer ./tokenizer \
+    --batch-size 8 \
+    --zero-stage 2
+
+# ZeRO-3 with LoRA
+deepspeed train_dpo_deepspeed.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --out-dir ./dpo_checkpoints_ds \
+    --tokenizer ./tokenizer \
+    --lora --lora-rank 64 \
+    --zero-stage 3
+
+# With CPU offload
+deepspeed train_dpo_deepspeed.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --out-dir ./dpo_checkpoints_ds \
+    --tokenizer ./tokenizer \
+    --zero-stage 3 \
+    --cpu-offload-optimizer \
+    --batch-size 4
 ```
 
 ---
 
-## 11. Inference
+## 9. Inference
 
-The inference script (`infer.py`) supports one-shot generation, interactive
-REPL, batched evaluation, and quantized modes.
-
-### One-Shot Generation
+### 9A. Interactive REPL
 
 ```bash
+# Interactive mode with streaming
 python infer.py \
-    --checkpoint ./checkpoints/latest_checkpoint \
-    --prompt "Solve 2+2"
-```
-
-### Interactive REPL
-
-```bash
-python infer.py \
-    --checkpoint ./checkpoints/latest_checkpoint \
+    --checkpoint ./checkpoints/latest.pt \
     --interactive
+
+# Interactive with thinking enabled
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --interactive \
+    --enable-thinking
+
+# Interactive with custom system prompt
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --interactive \
+    --system "You are a helpful coding assistant."
+
+# Interactive without streaming
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --interactive \
+    --no-stream
 ```
 
-Type prompts at the `>>>` prompt. Generation streams token-by-token.
-
-### Explicit Recipe
+### 9B. One-Shot Generation
 
 ```bash
+# Single prompt
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --prompt "What is the derivative of ln(x)?"
+
+# Multiple prompts (batched)
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --prompt "What is 2+2?" \
+    --prompt "Explain quantum computing." \
+    --batch-size 2
+
+# With explicit recipe
 python infer.py \
     --checkpoint ./checkpoints/latest.pt \
     --recipe ./recipe.json \
-    --prompt "Hello!"
+    --prompt "Hello, world!"
+
+# Override chat template
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --prompt "Hello" \
+    --chat-template raw
+
+# Explicit EOS token override
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --prompt "Complete this: 2+2=" \
+    --eos-token-id 50256
 ```
 
-### Batched Evaluation
+### 9C. Batched from File
 
 ```bash
+# Batch from JSONL
 python infer.py \
     --checkpoint ./checkpoints/latest.pt \
     --prompts-file ./eval.jsonl \
     --batch-size 8 \
-    --output ./results.jsonl
-```
+    --output ./completions.jsonl
 
-Input JSONL format: `{"prompt": "..."}` or `{"prompt": "...", "answer": "..."}`.
-
-### Quantized Inference
-
-```bash
-# 4-bit quantization
+# Without streaming (faster for batch)
 python infer.py \
     --checkpoint ./checkpoints/latest.pt \
-    --quantize 4bit \
-    --prompt "Hello"
+    --prompts-file ./eval.jsonl \
+    --batch-size 16 \
+    --output ./completions.jsonl \
+    --no-stream
+```
 
+### 9D. Quantized Inference
+
+```bash
 # 8-bit quantization
 python infer.py \
     --checkpoint ./checkpoints/latest.pt \
     --quantize 8bit \
-    --prompt "Hello"
-```
+    --prompt "Hello, world!"
 
-Requires `bitsandbytes` installed. The model loads compressed and runs with
-reduced memory (~4× for 4-bit).
-
-### LoRA Checkpoint Inference
-
-```bash
-# Infer.py auto-detects LoRA checkpoints and merges on-the-fly
-python infer.py \
-    --checkpoint ./sft_checkpoints/sft_step0005000_lora.pt \
-    --base-checkpoint ./pretrained_checkpoints/latest.pt \
-    --prompt "What is 2+2?"
-```
-
-### Generation Parameters
-
-```bash
+# 4-bit quantization (smallest memory footprint, ~4× reduction)
 python infer.py \
     --checkpoint ./checkpoints/latest.pt \
-    --prompt "Write a poem" \
-    --temperature 0.8 \
-    --top-k 50 \
-    --top-p 0.95 \
-    --repetition-penalty 1.1 \
-    --max-new-tokens 256 \
-    --min-new-tokens 10
+    --quantize 4bit \
+    --interactive
+
+# Quantized + batch
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --quantize 4bit \
+    --prompts-file ./eval.jsonl \
+    --batch-size 4 \
+    --output ./out.jsonl
 ```
 
-### Smoke Test (No Checkpoint Needed)
+### 9E. Advanced Generation Settings
 
 ```bash
-python infer.py --smoke-test
+# Low temperature (more deterministic)
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --prompt "Complete: The capital of France is" \
+    --temperature 0.2 \
+    --top-k 10
+
+# Creative generation
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --prompt "Write a poem about AI" \
+    --temperature 1.2 \
+    --top-p 0.95 \
+    --top-k 100
+
+# With repetition penalty (to avoid loops)
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --prompt "Tell me a story" \
+    --repetition-penalty 1.2 \
+    --max-new-tokens 1000
+
+# Min + max length constraints
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --prompt "Explain gravity" \
+    --min-new-tokens 50 \
+    --max-new-tokens 200
+
+# Seeded for reproducibility
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --prompt "1 + 1 =" \
+    --seed 42
 ```
 
-Creates a tiny random model and runs one generation to verify dependencies.
+### 9F. Device & Memory Management
+
+```bash
+# Run on specific GPU
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --device cuda:0 \
+    --prompt "Hello"
+
+# Run on CPU
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --device cpu \
+    --prompt "Hello"
+
+# With device memory budget (accelerate-style)
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --max-memory "0:18GiB,cpu:30GiB" \
+    --prompt "Hello"
+
+# Override max sequence length (for long-context inference)
+python infer.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --max-seq-len 16384 \
+    --prompt "Long context prompt..."
+```
+
+### 9G. LoRA Checkpoint Inference
+
+```bash
+# Inference with a LoRA checkpoint (auto-detects and merges)
+python infer.py \
+    --checkpoint ./sft_checkpoints/sft_step_010000.pt \
+    --prompt "Hello, world!"
+```
+
+The inference script auto-detects whether the checkpoint contains a `lora_state_dict`, creates LoRA adapters, loads weights, and merges them into the base model on-the-fly.
+
+**Inference Arguments:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint` | **(required)** | Path to `.pt` checkpoint |
+| `--recipe` | `None` | Path to `recipe.json` (auto-detected from checkpoint dir) |
+| `--device` | `auto` | `auto`, `cpu`, or `cuda:N` |
+| `--max-memory` | `None` | Per-device memory budget, e.g. `'0:18GiB,cpu:30GiB'` |
+| `--max-seq-len` | `None` | Override `max_position_embeddings` |
+| `--quantize` | `none` | `4bit`, `8bit`, or `none` |
+| `--prompt` | `None` | One or more prompts (repeatable) |
+| `--prompts-file` | `None` | JSONL file with prompts |
+| `--interactive` | `False` | REPL mode |
+| `--smoke-test` | `False` | Smoke test mode |
+| `--chat-template` | `auto` | `auto`, `chatml`, `raw`, `custom` |
+| `--enable-thinking` | `False` | Open `<think>` block in assistant turn |
+| `--system` | `None` | System message for every prompt |
+| `--max-new-tokens` | `512` | Max generation length |
+| `--min-new-tokens` | `0` | Min generation length |
+| `--temperature` | `0.7` | Sampling temperature |
+| `--top-k` | `50` | Top-k sampling |
+| `--top-p` | `0.9` | Top-p (nucleus) sampling |
+| `--repetition-penalty` | `1.0` | Repetition penalty |
+| `--seed` | `None` | RNG seed |
+| `--eos-token-id` | `None` | Override EOS token |
+| `--batch-size` | `1` | Micro-batch size |
+| `--output` | `None` | Output JSONL path |
+| `--stream` / `--no-stream` | `True` | Token streaming |
 
 ---
 
-## 12. Model Architecture
+## 10. Architecture Variants
 
-The model (`model.py`) is a dense (non-MoE) transformer with these configurable
-components:
+All training scripts (DDP, DeepSpeed, and Hivemind) accept architecture variant flags. These are defined centrally in `model.py` via `add_architecture_args()` and `apply_architecture_args()`.
 
-```
-┌──────────────────────────────────────────────────┐
-│              TransformerForCausalLM               │
-│                                                   │
-│  Token Embeddings (scale_emb = 1/√d)             │
-│         │                                         │
-│  ┌──────┴──────┐                                 │
-│  │ Decoder × N │  (each:                         │
-│  │   ┌────────┐│   pre-RMSNorm → Self-Attn       │
-│  │   │ Self-  ││   → residual                    │
-│  │   │ Attn   ││   → pre-RMSNorm → MLP           │
-│  │   └────────┘│   → residual)                   │
-│  │   ┌────────┐│                                  │
-│  │   │ MLP    ││  GQA (key-value groups)          │
-│  │   └────────┘│  RoPE (rotary embeddings)        │
-│  └──────┬──────┘  QK-Norm (optional)              │
-│         │         SwiGLU / GELU                   │
-│         │         RMSNorm / LayerNorm             │
-│  ┌──────┴──────┐                                 │
-│  │  Final Norm │                                  │
-│  └──────┬──────┘                                  │
-│         │                                         │
-│  ┌──────┴──────┐                                 │
-│  │  LM Head    │  (tied with embeddings)          │
-│  └─────────────┘                                  │
-└──────────────────────────────────────────────────┘
+### 10A. Quick Reference
+
+| Variant | Flags | Description |
+|---------|-------|-------------|
+| **Dense (default)** | *(none needed)* | Standard pre-norm decoder-only transformer |
+| **Parallel** | `--layer-type parallel` | PaLM-style: attn + MLP computed in parallel from same input |
+| **Jamba** | `--arch jamba --jamba-interval 4` | Hybrid SSM + Attention: every Nth layer is attention, rest are Mamba SSM |
+| **MoD** | `--mod-alpha 0.25` | Mixture-of-Depth: router skips FFN for low-scoring tokens |
+| **MLA** | `--use-mla` | Multi-head Latent Attention (DeepSeek-style, low-rank KV compression) |
+| **MTP** | `--num-mtp-heads 3` | Multi-Token Prediction with auxiliary loss (faster convergence) |
+| **Sliding Window** | `--sliding-window-size 4096` | Alternating global + local window attention (efficient long context) |
+
+### 10B. Architecture Variant Commands
+
+**Parallel Layer (PaLM-style)**
+
+```bash
+python train_pretrain.py \
+    --model-size 0.3B \
+    --layer-type parallel \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
 ```
 
-### ModelConfig Fields
+**Jamba Hybrid (SSM + Attention)**
+
+```bash
+# Attention every 4th layer, rest are Mamba SSM
+python train_pretrain.py \
+    --model-size 0.6B \
+    --arch jamba \
+    --jamba-interval 4 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# Attention every 6th layer (more SSM, less attention — faster)
+python train_pretrain.py \
+    --model-size 1.7B \
+    --arch jamba \
+    --jamba-interval 6 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+```
+
+**Mixture-of-Depth (MoD)**
+
+```bash
+# Aggressive routing (~50% of tokens skip FFN)
+python train_pretrain.py \
+    --model-size 0.3B \
+    --mod-alpha 0.3 \
+    --mod-loss-weight 0.01 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# Light routing (~20% of tokens skip FFN)
+python train_pretrain.py \
+    --model-size 0.3B \
+    --mod-alpha 0.15 \
+    --mod-loss-weight 0.005 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# MoD + Parallel (maximum throughput combination)
+python train_pretrain.py \
+    --model-size 0.3B \
+    --layer-type parallel \
+    --mod-alpha 0.25 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+```
+
+**Multi-head Latent Attention (MLA)**
+
+```bash
+# Default KV compression rank (hidden_size // 4)
+python train_pretrain.py \
+    --model-size 0.3B \
+    --use-mla \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# Explicit KV LoRA rank
+python train_pretrain.py \
+    --model-size 0.6B \
+    --use-mla \
+    --kv-lora-rank 256 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# MLA + Sliding Window (efficient KV for long context)
+python train_pretrain.py \
+    --model-size 0.6B \
+    --use-mla \
+    --sliding-window-size 8192 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+```
+
+**Multi-Token Prediction (MTP)**
+
+```bash
+# 3 auxiliary heads, default discount 0.5
+python train_pretrain.py \
+    --model-size 0.3B \
+    --num-mtp-heads 3 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# 5 heads with higher discount for later tokens
+python train_pretrain.py \
+    --model-size 0.6B \
+    --num-mtp-heads 5 \
+    --mtp-discount 0.6 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# MTP + Parallel + MoD (all efficiency tricks combined)
+python train_pretrain.py \
+    --model-size 0.6B \
+    --num-mtp-heads 3 \
+    --layer-type parallel \
+    --mod-alpha 0.2 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+```
+
+**Sliding Window Attention**
+
+```bash
+# 4096-token sliding window (alternating global/sw layers)
+python train_pretrain.py \
+    --model-size 0.3B \
+    --sliding-window-size 4096 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# 8192-token sliding window
+python train_pretrain.py \
+    --model-size 0.6B \
+    --sliding-window-size 8192 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+```
+
+### 10C. Composed Variants (Everything Together)
+
+```bash
+# Jamba + MLA + MTP + Sliding Window
+python train_pretrain.py \
+    --model-size 1B \
+    --arch jamba \
+    --use-mla \
+    --num-mtp-heads 3 \
+    --sliding-window-size 4096 \
+    --jamba-interval 4 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# Dense + Parallel + MoD + MTP (max throughput + faster convergence)
+python train_pretrain.py \
+    --model-size 0.6B \
+    --layer-type parallel \
+    --mod-alpha 0.25 \
+    --num-mtp-heads 3 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# MLA + MoD + Sliding Window (long context, efficient compute)
+python train_pretrain.py \
+    --model-size 0.6B \
+    --use-mla \
+    --mod-alpha 0.2 \
+    --sliding-window-size 8192 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# Jamba + Parallel layer type
+python train_pretrain.py \
+    --model-size 0.6B \
+    --arch jamba \
+    --layer-type parallel \
+    --jamba-interval 4 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+```
+
+### 10D. Variants in SFT, GRPO, DPO
+
+All architecture flags work identically in every training script:
+
+```bash
+# SFT with MLA
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --use-mla
+
+# GRPO with parallel layers
+python train_grpo.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_checkpoints \
+    --layer-type parallel
+
+# DPO with MTP heads (auxiliary loss during preference tuning)
+python train_dpo.py \
+    --checkpoint ./checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./dpo_checkpoints \
+    --num-mtp-heads 3
+
+# DeepSpeed SFT with Jamba + Sliding Window
+deepspeed train_sft_deepspeed.py \
+    --checkpoint-dir ./checkpoints \
+    --cache-dir ./sft_packed \
+    --out-dir ./sft_checkpoints_ds \
+    --arch jamba \
+    --sliding-window-size 4096
+```
+
+### 10E. Architecture Variant Arguments
+
+| Flag | Default | Choices | Description |
+|------|---------|---------|-------------|
+| `--arch` | `dense` | `dense`, `jamba` | Architecture type |
+| `--layer-type` | `sequential` | `sequential`, `parallel` | Layer computation order |
+| `--sliding-window-size` | `0` | int | Window size (0 = disabled) |
+| `--num-mtp-heads` | `0` | int | MTP heads (0 = disabled) |
+| `--mtp-discount` | `0.5` | float | Discount factor per future token |
+| `--mod-alpha` | `0.0` | float | MoD routing threshold (0 = disabled) |
+| `--mod-loss-weight` | `0.01` | float | MoD auxiliary loss weight |
+| `--use-mla` | `False` | flag | Enable Multi-head Latent Attention |
+| `--kv-lora-rank` | `None` | int | MLA KV compression rank (default: `hidden_size // 4`) |
+| `--jamba-interval` | `4` | int | Place attention layer every N layers in Jamba |
+
+### 10F. Architecture Decision Guide
+
+| Goal | Recommended Flags |
+|------|-------------------|
+| Maximum throughput | `--layer-type parallel --mod-alpha 0.25` |
+| Long context, efficient KV | `--use-mla` or `--use-mla --sliding-window-size 8192` |
+| Best quality-to-compute ratio | `--arch jamba --jamba-interval 4` |
+| Faster convergence | `--num-mtp-heads 3` (auxiliary MTP loss) |
+| Standard baseline | *(default: dense sequential)* |
+| Long context + compute efficient | `--use-mla --mod-alpha 0.2 --sliding-window-size 8192` |
+| Maximum everything | `--arch jamba --use-mla --layer-type parallel --num-mtp-heads 3 --mod-alpha 0.2` |
+
+---
+
+## 11. Recipe System
+
+The `TrainingRecipe` class in `recipe.py` is the single source of truth for training mode, chat templates, special tokens, and model name.
+
+### 11A. Three Training Modes
+
+| Mode | `<think>` tags? | Use Case |
+|------|----------------|----------|
+| `reasoning` | Required | Math, code, logic — model shows chain-of-thought |
+| `non_reasoning` | Not used | General chat, instruction following, creative writing |
+| `hybrid` | Per-example `want_thinking` flag | Mix of reasoning + non-reasoning in one training run |
+
+### 11B. Using Recipes
+
+```bash
+# Training scripts: pass --recipe or --mode
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --recipe ./recipe.json
+
+# Or just specify mode (uses default special tokens for that mode)
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --mode reasoning
+
+# Inference auto-detects recipe from checkpoint directory
+python infer.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --prompt "Hello" \
+    --recipe ./recipe.json
+
+# Data packing scripts also accept recipes
+python data/pack_sft.py \
+    --data-dir ./sft_data \
+    --tokenizer ./tokenizer \
+    --cache-dir ./sft_packed \
+    --mode hybrid
+
+# DeepSpeed training
+deepspeed train_pretrain_deepspeed.py \
+    --model-size 0.3B \
+    --data-dir ./packed \
+    --out-dir ./checkpoints_ds \
+    --recipe ./recipe.json
+
+# GRPO with recipe
+python train_grpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_checkpoints \
+    --recipe ./recipe.json
+```
+
+### 11C. Recipe JSON Format
+
+```json
+{
+  "mode": "reasoning",
+  "chat_template": "chatml",
+  "turn_prefix_user": "<|im_start|>user\n",
+  "turn_suffix_user": "<|im_end|>\n",
+  "turn_prefix_assistant": "<|im_start|>assistant\n",
+  "turn_suffix_assistant": "<|im_end|>\n",
+  "think_open": "<think>",
+  "think_close": "</think>",
+  "hybrid_think_token": "<|think_on|>",
+  "hybrid_nothink_token": "<|think_off|>",
+  "model_name": "DenseLLM"
+}
+```
+
+### 11D. Special Tokens
+
+| Token | `reasoning` | `non_reasoning` | `hybrid` |
+|-------|-------------|-----------------|----------|
+| `<\|endoftext\|>` | ✓ | ✓ | ✓ |
+| `<\|pad\|>` | ✓ | ✓ | ✓ |
+| `<\|im_start\|>` | ✓ | ✓ | ✓ |
+| `<\|im_end\|>` | ✓ | ✓ | ✓ |
+| `<think>` | ✓ | ✗ | ✓ |
+| `</think>` | ✓ | ✗ | ✓ |
+| `<\|think_on\|>` | ✗ | ✗ | ✓ |
+| `<\|think_off\|>` | ✗ | ✗ | ✓ |
+
+### 11E. Python API
+
+```python
+from recipe import TrainingRecipe
+
+# Create default (reasoning mode)
+recipe = TrainingRecipe()
+
+# Explicit config
+recipe = TrainingRecipe(
+    mode="hybrid",
+    chat_template="chatml",
+    turn_prefix_user="<|im_start|>user\n",
+    turn_suffix_user="<|im_end|>\n",
+)
+
+# Format turns
+user_turn = recipe.format_user_turn("What is 2+2?")
+# → "<|im_start|>user\nWhat is 2+2?<|im_end|>\n"
+
+assistant_turn = recipe.format_assistant_turn(
+    thinking="2 plus 2 equals 4",
+    answer="4"
+)
+# → "<|im_start|>assistant\n<think>\n2 plus 2 equals 4\n</think>\n4<|im_end|>\n"
+
+# Full conversation (with optional system message)
+conv = recipe.format_full_conversation(
+    prompt="What is 2+2?",
+    thinking="2 plus 2 equals 4",
+    answer="4",
+    system="You are a math tutor.",
+)
+
+# Token access
+print(recipe.special_tokens)
+print(recipe.eos_token)       # <|endoftext|>
+print(recipe.pad_token)       # <|pad|>
+
+# Serialize
+recipe.to_json("./recipe.json")
+recipe = TrainingRecipe.from_json("./recipe.json")
+```
+
+---
+
+## 12. Optimizer & LR Schedules
+
+### 12A. AdamW (Default)
+
+```bash
+# AdamW with default LR auto-scaling
+python train_pretrain.py \
+    --model-size 1.7B \
+    --optimizer adamw \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# AdamW with explicit LR
+python train_pretrain.py \
+    --model-size 0.3B \
+    --optimizer adamw \
+    --lr 3e-4 \
+    --weight-decay 0.1 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+```
+
+### 12B. Muon (Newton-Schulz, 2-3× Faster)
+
+```bash
+# Muon optimizer (recommended for 1B+ models)
+python train_pretrain.py \
+    --model-size 1.7B \
+    --optimizer muon \
+    --lr 2e-4 \
+    --weight-decay 0.1 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# Muon + WSD (best combination)
+python train_pretrain.py \
+    --model-size 1.7B \
+    --optimizer muon \
+    --schedule wsd \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+```
+
+Muon uses two optimizers internally: Muon for embedding-free parameters and AdamW for embeddings/norms.
+
+### 12C. Cosine Schedule (Default)
+
+```bash
+# Cosine decay with linear warmup
+python train_pretrain.py \
+    --model-size 0.3B \
+    --schedule cosine \
+    --num-steps 100000 \
+    --warmup-steps 2000 \
+    --lr 3e-4 \
+    --min-lr 3e-5 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+```
+
+### 12D. WSD Schedule (Warmup-Stable-Decay)
+
+WSD keeps LR at peak for most of training then quickly decays — often yields better final loss than cosine for the same step count.
+
+```bash
+# WSD: 80% stable, 20% decay
+python train_pretrain.py \
+    --model-size 0.6B \
+    --schedule wsd \
+    --num-steps 100000 \
+    --warmup-steps 2000 \
+    --stable-ratio 0.8 \
+    --lr 3e-4 \
+    --min-lr 3e-5 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# WSD with Muon
+python train_pretrain.py \
+    --model-size 1.7B \
+    --schedule wsd \
+    --stable-ratio 0.85 \
+    --optimizer muon \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+```
+
+### 12E. LR Auto-Scaling
+
+The framework automatically scales the learning rate based on model size using scaling laws:
+
+```bash
+# Auto-scaled — the LR you pass is adjusted internally
+python train_pretrain.py \
+    --model-size 13B \
+    --lr 3e-4 \
+    --data-dir ./packed
+
+# Disable auto-scaling for manual control
+python train_pretrain.py \
+    --model-size 13B \
+    --lr 1.5e-4 \
+    --no-lr-scale \
+    --data-dir ./packed
+```
+
+---
+
+## 13. PEFT: LoRA / DoRA / rsLoRA
+
+### 13A. LoRA (Low-Rank Adaptation)
+
+```bash
+# Standard LoRA in SFT
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --lora-rank 64 \
+    --lora-alpha 128
+
+# LoRA in GRPO
+python train_grpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_checkpoints \
+    --lora --lora-rank 32 --lora-alpha 64
+
+# LoRA in DPO
+python train_dpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./dpo_checkpoints \
+    --lora --lora-rank 64
+```
+
+### 13B. DoRA (Weight-Decomposed Low-Rank Adaptation)
+
+```bash
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --lora-rank 32 \
+    --lora-type dora
+```
+
+### 13C. rsLoRA (Rank-Stabilized LoRA)
+
+```bash
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --lora-rank 128 \
+    --lora-alpha 256 \
+    --use-rslora
+```
+
+### 13D. Custom Target Modules
+
+```bash
+# Adapt all linear projections (not just attention)
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --lora-rank 64 \
+    --lora-target-modules "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+
+# LoRA parameters learn at a different rate than base parameters
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --lora-rank 64 \
+    --lora-lr-ratio 2.0
+```
+
+### 13E. Merging LoRA Checkpoints
+
+```bash
+# After training, merge LoRA weights into base model and save full weights
+python train_sft.py --merge-and-save \
+    --output-dir ./sft_checkpoints
+
+# Inference auto-merges LoRA (no separate merge step needed)
+python infer.py \
+    --checkpoint ./sft_checkpoints/sft_step_010000.pt \
+    --prompt "Hello"
+```
+
+### 13F. PEFT in DeepSpeed
+
+```bash
+# LoRA in DeepSpeed SFT
+deepspeed train_sft_deepspeed.py \
+    --checkpoint-dir ./checkpoints \
+    --cache-dir ./sft_packed \
+    --out-dir ./sft_checkpoints_ds \
+    --lora-rank 64 \
+    --zero-stage 2
+
+# LoRA in DeepSpeed GRPO
+deepspeed train_grpo_deepspeed.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --cache_dir ./grpo_packed \
+    --out_dir ./grpo_checkpoints_ds \
+    --tokenizer ./tokenizer \
+    --lora --lora_rank 64 \
+    --zero-stage 3
+```
+
+---
+
+## 14. RoPE Scaling (YaRN / NTK)
+
+All architectures support YaRN and NTK-aware RoPE frequency scaling for extended context beyond the original `max_position_embeddings`.
+
+### 14A. YaRN Scaling
+
+```bash
+# 8× context extension (e.g., 8K → 64K)
+python train_pretrain.py \
+    --model-size 0.3B \
+    --rope-scaling '{"type": "yarn", "factor": 8.0}' \
+    --max-seq-len 65536 \
+    --seq-len 4096 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# YaRN with 4× in SFT
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --rope-scaling '{"type": "yarn", "factor": 4.0}' \
+    --max-seq-len 32768 \
+    --seq-len 8192
+```
+
+### 14B. NTK-Aware Scaling
+
+```bash
+# NTK-aware 8× extension (better high-frequency preservation)
+python train_pretrain.py \
+    --model-size 0.3B \
+    --rope-scaling '{"type": "ntk", "factor": 8.0}' \
+    --max-seq-len 65536 \
+    --seq-len 4096 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+
+# NTK with 16× for very long context
+python train_pretrain.py \
+    --model-size 0.6B \
+    --rope-scaling '{"type": "ntk", "factor": 16.0}' \
+    --max-seq-len 131072 \
+    --seq-len 8192 \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints
+```
+
+> **Note:** `rope_scaling` is a JSON object parsed by `ModelConfig`. The `factor` is the context extension multiplier (e.g., `8.0` = 8× the original `max_position_embeddings`). YaRN and NTK work identically across all architectures (dense, Jamba, etc.).
+
+---
+
+## 15. Ollama DPO Judge
+
+The `ollama_judge.py` script generates preference pairs using a remote Ollama server. Given prompts, it generates multiple candidates and uses a judge model to pick preferred/rejected.
+
+### 15A. Single Prompt
+
+```bash
+python ollama_judge.py \
+    --prompt "What is the capital of France?" \
+    --url http://localhost:11434 \
+    --judge-model llama3.1:8b \
+    --num-candidates 4
+```
+
+### 15B. Batch Mode from File
+
+```bash
+# Process prompts from JSONL file
+python ollama_judge.py \
+    --input ./prompts.jsonl \
+    --output ./preference_pairs.jsonl \
+    --url http://localhost:11434 \
+    --judge-model qwen2.5:7b-instruct \
+    --gen-model qwen2.5:7b \
+    --num-candidates 6 \
+    --max-pairs 2 \
+    --max-prompts 100
+```
+
+### 15C. Custom Generation Settings
+
+```bash
+python ollama_judge.py \
+    --input ./prompts.jsonl \
+    --output ./pairs.jsonl \
+    --judge-model llama3.1:8b \
+    --gen-model llama3.1:8b \
+    --num-candidates 4 \
+    --temperature 0.9 \
+    --max-tokens 1024 \
+    --timeout 180 \
+    --system-prompt "You are a helpful math tutor."
+
+# Use separate gen and judge models
+python ollama_judge.py \
+    --input ./math_prompts.jsonl \
+    --output ./pairs.jsonl \
+    --gen-model qwen2.5:7b \
+    --judge-model qwen2.5:7b-instruct
+```
+
+### 15D. Connectivity Test
+
+```bash
+# Verify connection to Ollama server
+python ollama_judge.py \
+    --url http://192.168.1.50:11434 \
+    --test
+```
+
+### 15E. Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Remote Ollama server URL |
+| `OLLAMA_JUDGE_MODEL` | `qwen2.5:7b-instruct` | Model used for pairwise judging |
+| `OLLAMA_GEN_MODEL` | (same as judge) | Model used for candidate generation |
+
+**Ollama Judge Arguments:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--url` | `http://localhost:11434` | Ollama server URL |
+| `--judge-model` | `llama3.1:8b` | Judge model name |
+| `--gen-model` | `""` | Generator model (same as judge if empty) |
+| `--timeout` | `120` | HTTP timeout (seconds) |
+| `--num-candidates` | `4` | Candidates per prompt |
+| `--max-pairs` | `1` | Max preference pairs per prompt |
+| `--temperature` | `0.8` | Sampling temperature |
+| `--max-tokens` | `512` | Max tokens per candidate |
+| `--system-prompt` | `""` | Optional system prompt |
+| `--max-prompts` | `0` | Max prompts to process (0 = all) |
+| `--test` | `False` | Run connectivity test |
+| `--prompt` | `None` | Single prompt (one-shot mode) |
+| `--input` | `None` | Input JSONL file (batch mode) |
+| `--output` | `./preference_pairs.jsonl` | Output JSONL file |
+
+---
+
+## 16. Distributed Multi-GPU
+
+### 16A. DDP via torchrun
+
+```bash
+# Single-node, 4 GPUs
+torchrun --nproc_per_node=4 train_pretrain.py \
+    --model-size 1.7B \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --batch-size 8 \
+    --grad-accum 8
+
+# Single-node, 8 GPUs
+torchrun --nproc_per_node=8 train_pretrain.py \
+    --model-size 7B \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --batch-size 4 \
+    --grad-accum 16 \
+    --gradient-checkpointing
+
+# Torch DDP SFT on 4 GPUs
+torchrun --nproc_per_node=4 train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --lora-rank 64 \
+    --batch-size 8
+
+# Torch DDP DPO on 4 GPUs
+torchrun --nproc_per_node=4 train_dpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --batch-size 4
+```
+
+### 16B. DeepSpeed Multi-Node
+
+```bash
+# Single node, ZeRO-2
+deepspeed --num_gpus=4 train_pretrain_deepspeed.py \
+    --model-size 1.7B \
+    --data-dir ./packed \
+    --out-dir ./checkpoints_ds \
+    --zero-stage 2
+
+# Multi-node via hostfile
+deepspeed --hostfile ./hostfile train_pretrain_deepspeed.py \
+    --model-size 13B \
+    --data-dir ./packed \
+    --out-dir ./checkpoints_ds \
+    --batch-size 4 \
+    --grad-accum-steps 8 \
+    --zero-stage 3
+
+# DeepSpeed SFT multi-node
+deepspeed --hostfile ./hostfile train_sft_deepspeed.py \
+    --checkpoint-dir ./checkpoints \
+    --cache-dir ./sft_packed \
+    --out-dir ./sft_checkpoints_ds \
+    --lora-rank 64 \
+    --zero-stage 3
+```
+
+### 16C. Host File Format
+
+```
+# hostfile example for 2 nodes with 4 GPUs each
+node1 slots=4
+node2 slots=4
+```
+
+---
+
+## 17. Decentralized Hivemind Training
+
+Hivemind enables heterogeneous multi-node training across different GPUs, machines, and even CPUs.
+
+### 17A. Pretrain with Hivemind
+
+**Bootstrap node** (first machine, e.g., RTX 4090):
+
+```bash
+bash hivemind/run.sh bootstrap \
+    --model-size 300M \
+    --data-dir ./packed \
+    --batch-size 16 \
+    --grad-accum 2 \
+    --dtype bf16 \
+    --checkpoint-dir ./hivemind_ckpts_a
+```
+
+**Worker node** (second machine, e.g., RTX 3050):
+
+```bash
+bash hivemind/run.sh worker 192.168.1.100:5678 \
+    --model-size 300M \
+    --data-dir ./packed \
+    --batch-size 4 \
+    --dtype bf16 \
+    --checkpoint-dir ./hivemind_ckpts_b
+```
+
+**CPU laptop:**
+
+```bash
+bash hivemind/run.sh worker 192.168.1.100:5678 \
+    --model-size 300M \
+    --data-dir ./packed \
+    --batch-size 1 \
+    --dtype fp32 \
+    --checkpoint-dir ./hivemind_ckpts_c
+```
+
+### 17B. SFT with Hivemind
+
+```bash
+# Bootstrap
+bash hivemind/run.sh sft-bootstrap \
+    --model-size 300M \
+    --data-dir ./sft_packed \
+    --lora-rank 64 \
+    --checkpoint-dir ./sft_ckpts
+
+# Worker
+bash hivemind/run.sh sft-worker 192.168.1.100:5678 \
+    --model-size 300M \
+    --data-dir ./sft_packed \
+    --lora-rank 32 \
+    --checkpoint-dir ./sft_ckpts_b
+```
+
+### 17C. GRPO with Hivemind
+
+```bash
+# Bootstrap
+bash hivemind/run.sh grpo-bootstrap \
+    --checkpoint ./sft_ckpts/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_ckpts \
+    --batch-size 8 \
+    --num-generations 8
+
+# Worker
+bash hivemind/run.sh grpo-worker 192.168.1.100:5678 \
+    --checkpoint ./sft_ckpts/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_ckpts_b \
+    --batch-size 2 \
+    --num-generations 4
+```
+
+### 17D. DPO with Hivemind
+
+```bash
+# Bootstrap
+bash hivemind/run.sh dpo-bootstrap \
+    --checkpoint ./sft_ckpts/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./dpo_ckpts \
+    --batch-size 8
+
+# Worker
+bash hivemind/run.sh dpo-worker 192.168.1.100:5678 \
+    --checkpoint ./sft_ckpts/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./dpo_ckpts_b \
+    --batch-size 2
+```
+
+### 17E. Architecture Variants + Hivemind
+
+```bash
+# Jamba with Hivemind
+bash hivemind/run.sh bootstrap \
+    --model-size 300M \
+    --arch jamba \
+    --jamba-interval 4 \
+    --data-dir ./packed \
+    --checkpoint-dir ./ckpts
+
+# MLA + Sliding Window with Hivemind
+bash hivemind/run.sh bootstrap \
+    --model-size 300M \
+    --use-mla \
+    --sliding-window-size 4096 \
+    --data-dir ./packed \
+    --checkpoint-dir ./ckpts
+```
+
+### 17F. Checkpoint Averaging (Merged Model)
+
+```bash
+# After distributed training, produce a merged evaluation checkpoint
+bash hivemind/run.sh average 192.168.1.100:5678 ./averaged_model
+```
+
+### 17G. Hivemind CLI Arguments
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--hivemind` | `False` | Enable decentralized training |
+| `--initial-peers` | `""` | Bootstrap peers (empty = bootstrap node) |
+| `--host` | `0.0.0.0` | Network interface to bind |
+| `--port` | `0` | P2P port (0 = random) |
+| `--peer-id` | `None` | Human-readable peer name |
+| `--target-group-size` | `8` | Averaging fan-out |
+| `--averaging-period` | `1` | All-reduce every N steps |
+| `--average-parameters` | `True` | Average parameters (not gradients) |
+| `--no-average-parameters` | `False` | Average gradients instead |
+| `--checkpoint-average-rounds` | `3` | Rounds for final checkpoint averaging |
+| `--average-checkpoints` | `False` | After training, average params across swarm |
+
+### 17H. Hivemind Architecture
+
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Peer A        │    │   Peer B        │    │   Peer C        │
+│   RTX 4090      │    │   RTX 3060      │    │   MacBook M3    │
+│   8 GB batch    │    │   4 GB batch    │    │   2 GB batch    │
+└────────┬────────┘    └────────┬────────┘    └────────┬────────┘
+         │                      │                      │
+         └──────────────────────┼──────────────────────┘
+                                │
+                    ┌───────────▼───────────┐
+                    │   Hivemind DHT        │
+                    │  (decentralized)      │
+                    │  Async parameter      │
+                    │  averaging            │
+                    └───────────────────────┘
+```
+
+Each peer: has the full model → reads own data shard → runs local steps at its own pace → fires async all-reduce after each step → continues immediately without blocking → absorbs averaged parameters when the all-reduce completes.
+
+---
+
+## 18. Checkpoint Save / Resume
+
+### 18A. Save Format
+
+Every training script saves checkpoints containing:
+- `model_state` — model parameters
+- `optimizer_state` — optimizer state (AdamW moments, Muon states)
+- `config` — `ModelConfig` serialization
+- `step` — current training step
+- `loss` — current loss value
+- `recipe` — `TrainingRecipe` in JSON form
+
+### 18B. Resuming Training
+
+```bash
+# Resume from a specific checkpoint file
+python train_pretrain.py \
+    --model-size 0.3B \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --resume ./checkpoints/step_00050000.pt
+
+# Resume from a directory (auto-finds latest step)
+python train_pretrain.py \
+    --model-size 0.3B \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --resume ./checkpoints
+
+# Resume SFT
+python train_sft.py \
+    --checkpoint-dir ./checkpoints \
+    --data-dir ./sft_packed \
+    --output-dir ./sft_checkpoints \
+    --resume ./sft_checkpoints/sft_step_0005000.pt
+
+# Resume GRPO
+python train_grpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./grpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./grpo_checkpoints \
+    --resume ./grpo_checkpoints/grpo_step_0000200.pt
+
+# Resume DPO
+python train_dpo.py \
+    --checkpoint ./sft_checkpoints/latest.pt \
+    --data-dir ./dpo_packed \
+    --tokenizer ./tokenizer \
+    --out-dir ./dpo_checkpoints \
+    --resume ./dpo_checkpoints/dpo_step_0000200.pt
+
+# Resume DeepSpeed (from DeepSpeed checkpoint directory)
+deepspeed train_pretrain_deepspeed.py \
+    --model-size 0.6B \
+    --data-dir ./packed \
+    --out-dir ./checkpoints_ds \
+    --resume ./checkpoints_ds/global_step00050000
+
+# Resume Hivemind (each peer resumes from its own directory)
+bash hivemind/run.sh worker 192.168.1.100:5678 \
+    --model-size 300M \
+    --data-dir ./packed \
+    --checkpoint-dir ./hivemind_ckpts \
+    --resume ./hivemind_ckpts/step_00000050.pt
+```
+
+### 18C. Checkpoint Management
+
+```bash
+# Keep only the 5 most recent checkpoints
+python train_pretrain.py \
+    --model-size 0.3B \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --keep-ckpts 5 \
+    --save-every 2000
+
+# Save infrequently for long training runs
+python train_pretrain.py \
+    --model-size 1.7B \
+    --data-dir ./packed \
+    --checkpoint-dir ./checkpoints \
+    --save-every 10000 \
+    --keep-ckpts 2
+```
+
+---
+
+## 19. Model Architecture Reference
+
+### 19A. ModelConfig Fields
 
 ```python
 config = ModelConfig(
-    vocab_size=65536,           # Vocabulary size
-    hidden_size=2048,           # Hidden dimension
-    intermediate_size=6144,     # MLP intermediate dimension
-    num_hidden_layers=28,       # Decoder layers
-    num_attention_heads=16,     # Attention heads
-    num_key_value_heads=4,      # KV heads (GQA)
-    head_dim=128,               # Head dimension
-    max_position_embeddings=8192,  # Max sequence length
-    rms_norm_eps=1e-6,          # RMSNorm epsilon
-    rope_theta=1000000.0,       # RoPE base frequency
-    rope_scaling=None,          # RoPE scaling (NTK-aware, YaRN, etc.)
-    tie_word_embeddings=True,   # Tie LM head ↔ embeddings
-    scale_emb=True,             # Scale embeddings by 1/√d
-    norm_type="rmsnorm",        # rmsnorm / layernorm
-    mlp_type="swiglu",          # swiglu / gelu
-    use_qk_norm=True,           # QK RMSNorm before RoPE
-    attn_type="gqa",            # gqa / mha
-    attention_dropout=0.0,      # Attention dropout rate
-    hidden_dropout=0.0,         # Hidden dropout rate
-    init_std=0.02,              # Weight init standard deviation
+    vocab_size=65536,                # Vocabulary size
+    hidden_size=2048,                # Hidden dimension
+    intermediate_size=6144,          # MLP intermediate dimension
+    num_hidden_layers=28,            # Number of decoder layers
+    num_attention_heads=16,          # Number of attention heads
+    num_key_value_heads=4,           # KV heads (GQA)
+    head_dim=128,                    # Head dimension
+    max_position_embeddings=8192,    # Max sequence length
+    rms_norm_eps=1e-6,               # RMSNorm epsilon
+    rope_theta=1000000.0,            # RoPE base frequency
+    rope_scaling=None,               # RoPE scaling (YaRN, NTK)
+    tie_word_embeddings=True,        # Tie LM head ↔ embeddings
+    scale_emb=True,                  # Scale embeddings by 1/√d
+    norm_type="rmsnorm",             # rmsnorm / layernorm
+    mlp_type="swiglu",               # swiglu / gelu
+    use_qk_norm=True,                # QK RMSNorm before RoPE
+    attn_type="gqa",                 # gqa / mha
+    attention_dropout=0.0,           # Attention dropout rate
+    hidden_dropout=0.0,              # Hidden dropout rate
+    init_std=0.02,                   # Weight init standard deviation
+    # Architecture variant fields:
+    arch_type="dense",               # dense / jamba
+    layer_type="sequential",         # sequential / parallel
+    sliding_window_size=0,           # 0 = disabled
+    use_mla=False,                   # Multi-head Latent Attention
+    kv_lora_rank=None,               # MLA KV compression rank
+    num_mtp_heads=0,                 # MTP heads
+    mtp_discount=0.5,                # MTP discount factor
+    mod_alpha=0.0,                   # MoD threshold (0 = disabled)
+    mod_loss_weight=0.01,            # MoD auxiliary loss weight
+    jamba_hybrid_layer_interval=4,   # Jamba attention interval
 )
 ```
 
-### Auto-Sizing (`from_target_size`)
+### 19B. Auto-Sizing (`from_target_size`)
+
+The auto-sizer searches over hidden sizes, layers, and heads to find a configuration closest to the target parameter count. It uses cube-root scaling (params ∝ H³), auto-tiered head_dim, and adaptive layer search to support the full 10M → trillions range.
 
 ```python
-# Generates a balanced architecture for ~1.7B params
+# ~1.7B param model
 config = ModelConfig.from_target_size(target_params=1_700_000_000)
 ```
 
-The auto-sizer searches over hidden sizes, layers, and heads to find a
-configuration closest to the target parameter count. It uses cube-root
-scaling (params ∝ H³), auto-tiered head_dim, and adaptive layer search
-to support the full 10M → trillions range.
-
-### Supported Configurations
+### 19C. Sample Model Configurations
 
 | Model Size | Layers | Hidden | Heads | KV Heads | Head Dim | Intermediate | Typical GPU |
-|---|---|---|---|---|---|---|---|
+|-----------|--------|--------|-------|----------|---------|-------------|-------------|
 | 10M | 3 | 576 | 9 | 1 | 64 | 1,472 | CPU / laptop |
 | 100M | 12 | 896 | 14 | 1 | 64 | 2,496 | CPU / laptop |
 | 300M | 16 | 1,280 | 10 | 2 | 128 | 3,840 | RTX 4090 (24 GB) |
@@ -1647,113 +2582,123 @@ to support the full 10M → trillions range.
 | 8B | 41 | 4,288 | 36 | 2 | 128 | 11,840 | H100 / 4× A100-40GB |
 | 70B | 68 | 9,984 | 52 | 4 | 192 | 27,456 | 8× H100 |
 | 300B | 102 | 16,128 | 64 | 32 | 256 | 44,352 | Multi-node |
-| 1T | 162 | 24,064 | 96 | 16 | 256 | 66,176 | Multi-node
+| 1T | 162 | 24,064 | 96 | 16 | 256 | 66,176 | Multi-node |
 
-### Flash Attention
+### 19D. Flash Attention
 
-Uses PyTorch's `F.scaled_dot_product_attention` which automatically
-leverages FlashAttention-2/3 on compatible GPUs.
+Uses PyTorch's `F.scaled_dot_product_attention` which automatically leverages FlashAttention-2/3 on compatible GPUs (SM80+).
 
-### Gradient Checkpointing
+### 19E. Gradient Checkpointing
 
-```python
-model.model.enable_gradient_checkpointing()  # saves ~35% VRAM, costs ~30% compute
+```bash
+# Pass to any training script
+python train_pretrain.py \
+    --model-size 1.7B \
+    --gradient-checkpointing \
+    --data-dir ./packed
 ```
 
-Pass `--gradient-checkpointing` to the pretrain script.
+Saves ~35% VRAM at the cost of ~30% additional compute.
+
+### 19F. MFU Estimation
+
+The framework estimates Model FLOPS Utilization (MFU) using a GPU peak TFLOPS lookup table:
+
+- A100 SXM: 312 TFLOPS (BF16)
+- RTX 4090: 165 TFLOPS (BF16)
+- H100: 494 TFLOPS (BF16)
+- H200: 524 TFLOPS (BF16)
+
+At each log interval, the measured FLOPS is compared to the GPU peak to report MFU%.
+
+### 19G. Z-Loss
+
+Z-loss is an auxiliary loss that penalises large logit magnitudes by adding `z_loss_weight * mean(logits^2)` to the total loss. This improves training stability, especially for large models or long training runs:
+
+```bash
+# Disable Z-loss
+python train_pretrain.py \
+    --model-size 0.3B \
+    --z-loss-weight 0 \
+    --data-dir ./packed
+
+# Strong Z-loss penalty
+python train_pretrain.py \
+    --model-size 13B \
+    --z-loss-weight 1e-3 \
+    --data-dir ./packed
+```
 
 ---
 
-## 13. Troubleshooting & FAQ
+## Appendix A: Full CLI Reference
 
-### Common Issues
-
-#### `CUDA out of memory`
-
-Solutions (in order of effectiveness):
-1. Reduce `--batch-size` (the biggest lever)
-2. Enable `--gradient-checkpointing` (saves ~35% activation VRAM)
-3. Reduce `--seq-len` (halving sequence length halves activations)
-4. Use LoRA (`--lora-rank 64`) for SFT
-5. Use DeepSpeed (`train_*_deepspeed.py`) with auto-ZeRO
-
-#### `FileNotFoundError: No ... files found`
-
-Ensure you've run the data pipeline step in order:
-
-```
-dataset_agent.py  →  pack_*.py  →  train_*.py
-     ↓                    ↓             ↓
-  JSONL shards       memmap .bin     model checkpoint
-```
-
-Check that `--data-dir` and `--out-dir`/`--cache-dir` point to the correct
-directories from the previous step.
-
-#### `Double-shift` or `NaN` loss in pretraining
-
-The `PackedDataLoader` produces pre-shifted targets, and `pretrain_loss()`
-computes the cross-entropy directly against those targets. If you see NaN
-loss, make sure you're using `pretrain_loss()` and NOT passing `labels` to
-`model(x)`.
-
-#### Ollama connection errors in data agent
+Every script has a `--help` flag for the complete list of arguments:
 
 ```bash
-# Ensure Ollama is running
-ollama serve
-
-# Check which model is available
-ollama list
-
-# The agent needs both:
-#   OLLAMA_URL    (default: http://localhost:11434)
-#   OLLAMA_MODEL  (default: llama3.1)
+python model.py --help                      # Model configuration (read source)
+python tokenizer_train.py --help             # Tokenizer training
+python train_pretrain.py --help              # Pretrain (DDP)
+python train_pretrain_deepspeed.py --help    # Pretrain (DeepSpeed)
+python train_sft.py --help                   # SFT
+python train_sft_deepspeed.py --help         # SFT (DeepSpeed)
+python train_grpo.py --help                  # GRPO
+python train_grpo_deepspeed.py --help        # GRPO (DeepSpeed)
+python train_dpo.py --help                   # DPO
+python train_dpo_deepspeed.py --help         # DPO (DeepSpeed)
+python infer.py --help                       # Inference
+python ollama_judge.py --help                # DPO preference generation
+python data/pack_pretrain.py --help          # Pretrain data packing
+python data/pack_sft.py --help               # SFT data packing
+python data/pack_grpo.py --help              # GRPO data packing
+python data/pack_dpo.py --help               # DPO data packing
+python webscrapped_dataset_curator_AI_MCP/agent/codegen_pipeline.py --help
+python webscrapped_dataset_curator_AI_MCP/agent/hf_to_packed.py --help
+python webscrapped_dataset_curator_AI_MCP/agent/dataset_agent.py --help
+python hivemind/train_pretrain_hivemind.py --help
+python hivemind/train_sft_hivemind.py --help
+python hivemind/train_grpo_hivemind.py --help
+python hivemind/train_dpo_hivemind.py --help
 ```
 
-#### `datasets` package errors
+### Shared Architecture Arguments (all training scripts)
 
-If `--public-sources huggingface` is set but `datasets` or
-`huggingface_hub` are not installed:
-
-```bash
-pip install datasets huggingface_hub
+```
+--arch {dense,jamba}
+--layer-type {sequential,parallel}
+--sliding-window-size N
+--num-mtp-heads N
+--mtp-discount F
+--mod-alpha F
+--mod-loss-weight F
+--use-mla
+--kv-lora-rank N
+--jamba-interval N
 ```
 
-Missing deps produce a logged warning, not a crash — that backend is skipped.
+### Shared Recipe Arguments (packing + training scripts)
 
-### FAQ
-
-**Q: Can I add a new category for web scraping?**
-
-Edit `agent/topics.py` and add an entry to `TOPIC_SEEDS` and
-`HUB_SEARCH_KEYWORDS` for your new category.
-
-**Q: How do I use my own training recipe across multiple machines?**
-
-Save `recipe.json` with `recipe.to_json("./recipe.json")`, then pass
-`--recipe ./recipe.json` to every training script and to `infer.py`.
-
-**Q: Can I continue an SFT run after changing LoRA rank?**
-
-No — the LoRA adapter dimensions are baked into the checkpoint. Load
-the base weights fresh and re-inject with the new rank.
-
-**Q: What happens if I mix sources in `--public-sources`?**
-
-Each source is tried in order. After all public sources are exhausted for
-a category, the remaining budget is filled via live web scraping (unless
-`--public-only` is set).
-
-**Q: How do I serve the trained model?**
-
-```bash
-python infer.py --checkpoint ./checkpoints/latest.pt --interactive
+```
+--recipe PATH
+--mode {reasoning,non_reasoning,hybrid}
 ```
 
-For production serving, the `infer.py` script is designed as a reference
-implementation you can wrap in a REST API, gRPC server, or MCP server.
+### Shared Hivemind Arguments (hivemind training scripts)
+
+```
+--hivemind
+--initial-peers "ip:port"
+--host 0.0.0.0
+--port N
+--peer-id NAME
+--target-group-size N
+--averaging-period N
+--average-parameters / --no-average-parameters
+--checkpoint-average-rounds N
+```
 
 ---
 
-> **End of Manual** — For CLI-specific help: `python <script> --help`
+> **Pro tip:** Every training script auto-saves its `ModelConfig`, `TrainingRecipe`, and hyperparameters alongside checkpoints. You never lose track of what produced a given `.pt` file — just inspect the checkpoint metadata.
+
+> For architecture-specific help: `python -c "from model import add_architecture_args; help(add_architecture_args)"`
