@@ -1389,6 +1389,18 @@ def train(args: argparse.Namespace):
     if master:
         print(f"[Dataset] {len(train_ds):,} prompts ({world_size} rank(s))")
 
+    # --------------------------------------------------------------- auto LR scaling
+    if not args.no_lr_scale:
+        ref_hidden = 2048
+        scale = math.sqrt(ref_hidden / config.hidden_size)
+        scale = max(0.5, min(scale, 2.0))
+        original_lr = args.lr
+        args.lr = args.lr * scale
+        args.min_lr = args.min_lr * scale
+        if master:
+            print(f"[LR] Auto-scaled from {original_lr:.2e} to {args.lr:.2e} "
+                  f"(x{scale:.3f}, hidden={config.hidden_size})")
+
     # --------------------------------------------------------------- optim
     from optim.build_optimizer import build_optimizer
     optimizer = build_optimizer(
@@ -1635,8 +1647,10 @@ def parse_args():
                    help="Total training steps")
     p.add_argument("--warmup-steps", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-6,
-                   help="Peak LR")
+                   help="Peak LR. Auto-scaled by model size unless --no-lr-scale.")
     p.add_argument("--min-lr", type=float, default=1e-7)
+    p.add_argument("--no-lr-scale", action="store_true",
+                   help="Disable auto LR scaling by model size.")
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])

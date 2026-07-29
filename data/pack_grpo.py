@@ -55,22 +55,20 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def discover_jsonl_files(data_dir: str) -> List[str]:
-    """Recursively find all .jsonl files under *data_dir*, sorted."""
-    patterns = [
-        os.path.join(data_dir, "**", "*.jsonl"),
-    ]
-    files: List[str] = []
-    for pat in patterns:
-        files.extend(glob.glob(pat, recursive=True))
-    if not files:
-        files = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
-    if not files:
+    """
+    Discover every JSONL shard under <data_dir>/<category>/*.jsonl.
+    Sorting first makes the assignment deterministic across processes.
+    """
+    all_shards = sorted(glob.glob(os.path.join(data_dir, "*", "*.jsonl")))
+    if not all_shards:
+        # Fallback: try flat structure
+        all_shards = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
+    if not all_shards:
         raise FileNotFoundError(
-            f"No .jsonl files found under {data_dir}. "
+            f"No .jsonl shards found under {data_dir}/<category>/. "
             "Expected JSONL with 'prompt' and 'answer' fields."
         )
-    files.sort()
-    return files
+    return all_shards
 
 
 def assign_files_to_worker(
@@ -116,6 +114,7 @@ def tokenize_prompt(
     recipe: TrainingRecipe,
     tokenizer,
     eos_id: int,
+    max_len: int = 0,
 ) -> List[int]:
     """
     Tokenize the prompt portion of a GRPO record.
@@ -127,21 +126,37 @@ def tokenize_prompt(
     is appended to guide the model into assistant generation mode.
     The EOS marks the end of the prompt; the model generates from there.
 
+    IMPORTANT: the prompt format must match the EXACT same ChatML template
+    used by pack_sft.py and seen by the model during SFT training. The model
+    only knows how to produce well-formed <think>...</think> completions when
+    it sees a prompt in the format it was fine-tuned on. Using an abbreviated
+    template like "user\n{prompt}\nassistant\n" (without im_start/im_end tags)
+    would be a different, unseen prompt shape — GRPO rollouts would sample
+    the model off-distribution, corrupting the reward signal from the very
+    first step.
+
+    If max_len > 0, the prompt tokens are truncated to max_len before
+    the EOS separator is appended.
+
     Returns:
         List of token ids.
     """
     prompt = rec.get("prompt", "").strip()
 
-    # Format user turn using recipe template
+    # Format user turn using recipe template (e.g. <|im_start|>user\n{prompt}<|im_end|>\n)
     user_text = recipe.format_user_turn(prompt)
 
     # Append assistant turn prefix — this signals the model to start generating
     # an assistant response. No body is included; the model fills that in.
-    assistant_prefix = recipe.turn_prefix_assistant
+    assistant_prefix = recipe.turn_prefix_assistant  # e.g. "<|im_start|>assistant\n"
 
     full_text = user_text + assistant_prefix
 
     token_ids = tokenizer.encode(full_text).ids
+
+    # Truncate if necessary
+    if max_len > 0:
+        token_ids = token_ids[:max_len]
 
     # Clamp to uint16
     token_ids = [min(tid, 65535) for tid in token_ids]
@@ -156,7 +171,7 @@ def tokenize_prompt(
 # Two-pass packing
 # ---------------------------------------------------------------------------
 
-def count_tokens(files: List[str], recipe: TrainingRecipe, tokenizer, eos_id: int) -> Tuple[int, List[int]]:
+def count_tokens(files: List[str], recipe: TrainingRecipe, tokenizer, eos_id: int, max_len: int = 0) -> Tuple[int, List[int]]:
     """
     Pass 1: count total tokens and per-record lengths.
 
@@ -165,7 +180,7 @@ def count_tokens(files: List[str], recipe: TrainingRecipe, tokenizer, eos_id: in
     """
     per_record: List[int] = []
     for _fp, _ln, rec in _read_records(files):
-        token_ids = tokenize_prompt(rec, recipe, tokenizer, eos_id)
+        token_ids = tokenize_prompt(rec, recipe, tokenizer, eos_id, max_len)
         per_record.append(len(token_ids))
     total = sum(per_record)
     return total, per_record
@@ -180,6 +195,7 @@ def write_shard(
     answers_path: str,
     total_tokens: int,
     record_indices: Optional[List[int]] = None,
+    max_len: int = 0,
 ) -> Tuple[int, int]:
     """
     Pass 2: write prompt tokens into a pre-allocated memmap and
@@ -203,7 +219,7 @@ def write_shard(
             record_counter += 1
             continue
 
-        token_ids = tokenize_prompt(rec, recipe, tokenizer, eos_id)
+        token_ids = tokenize_prompt(rec, recipe, tokenizer, eos_id, max_len)
         n = len(token_ids)
         mmap_tok[offset: offset + n] = np.array(token_ids, dtype=np.uint16)
         offset += n
@@ -224,17 +240,29 @@ def write_shard(
 
 
 # ---------------------------------------------------------------------------
-# Train / val split
+# Train / val split (deterministic interleaving)
 # ---------------------------------------------------------------------------
+
+def _is_val(record_idx: int, val_fraction: float) -> bool:
+    """Deterministic train/val split: every Nth record goes to val."""
+    if val_fraction <= 0:
+        return False
+    period = max(1, round(1.0 / val_fraction))
+    return (record_idx % period) == 0
+
 
 def split_by_record(
     per_record_lengths: List[int], val_fraction: float
 ) -> Tuple[List[int], List[int]]:
-    """Contiguous tail split."""
-    n = len(per_record_lengths)
-    n_val = max(1, math.ceil(n * val_fraction)) if val_fraction > 0 else 0
-    n_train = n - n_val
-    return list(range(n_train)), list(range(n_train, n))
+    """Deterministic interleaving split: every Nth record goes to val."""
+    train_idx = []
+    val_idx = []
+    for i in range(len(per_record_lengths)):
+        if _is_val(i, val_fraction):
+            val_idx.append(i)
+        else:
+            train_idx.append(i)
+    return train_idx, val_idx
 
 
 # ---------------------------------------------------------------------------
@@ -271,12 +299,15 @@ def pack_grpo(args: argparse.Namespace) -> None:
     files = assign_files_to_worker(all_files, args.worker, args.num_workers)
     log.info("Worker %d/%d assigned %d files", args.worker, args.num_workers, len(files))
 
+    # --- Max length per example ---
+    max_len = args.max_len_per_example
+
     # --- Output directory ---
     os.makedirs(args.cache_dir, exist_ok=True)
 
     # --- Pass 1: count ---
     log.info("Pass 1: counting tokens ...")
-    total_tokens, per_record_lengths = count_tokens(files, recipe, tokenizer, eos_id)
+    total_tokens, per_record_lengths = count_tokens(files, recipe, tokenizer, eos_id, max_len)
     num_records = len(per_record_lengths)
     log.info("Total tokens: %d (%d records)", total_tokens, num_records)
 
@@ -303,16 +334,17 @@ def pack_grpo(args: argparse.Namespace) -> None:
         val_tokens = 0
 
     # --- Pass 2: write ---
-    worker_tag = f".w{args.worker}" if args.num_workers > 1 else ""
+    suffix = f"w{args.worker}-of-{args.num_workers}"
 
     # Write training shard
     log.info("Pass 2: writing training shard ...")
-    train_tok_path = os.path.join(args.cache_dir, f"grpo_prompt_tokens{worker_tag}.bin")
-    train_ans_path = os.path.join(args.cache_dir, f"grpo_answers{worker_tag}.json")
+    train_tok_path = os.path.join(args.cache_dir, f"grpo_prompt_tokens.{suffix}.bin")
+    train_ans_path = os.path.join(args.cache_dir, f"grpo_answers.{suffix}.json")
     n_written, n_answers = write_shard(
         files, recipe, tokenizer, eos_id,
         train_tok_path, train_ans_path, train_tokens,
         record_indices=train_idx,
+        max_len=max_len,
     )
 
     # Write training manifest
@@ -330,7 +362,7 @@ def pack_grpo(args: argparse.Namespace) -> None:
         "token_file": os.path.basename(train_tok_path),
         "answers_file": os.path.basename(train_ans_path),
     }
-    manifest_path = os.path.join(args.cache_dir, f"grpo_manifest{worker_tag}.json")
+    manifest_path = os.path.join(args.cache_dir, f"grpo_manifest.{suffix}.json")
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
     log.info("Wrote manifest: %s", manifest_path)
@@ -338,32 +370,26 @@ def pack_grpo(args: argparse.Namespace) -> None:
     # Write validation shard (if requested)
     if val_fraction > 0 and val_tokens > 0 and val_idx:
         log.info("Pass 2: writing validation shard ...")
-        val_tok_path = os.path.join(args.cache_dir, f"grpo_val_prompt_tokens{worker_tag}.bin")
-        val_ans_path = os.path.join(args.cache_dir, f"grpo_val_answers{worker_tag}.json")
+        val_tok_path = os.path.join(args.cache_dir, f"grpo_val_prompt_tokens.{suffix}.bin")
+        val_ans_path = os.path.join(args.cache_dir, f"grpo_val_answers.{suffix}.json")
         n_written_val, n_answers_val = write_shard(
             files, recipe, tokenizer, eos_id,
             val_tok_path, val_ans_path, val_tokens,
             record_indices=val_idx,
+            max_len=max_len,
         )
 
-        val_manifest = {
-            "total_tokens": int(val_tokens),
-            "num_prompts": n_written_val,
-            "num_answers": n_answers_val,
-            "vocab_size": vocab_size,
-            "eos_token_id": eos_id,
-            "dtype": "uint16",
-            "mode": recipe.mode,
-            "worker": args.worker,
-            "num_workers": args.num_workers,
-            "split": "val",
-            "token_file": os.path.basename(val_tok_path),
-            "answers_file": os.path.basename(val_ans_path),
-        }
-        val_manifest_path = os.path.join(args.cache_dir, f"grpo_val_manifest{worker_tag}.json")
-        with open(val_manifest_path, "w") as f:
-            json.dump(val_manifest, f, indent=2)
-        log.info("Wrote manifest: %s", val_manifest_path)
+        # Update manifest with val files
+        manifest["val_tokens"] = int(val_tokens)
+        manifest["val_prompts"] = n_written_val
+        manifest["val_answers"] = n_answers_val
+        manifest["val_token_file"] = os.path.basename(val_tok_path)
+        manifest["val_answers_file"] = os.path.basename(val_ans_path)
+        manifest["val_fraction"] = val_fraction
+
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        log.info("Updated manifest with val files: %s", manifest_path)
 
     elapsed = time.time() - t0
     log.info("Done in %.1fs", elapsed)
@@ -401,12 +427,28 @@ def parse_args() -> argparse.Namespace:
         "--num-workers", type=int, default=1,
         help="Total number of parallel workers.",
     )
+    p.add_argument(
+        "--max-len-per-example", type=int, default=2048,
+        help="Max tokens per individual GRPO example before truncation.",
+    )
+    p.add_argument(
+        "--seq-length", type=int, default=None,
+        help="Shorthand to set --max-len-per-example to a specific value. "
+             "Useful for short-context training (e.g. 256, 512). "
+             "Overrides --max-len-per-example when both are given.",
+    )
     add_recipe_args(p)
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+
+    # --seq-length overrides --max-len-per-example
+    if args.seq_length is not None:
+        log.info("--seq-length %d overrides --max-len-per-example %d",
+                 args.seq_length, args.max_len_per_example)
+        args.max_len_per_example = args.seq_length
 
     if args.worker >= args.num_workers:
         log.error("--worker (%d) must be < --num-workers (%d)", args.worker, args.num_workers)

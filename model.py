@@ -155,72 +155,99 @@ class ModelConfig:
     ) -> float:
         """
         Score a candidate architecture: lower is better.
-        Penalises deviation from target_params AND deviation from
-        the ideal aspect ratio (intermediate_size ≈ 3× hidden_size
-        for SwiGLU, KV heads dividing attention heads evenly, etc.).
+        Uses asymmetric param error (overshoot penalised 1.5×),
+        MLP aspect-ratio check, KV-head divisibility, and
+        a mild depth preference (deeper = better at same param count).
         """
         n_params = ModelConfig._param_count(
             vocab_size, hidden_size, intermediate_size,
             num_hidden_layers, num_attention_heads,
             num_key_value_heads, head_dim,
         )
-        param_err = abs(math.log(n_params / target_params))
-        # Aspect-ratio penalties
+        # Asymmetric param error: overshooting costs 50 % more than undershooting
+        ratio = n_params / max(1, target_params)
+        if ratio > 1.0:
+            param_err = (ratio - 1.0) * 1.5
+        else:
+            param_err = (1.0 - ratio) * 1.0
+        # MLP ratio penalty — target 2.75× for SwiGLU (standard practice)
         mlp_ratio = intermediate_size / max(1, hidden_size)
-        mlp_penalty = (mlp_ratio - 3.0) ** 2
+        mlp_penalty = (mlp_ratio - 2.75) ** 2
+        # KV-head divisibility — must divide attention heads evenly
         kv_penalty = 0.0
         if num_attention_heads % num_key_value_heads != 0:
-            kv_penalty = 0.5
-        # Total score — param error dominates
-        return param_err + 0.1 * mlp_penalty + 0.3 * kv_penalty
+            kv_penalty = 0.3
+        # Depth preference: deeper models learn better per-param (at equal param count)
+        ref_layers = 28
+        if num_hidden_layers >= ref_layers:
+            depth_score = -math.log(num_hidden_layers / ref_layers) * 0.03  # reward deeper
+        else:
+            depth_score = math.log(ref_layers / num_hidden_layers) * 0.05   # penalty shallower
+        # Total — param error dominates
+        return param_err + 0.1 * mlp_penalty + 0.5 * kv_penalty + depth_score
 
     @classmethod
     def from_target_size(
         cls,
         target_params: int,
         vocab_size: int = 65536,
-        head_dim: int = 128,
+        head_dim: Optional[int] = None,
         max_position_embeddings: int = 8192,
         depth_mult: float = 1.0,
     ) -> "ModelConfig":
         """
         Search for an architecture close to ``target_params`` non-embedding
-        parameters. Uses the same heuristic search as the reference Qwen3
-        ``from_target_size``.
+        parameters.
 
-        The search space:
-            hidden_size ∈ round(scaled * factor) where factor marches
-            num_layers proportional to scaled size
-            KV heads ∈ {2, 4, 8} dividing attention heads evenly
+        Improvements over the baseline version:
+          - ``head_dim`` auto-selected per model tier (64 for < 1 B, 128 otherwise)
+            so small models don't waste parameters on oversized heads.
+          - Wider search grid (6 hidden multipliers, 5 MLP ratios,
+            +/- 4 layers in steps of 2) for better accuracy.
+          - KV-head options include 1 for sub-1 B models.
+          - The quality score uses asymmetric overshoot penalty and
+            a mild depth preference (deeper = better).
         """
-        # Determine base dimension: roughly (target / 12B)^{1/2} * 4096
-        # This mirrors the Chinchilla-optimal scaling.
+        # Auto-select head_dim based on target size
+        if head_dim is None:
+            head_dim = 64 if target_params < 1_000_000_000 else 128
+
+        # KV-head options — small models can use 1 KV head (MQA)
+        kv_options = [1, 2, 4] if target_params < 1_000_000_000 else [2, 4, 8]
+
+        # Base hidden-size estimate  (Chinchilla scaling)
         base = int(4096 * math.sqrt(target_params / 8_000_000_000))
-        hidden = ((base + 127) // 128) * 128  # round to nearest 128
+        hidden = ((base + 127) // 128) * 128
 
         best: Optional[ModelConfig] = None
         best_score = float("inf")
 
-        # Search around the initial guess
-        for h_mult in [0.8, 0.9, 1.0, 1.1, 1.2]:
+        # More granular search than the baseline
+        for h_mult in [0.75, 0.875, 1.0, 1.125, 1.25, 1.375]:
             h = max(128, int(hidden * h_mult))
-            h = ((h + 63) // 64) * 64  # round to 64
-            # Layers proportional to size
-            L = max(8, int(28 * (h / 2048) * depth_mult))
-            # Attention heads: aim for hidden/128
-            H = max(4, h // head_dim)
-            # Adjust to be practical
-            H = ((H + 3) // 4) * 4  # round to multiple of 4
-            # KV heads
-            for kv in [2, 4, 8]:
+            h = ((h + 63) // 64) * 64
+
+            # Attention heads
+            H = max(2, h // head_dim)
+            if target_params >= 1_000_000_000:
+                H = ((H + 3) // 4) * 4  # round to multiple of 4 for GPU tensor cores
+            if H < 2:
+                continue
+
+            for kv in kv_options:
                 if H % kv != 0:
                     continue
-                for mlp_mult in [2.5, 3.0, 3.5]:
-                    inter = int(h * mlp_mult)
-                    inter = ((inter + 63) // 64) * 64
-                    for L_candidate in [max(8, L - 4), L, L + 4]:
+
+                # Layers proportional to hidden_size  (more granular: +/-4 in steps of 2)
+                L_base = max(6, int(28 * (h / 2048) * depth_mult))
+
+                for L in range(max(4, L_base - 4), L_base + 8, 2):
+                    for mlp_ratio in [2.5, 2.75, 3.0, 3.25, 3.5]:
+                        inter = int(h * mlp_ratio)
+                        inter = ((inter + 63) // 64) * 64
+
                         score = cls._quality_score(
-                            vocab_size, h, inter, L_candidate, H, kv,
+                            vocab_size, h, inter, L, H, kv,
                             head_dim, target_params,
                         )
                         if score < best_score:
@@ -229,7 +256,7 @@ class ModelConfig:
                                 vocab_size=vocab_size,
                                 hidden_size=h,
                                 intermediate_size=inter,
-                                num_hidden_layers=L_candidate,
+                                num_hidden_layers=L,
                                 num_attention_heads=H,
                                 num_key_value_heads=kv,
                                 head_dim=head_dim,
@@ -245,7 +272,7 @@ class ModelConfig:
                 num_hidden_layers=4,
                 num_attention_heads=4,
                 num_key_value_heads=2,
-                head_dim=64,
+                head_dim=head_dim or 64,
                 max_position_embeddings=max_position_embeddings,
             )
 
@@ -339,14 +366,41 @@ class RotaryEmbedding(nn.Module):
         k: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply rotary embeddings to q and k."""
+        """Apply rotary embeddings to q and k.
+
+        Handles both single-head (B, T, D) and multi-head (B, T, H*D)
+        inputs by reshaping internally when the last dimension does not
+        match ``head_dim``.
+        """
         cos, sin = self._compute_cos_sin(position_ids)  # (B, T, D/2)
         # Interleave
-        cos = torch.cat([cos, cos], dim=-1)  # (B, T, D)
+        cos = torch.cat([cos, cos], dim=-1)  # (B, T, D_head)
         sin = torch.cat([sin, sin], dim=-1)
-        # Rotate
-        q_embed = (q * cos) + (RotaryEmbedding._rotate_half(q) * sin)
-        k_embed = (k * cos) + (RotaryEmbedding._rotate_half(k) * sin)
+
+        d = cos.shape[-1]  # head_dim
+
+        # --- Q: handle multi-head by reshaping to (B, T, n_heads, d) ---
+        q_flat = q.shape[-1]
+        if q_flat != d:
+            q = q.view(*q.shape[:-1], q_flat // d, d)
+            q_embed = (q * cos.unsqueeze(-2)) + (
+                RotaryEmbedding._rotate_half(q) * sin.unsqueeze(-2)
+            )
+            q_embed = q_embed.view(*q.shape[:-2], q_flat)
+        else:
+            q_embed = (q * cos) + (RotaryEmbedding._rotate_half(q) * sin)
+
+        # --- K: same logic ---
+        k_flat = k.shape[-1]
+        if k_flat != d:
+            k = k.view(*k.shape[:-1], k_flat // d, d)
+            k_embed = (k * cos.unsqueeze(-2)) + (
+                RotaryEmbedding._rotate_half(k) * sin.unsqueeze(-2)
+            )
+            k_embed = k_embed.view(*k.shape[:-2], k_flat)
+        else:
+            k_embed = (k * cos) + (RotaryEmbedding._rotate_half(k) * sin)
+
         return q_embed, k_embed
 
     @staticmethod
@@ -395,10 +449,10 @@ class Attention(nn.Module):
             self.num_heads * self.head_dim, config.hidden_size, bias=False
         )
 
-        # QK-Norm (RMSNorm on Q and K before RoPE — Qwen3's stabilisation trick)
+        # QK-Norm (per-head RMSNorm on Q and K before RoPE — stabilises training)
         if self.use_qk_norm:
-            self.q_norm = RMSNorm(self.num_heads * self.head_dim, eps=config.rms_norm_eps)
-            self.k_norm = RMSNorm(self.num_kv_heads * self.head_dim, eps=config.rms_norm_eps)
+            self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def _shape_qkv(
         self,
@@ -428,10 +482,15 @@ class Attention(nn.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-        # QK-Norm before RoPE
+        # QK-Norm: applied per-head before RoPE
         if self.use_qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+            q = q.view(B, T, self.num_heads, self.head_dim)
+            k = k.view(B, T, self.num_kv_heads, self.head_dim)
+            # RMSNorm over head_dim — each head normalised independently
+            q = self.q_norm(q.reshape(-1, self.head_dim)).reshape(B, T, self.num_heads, self.head_dim)
+            k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(B, T, self.num_kv_heads, self.head_dim)
+            q = q.reshape(B, T, self.num_heads * self.head_dim)
+            k = k.reshape(B, T, self.num_kv_heads * self.head_dim)
 
         # RoPE
         if rotary_emb is not None and position_ids is not None:
@@ -617,6 +676,28 @@ class TransformerModel(nn.Module):
 
         # Embedding scale
         self.embed_scale = 1.0 / math.sqrt(config.hidden_size) if config.scale_emb else 1.0
+        self.gradient_checkpointing = False
+
+    def _ckpt_layer(
+        self,
+        layer: DecoderLayer,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, None]:
+        """
+        Wrapper for torch.utils.checkpoint on a single decoder layer.
+        KV-cache and attention mask are omitted during gradient checkpointing
+        since it only runs in training (no cache) and causality is built into
+        SDPA's is_causal flag (no explicit mask needed).
+        """
+        dummy_attention_mask: Optional[torch.Tensor] = None
+        dummy_past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        return torch.utils.checkpoint.checkpoint(
+            layer, hidden_states,
+            dummy_attention_mask, dummy_past_kv, False, position_ids,
+            self.rotary_emb,
+            use_reentrant=False,
+        )
 
     def forward(
         self,
@@ -647,18 +728,23 @@ class TransformerModel(nn.Module):
                 device=device, dtype=torch.long,
             ).unsqueeze(0).expand(batch_size, -1)
 
-        # Decode through layers
+        # Decode through layers with optional gradient checkpointing
         present_kv: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
         for i, layer in enumerate(self.layers):
             past_kv = past_key_values[i] if past_key_values is not None else None
-            hidden_states, kv = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                past_key_value=past_kv,
-                use_cache=use_cache,
-                position_ids=position_ids,
-                rotary_emb=self.rotary_emb,
-            )
+            if self.gradient_checkpointing and self.training:
+                hidden_states, kv = self._ckpt_layer(
+                    layer, hidden_states, position_ids,
+                )
+            else:
+                hidden_states, kv = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    past_key_value=past_kv,
+                    use_cache=use_cache,
+                    position_ids=position_ids,
+                    rotary_emb=self.rotary_emb,
+                )
             present_kv.append(kv)
 
         hidden_states = self.norm(hidden_states)
@@ -669,9 +755,14 @@ class TransformerModel(nn.Module):
         return outputs
 
     def enable_gradient_checkpointing(self):
-        """Enable gradient checkpointing on decoder layers (saves ~35% VRAM)."""
-        for layer in self.layers:
-            layer.gradient_checkpointing = True
+        """
+        Enable gradient checkpointing — recompute decoder layer activations
+        during backward instead of storing them. Saves ~30-35% VRAM at the
+        cost of ~30% slower per step.
+        """
+        self.gradient_checkpointing = True
+        print("[GradCkpt] gradient checkpointing enabled — activations will be "
+              "recomputed on backward (saves VRAM, ~30% slower per step)")
 
 
 # ======================================================================
@@ -702,14 +793,27 @@ class TransformerForCausalLM(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module):
-        """Weight initialisation with std=config.init_std (default 0.02)."""
-        std = self.config.init_std
+        """Weight initialisation with depth-appropriate scaling.
+
+        Base std = ``config.init_std`` (default 0.02).
+        Output projections (o_proj, down_proj) use a smaller std
+        proportional to ``1 / sqrt(2 * num_layers)`` so that residual
+        variance does not grow with depth (DeepNet / LLaMA recipe).
+        """
+        base_std = self.config.init_std
         if isinstance(module, nn.Linear):
+            # Check if this is a residual output projection.
+            # All such projections have shape (hidden_size, >=hidden_size).
+            is_output_proj = (
+                module.weight.shape[0] == self.config.hidden_size
+                and module.weight.shape[1] >= self.config.hidden_size
+            )
+            std = base_std / math.sqrt(2 * self.config.num_hidden_layers) if is_output_proj else base_std
             nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=std)
+            nn.init.normal_(module.weight, mean=0.0, std=base_std)
 
     def tie_weights(self):
         """Re-tie lm_head to embed_tokens (needed after load_state_dict)."""
@@ -724,13 +828,32 @@ class TransformerForCausalLM(nn.Module):
         use_cache: bool = False,
         position_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        num_logits_to_keep: int = 0,
     ) -> Dict[str, Any]:
         """
         Returns dict with keys:
             "logits": (B, T, V) if labels is None, else (B, T-1, V) shifted.
             "loss": cross-entropy loss if labels provided.
             "past_key_values": optional KV-cache.
+
+        ``num_logits_to_keep``: when > 0, only project the last N *target*
+        positions through lm_head (the positions are auto-shifted left by one
+        so ``logits[t]`` predicts ``input_ids[t+1]``). This avoids materialising
+        the full (B, L, vocab_size) logit tensor — critical for GRPO where we
+        only need log-probs for generated (non-prompt) tokens and vocab_size
+        can be 100k+. Mutually exclusive with ``labels``.
         """
+        if num_logits_to_keep > 0:
+            assert labels is None, (
+                "num_logits_to_keep and labels are mutually exclusive: "
+                "labels needs the full-sequence shift, num_logits_to_keep "
+                "is for the pre-sliced last-N-targets case."
+            )
+            # Only pass the *minimum* hidden states needed through lm_head:
+            # one extra position (the last +1) because we want logits[t] for
+            # predicting target t+1, and we restrict to the final N targets.
+            hidden_subset = None
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -739,7 +862,16 @@ class TransformerForCausalLM(nn.Module):
             position_ids=position_ids,
         )
         hidden_states = outputs["last_hidden_state"]
-        logits = self.lm_head(hidden_states).float()
+
+        # Slice hidden states BEFORE lm_head when num_logits_to_keep is set
+        if num_logits_to_keep > 0:
+            # +1 then drop the last row = standard "shift left by one"
+            # restricted to the last N target positions.
+            hidden_for_logits = hidden_states[:, -(num_logits_to_keep + 1):-1, :]
+        else:
+            hidden_for_logits = hidden_states
+
+        logits = self.lm_head(hidden_for_logits).float()
 
         result = {"logits": logits}
         if use_cache:

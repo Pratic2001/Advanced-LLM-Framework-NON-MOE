@@ -1157,6 +1157,18 @@ def train(args):
             engine, args.resume, is_lora
         )
 
+    # ---------------------------------------------------------------- auto LR scaling
+    if not args.no_lr_scale:
+        ref_hidden = 2048
+        scale = math.sqrt(ref_hidden / config.hidden_size)
+        scale = max(0.5, min(scale, 2.0))
+        original_lr = args.lr
+        args.lr = args.lr * scale
+        args.min_lr = args.min_lr * scale
+        if master:
+            print(f"[LR] Auto-scaled from {original_lr:.2e} to {args.lr:.2e} "
+                  f"(x{scale:.3f}, hidden={config.hidden_size})")
+
     # ---------------------------------------------------------------- LR scheduler
     lr_scheduler = build_scheduler(
         schedule="cosine",
@@ -1227,6 +1239,9 @@ def train(args):
                 loss = masked_cross_entropy(
                     out["logits"], y, m
                 ) / args.grad_accum_steps
+                # Z-loss: penalise large logits for training stability
+                if args.z_loss_weight > 0:
+                    loss = loss + (args.z_loss_weight * out["logits"].float().square().mean() / args.grad_accum_steps)
 
             engine.backward(loss)
             loss_accum += loss.item()
@@ -1364,8 +1379,14 @@ def parse_args():
                    help="Total training steps")
     p.add_argument("--warmup-steps", type=int, default=1000)
     p.add_argument("--lr", type=float, default=2e-5,
-                   help="Peak LR (typically 1e-5 to 5e-5 for SFT)")
+                   help="Peak LR (typically 1e-5 to 5e-5 for SFT). "
+                        "Auto-scaled by model size unless --no-lr-scale.")
     p.add_argument("--min-lr", type=float, default=2e-6)
+    p.add_argument("--no-lr-scale", action="store_true",
+                   help="Disable auto LR scaling by model size.")
+    p.add_argument("--z-loss-weight", type=float, default=1e-4,
+                   help="Z-loss coefficient (0=disabled). "
+                        "Penalises large logit magnitudes for stable training.")
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])

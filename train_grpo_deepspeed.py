@@ -607,6 +607,18 @@ def train(args):
     ckpt_data = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config    = ModelConfig(**ckpt_data["config"])
 
+    # ---------------------------------------------------------------- auto LR scaling
+    if not args.no_lr_scale:
+        ref_hidden = 2048
+        scale = math.sqrt(ref_hidden / config.hidden_size)
+        scale = max(0.5, min(scale, 2.0))
+        original_lr = args.lr
+        args.lr = args.lr * scale
+        args.min_lr = args.min_lr * scale
+        if master:
+            print(f"[LR] Auto-scaled from {original_lr:.2e} to {args.lr:.2e} "
+                  f"(x{scale:.3f}, hidden={config.hidden_size})")
+
     # ---------------------------------------------------------------- hardware audit
     hw = audit_hardware()
 
@@ -994,7 +1006,11 @@ def parse_args():
                    help="Number of PROMPTS per step (rollouts = batch_size * G)")
     p.add_argument("--max_steps",        type=int,   default=500)
     p.add_argument("--warmup_steps",     type=int,   default=20)
-    p.add_argument("--lr",               type=float, default=1e-6)
+    p.add_argument("--lr",               type=float, default=1e-6,
+                   help="Peak LR. Auto-scaled by model size unless --no-lr-scale.")
+    p.add_argument("--min-lr",           type=float, default=1e-7)
+    p.add_argument("--no-lr-scale",      action="store_true",
+                   help="Disable auto LR scaling by model size.")
     p.add_argument("--min_lr",           type=float, default=1e-7)
     p.add_argument("--weight_decay",     type=float, default=0.0)
     p.add_argument("--grad_clip",        type=float, default=1.0)

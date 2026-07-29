@@ -1,0 +1,84 @@
+# =============================================================================
+# Advanced LLM Framework — Core Requirements
+# =============================================================================
+# Install:  pip install -r requirements.txt
+#
+# Optional feature groups (pick what you need):
+#   pip install -r requirements.txt --extra-index-url ...  # or use extras:
+#
+#   pip install ".[web]"      # Web scraping (MCP server, crawler)
+#   pip install ".[train]"    # Training CPU extras
+#   pip install ".[data]"     # Data curation (HF datasets, Kaggle)
+#   pip install ".[peft]"     # LoRA/DoRA fine-tuning extras
+#   pip install ".[reason]"   # LangGraph reasoning codegen
+#   pip install ".[all]"      # Everything
+#
+# CUDA / GPU: torch is listed without --index-url. If you need a specific
+# CUDA version, install torch separately first:
+#   pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+# =============================================================================
+
+# ── Core (always required) ──────────────────────────────────────────────────
+torch>=2.4.0
+numpy>=1.26.0
+tokenizers>=0.19.0
+httpx>=0.27.0
+tqdm>=4.66.0
+safetensors>=0.4.0
+
+# ── Training (required for train_*.py) ─────────────────────────────────────
+deepspeed>=0.14.0
+
+# ── Data curation (required for dataset_agent.py, codegen_pipeline.py) ────
+datasets>=2.18.0
+mcp>=1.0.0
+
+# ── Web scraping (required for web_scraper_mcp/server.py) ─────────────────
+# duckduckgo-search>=4.0.0       # Web search
+# trafilatura>=1.6.0              # HTML → text extraction
+# pdfplumber>=0.10.0              # PDF extraction
+# python-docx>=1.1.0              # DOCX extraction
+# python-pptx>=0.6.0              # PPTX extraction
+# openpyxl>=3.1.0                 # XLSX extraction
+# Pillow>=10.0.0                  # Image processing
+# pytesseract>=0.3.0              # OCR (needs tesseract-ocr system pkg)
+# yt-dlp>=2024.0.0                # Video downloading
+# faster-whisper>=1.0.0           # Audio transcription (needs CUDA)
+# crawl4ai>=0.4.0                 # Headless browser crawling
+
+# ── LoRA / DoRA / PEFT (required for --lora in train_sft.py) ──────────────
+# triton>=2.3.0                   # For fused kernels (CUDA only)
+
+# ── Inference extras ───────────────────────────────────────────────────────
+# bitsandbytes>=0.43.0            # Quantized inference (--quantize 4bit/8bit)
+# einops>=0.7.0                   # For attention reshaping
+
+# ── LangGraph reasoning codegen (for --reasoning-model) ────────────────────
+# langchain>=1.2.0                # LangChain core
+# langchain-ollama>=1.0.0         # Ollama integration for LangChain
+# langgraph>=1.0.0                # LangGraph workflow engine
+
+# ── Logging / monitoring ───────────────────────────────────────────────────
+# wandb>=0.17.0                   # Weights & Biases logging (--wandb-project)
+
+# ── Collator / misc ────────────────────────────────────────────────────────
+# scikit-learn>=1.4.0             # For KNN / retrieval-based features
+# pandas>=2.0.0                   # Data manipulation
+# datasketch>=1.6.0               # MinHash LSH for near-dedup
+# faiss-cpu>=1.8.0                # Vector search (or faiss-gpu for CUDA)
+# sentence-transformers>=2.3.0    # Embedding models for quality filtering
+
+# =============================================================================
+# Installation Cheat Sheet
+# =============================================================================
+#
+#   # Minimal (train from pre-packed data):
+#   pip install torch numpy tokenizers httpx tqdm safetensors deepspeed datasets mcp
+#
+#   # Full data curation pipeline:
+#   pip install torch numpy tokenizers httpx tqdm safetensors deepspeed datasets mcp \
+#               duckduckgo-search trafilatura pdfplumber python-docx python-pptx openpyxl \
+#               Pillow pytesseract yt-dlp faster-whisper crawl4ai
+#
+#   # With LangGraph reasoning codegen:
+#   pip install langchain langchain-ollama langgraph

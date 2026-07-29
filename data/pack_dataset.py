@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""
+data/pack_dataset.py
+
+Tokenizes the JSONL shards under <data_dir>/<category>/*.jsonl
+using the repo's tokenizer, and packs the resulting token IDs into flat,
+memory-mapped .bin files for fast random-access reading during training.
+
+Output layout:
+    <cache_dir>/train.bin   — uint16 or uint32 token IDs, contiguous
+    <cache_dir>/val.bin     — held-out validation slice
+    <cache_dir>/meta.json   — dtype, vocab size, token counts, category breakdown
+
+Memory design
+─────────────
+OLD (memory-hogging):
+    Worker loaded all texts from a 256 MB shard into a Python list,
+    called encode_batch() on all of them at once, then built a giant
+    ids list — 3-5 GB per worker × N workers.
+
+NEW (constant RAM, lifetime-safe):
+    - Workers encode documents in mini-batches of --mini-batch size and
+      write uint32 token IDs directly to a binary chunk file.
+      Peak RAM per worker ≈ mini_batch × avg_doc_tokens × 4 bytes ≈ 30–80 MB.
+    - An optional --max-doc-chars cap pathologically large documents so a
+      single 50 MB JSONL line can't blow the mini-batch budget. Oversized
+      documents are NOT dropped — they are split into <=max-doc-chars
+      pieces and tokenized one piece at a time, so no data is lost.
+    - The main process copies each chunk into the output memmap in slices
+      of --copy-chunk-mb bytes so it never loads a full chunk into RAM either.
+    - Stage 1 uses 'spawn' (not 'fork') so the main process's already-loaded
+      mmap/PyTorch state isn't accidentally inherited by workers.
+
+Usage:
+    python data/pack_dataset.py --data-dir ./data --tokenizer ./tokenizer
+    python data/pack_dataset.py --data-dir ./data --tokenizer ./tokenizer \\
+        --workers 4 --mini-batch 32 --copy-chunk-mb 64 --seq-length 512
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import logging
+import os
+import struct
+import sys
+import time
+from typing import Optional
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Path setup so we can import from the repo root
+# ---------------------------------------------------------------------------
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from tokenizer_train import load_tokenizer  # noqa: E402
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[pack_dataset] %(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Worker  (runs in subprocess — one per shard)
+# ---------------------------------------------------------------------------
+
+_TOKENIZER = None
+_MAX_DOC_CHARS = 0
+_PIECE_OVERLAP_CHARS = 0
+_SEQ_LENGTH = 0
+
+
+def _init_worker(tokenizer_path: str, max_doc_chars: int, piece_overlap_chars: int = 0, seq_length: int = 0):
+    """Load the tokenizer once per worker. Imported lazily so workers don't
+    depend on the parent's torch / numpy state at import time."""
+    global _TOKENIZER, _MAX_DOC_CHARS, _PIECE_OVERLAP_CHARS, _SEQ_LENGTH
+    from tokenizers import Tokenizer
+    _TOKENIZER = Tokenizer.from_file(tokenizer_path)
+    _MAX_DOC_CHARS = max_doc_chars
+    _PIECE_OVERLAP_CHARS = piece_overlap_chars
+    _SEQ_LENGTH = seq_length
+
+
+def _tokenize_shard(job):
+    """
+    Stream documents from one JSONL shard, encode in mini-batches, write
+    raw uint32 token IDs to a binary chunk file.
+
+    Oversized documents (longer than _MAX_DOC_CHARS) are split into
+    <=_MAX_DOC_CHARS-character pieces and tokenized one piece at a time,
+    so no data is dropped. Each piece is encoded in its own batch slot
+    to keep per-piece memory bounded.
+
+    When _SEQ_LENGTH is set, document token IDs are truncated to that
+    many tokens after encoding.
+
+    Chunk file: plain sequence of little-endian uint32 integers.
+    Returns (category, total_token_count, chunk_path, chunked_doc_count).
+    """
+    shard_path, tmp_dir, idx, mini_batch = job
+
+    out_path = os.path.join(tmp_dir, f"chunk_{idx:06d}.bin")
+    category = None
+    total    = 0
+    batch_texts: list = []
+    chunked_docs = 0   # number of source documents that had to be split
+
+    def _flush(texts, fh):
+        if not texts:
+            return 0
+        encodings = _TOKENIZER.encode_batch(texts)
+        n = 0
+        for enc in encodings:
+            ids = enc.ids
+            if _SEQ_LENGTH and len(ids) > _SEQ_LENGTH:
+                ids = ids[:_SEQ_LENGTH]
+            if ids:
+                fh.write(struct.pack(f"<{len(ids)}I", *ids))
+                n += len(ids)
+        return n
+
+    def _enqueue_piece(text, fh):
+        """Enqueue a single piece, flushing whenever the batch is full."""
+        nonlocal total
+        if len(batch_texts) >= mini_batch:
+            total += _flush(batch_texts, fout)
+            batch_texts.clear()
+        batch_texts.append(text)
+        if len(batch_texts) >= mini_batch:
+            total += _flush(batch_texts, fout)
+            batch_texts.clear()
+
+    try:
+        with open(shard_path, "r", encoding="utf-8", errors="replace") as fin, \
+             open(out_path, "wb") as fout:
+
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                text = rec.get("text")
+                if not text:
+                    continue
+                if category is None:
+                    category = rec.get("category", "unknown")
+
+                if _MAX_DOC_CHARS and len(text) > _MAX_DOC_CHARS:
+                    step = _MAX_DOC_CHARS - _PIECE_OVERLAP_CHARS
+                    if step <= 0:
+                        step = _MAX_DOC_CHARS
+                    for start in range(0, len(text), step):
+                        piece = text[start:start + _MAX_DOC_CHARS]
+                        _enqueue_piece(piece, fout)
+                        if len(piece) < _MAX_DOC_CHARS:
+                            break
+                    chunked_docs += 1
+                else:
+                    _enqueue_piece(text, fout)
+
+            total += _flush(batch_texts, fout)  # flush remainder
+
+    except Exception as e:
+        log.error("Worker %d error on %s: %s", idx, shard_path, e)
+
+    if total == 0:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        return category or "unknown", 0, None, chunked_docs
+
+    return category or "unknown", total, out_path, chunked_docs
+
+
+# ---------------------------------------------------------------------------
+# Streaming chunk-to-memmap copy  (no full chunk loaded at once)
+# ---------------------------------------------------------------------------
+
+def _copy_chunk(chunk_path: str,
+                val_arr:   np.ndarray, val_ptr:   int, val_remaining: int,
+                train_arr: np.ndarray, train_ptr: int,
+                out_dtype, slice_tokens: int):
+    """
+    Read chunk_path in slices of `slice_tokens` uint32s.
+    Fill val_arr first (up to val_remaining tokens), then train_arr.
+    Deletes chunk_path when done.
+    Returns (new_val_ptr, new_val_remaining, new_train_ptr).
+    """
+    bytes_per_tok = 4   # uint32
+
+    with open(chunk_path, "rb") as fh:
+        while True:
+            raw = fh.read(slice_tokens * bytes_per_tok)
+            if not raw:
+                break
+            arr = np.frombuffer(raw, dtype=np.uint32)
+
+            # Split between val and train within this slice
+            if val_remaining > 0:
+                take_val = min(val_remaining, len(arr))
+                slice_v  = arr[:take_val].astype(out_dtype, copy=False)
+                val_arr[val_ptr : val_ptr + take_val] = slice_v
+                val_ptr       += take_val
+                val_remaining -= take_val
+                arr = arr[take_val:]
+
+            if len(arr) > 0:
+                slice_t = arr.astype(out_dtype, copy=False)
+                train_arr[train_ptr : train_ptr + len(slice_t)] = slice_t
+                train_ptr += len(slice_t)
+
+    os.remove(chunk_path)
+    return val_ptr, val_remaining, train_ptr
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Tokenize and pack JSONL corpus into memmap .bin files.",
+    )
+    p.add_argument("--data-dir",        default="./data",
+                    help="Directory tree containing .jsonl files with a 'text' field.")
+    p.add_argument("--tokenizer",       default="./tokenizer",
+                    help="Path to tokenizer directory or tokenizer.json file.")
+    p.add_argument("--cache-dir",       default="./packed",
+                    help="Output directory for packed files.")
+    p.add_argument("--val-fraction",    type=float, default=0.005,
+                    help="Fraction of tokens for validation (default 0.5%%).")
+    p.add_argument("--workers",         type=int,
+                    default=max(1, (os.cpu_count() or 2) - 1),
+                    help="Parallel tokenization workers.")
+    p.add_argument("--mini-batch",      type=int, default=64,
+                    help="Docs encoded per mini-batch in each worker. "
+                         "Lower = less RAM per worker. Default 64.")
+    p.add_argument("--max-doc-chars",   type=int, default=200_000,
+                    help="Cap for a single piece fed to the tokenizer. "
+                         "Documents longer than this are split into pieces "
+                         "of this size and tokenized one piece at a time. "
+                         "Default 200,000 chars (~50k tokens).")
+    p.add_argument("--piece-overlap-chars", type=int, default=0,
+                    help="Character overlap between adjacent pieces when "
+                         "splitting an oversized document. Default 0 "
+                         "(no overlap).")
+    p.add_argument("--copy-chunk-mb",   type=int, default=64,
+                    help="Slice size (MB) when copying chunks to final mmap. "
+                         "Controls main-process peak RAM. Default 64 MB.")
+    p.add_argument("--seq-length", type=int, default=None,
+                    help="Max tokens per document. Documents longer than this "
+                         "are truncated to this many tokens, so each training "
+                         "window starts at a clean document boundary and RoPE "
+                         "can learn position resets at EOS tokens. "
+                         "Useful for short-context training (e.g. 256, 512). "
+                         "Should be >= training --seq-len to avoid padding. "
+                         "Default None (no truncation).")
+    p.add_argument("--shuffle-shards",  action="store_true", default=True)
+    p.add_argument("--tokenizer-threads", type=int, default=1,
+                    help="Threads per worker's encode_batch(). Default 1 to "
+                         "avoid oversubscribing cores when --workers > 1.")
+    args = p.parse_args()
+
+    # Resolve tokenizer path
+    tokenizer_path = os.path.join(args.tokenizer, "tokenizer.json")
+    if not os.path.exists(tokenizer_path):
+        # Maybe it's a direct path to tokenizer.json
+        if os.path.exists(args.tokenizer):
+            tokenizer_path = args.tokenizer
+        else:
+            raise FileNotFoundError(
+                f"tokenizer.json not found at {tokenizer_path} "
+                f"or at {args.tokenizer} — run train_tokenizer.py first."
+            )
+
+    # Read vocab size from the tokenizer file
+    from tokenizers import Tokenizer
+    tmp_tok    = Tokenizer.from_file(tokenizer_path)
+    vocab_size = tmp_tok.get_vocab_size()
+    del tmp_tok
+    out_dtype  = np.uint16 if vocab_size <= 65536 else np.uint32
+    log.info("Tokenizer vocab size: %d  ->  packing as %s", vocab_size, out_dtype.__name__)
+
+    # Pin tokenizers' internal rayon thread count BEFORE workers fork/spawn
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ["RAYON_NUM_THREADS"] = str(max(1, args.tokenizer_threads))
+
+    shard_paths = sorted(glob.glob(os.path.join(args.data_dir, "*", "*.jsonl")))
+    if not shard_paths:
+        # Fallback: try flat structure
+        shard_paths = sorted(glob.glob(os.path.join(args.data_dir, "*.jsonl")))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"No .jsonl shards found under {args.data_dir}/<category>/. "
+            "Expected JSONL records with a 'text' field."
+        )
+    log.info("Found %d shard file(s)", len(shard_paths))
+
+    if args.shuffle_shards:
+        rng = np.random.default_rng(seed=42)
+        shard_paths = list(shard_paths)
+        rng.shuffle(shard_paths)
+
+    os.makedirs(args.cache_dir, exist_ok=True)
+    tmp_dir = os.path.join(args.cache_dir, "_tmp_chunks")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    slice_tokens = max(1, (args.copy_chunk_mb * 1024 * 1024) // 4)
+
+    # Print memory estimates so the user can tune before a long run
+    avg_doc_tokens   = 600
+    peak_per_worker  = args.mini_batch * avg_doc_tokens * 4 / 1024**2
+    total_worker_ram = peak_per_worker * args.workers
+    main_proc_peak   = args.copy_chunk_mb
+    log.info("Workers              : %d", args.workers)
+    log.info("Mini-batch / worker  : %d docs  (~%.0f MB peak RAM per worker)",
+             args.mini_batch, peak_per_worker)
+    log.info("Est. total worker RAM: ~%.0f MB", total_worker_ram)
+    log.info("Main proc peak RAM   : ~%d MB (copy slice)", main_proc_peak)
+    log.info("Per-doc cap          : %s chars per piece", f"{args.max_doc_chars:,}")
+    log.info("Piece overlap        : %s chars (0 = no overlap)", f"{args.piece_overlap_chars:,}")
+    log.info("Seq-length           : %s", args.seq_length or "none (no truncation)")
+    log.info("Tokenizer threads    : %d per worker", args.tokenizer_threads)
+
+    # ---------------------------------------------------------------
+    # Stage 1 — tokenize shards in parallel, stream-write chunk files
+    # ---------------------------------------------------------------
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
+
+    t0         = time.time()
+    work_items = [(path, tmp_dir, i, args.mini_batch)
+                  for i, path in enumerate(shard_paths)]
+
+    cat_counts:    dict = {}
+    chunk_records: list = []
+    total_chunked: int  = 0
+
+    log.info("Stage 1 — tokenizing %d shard(s) ...", len(work_items))
+    with ctx.Pool(
+        processes=args.workers,
+        initializer=_init_worker,
+        initargs=(tokenizer_path, args.max_doc_chars, args.piece_overlap_chars,
+                  args.seq_length or 0),
+    ) as pool:
+        for i, (cat, n_tok, chunk_path, chunked) in enumerate(
+            pool.imap_unordered(_tokenize_shard, work_items)
+        ):
+            chunk_records.append((cat, n_tok, chunk_path))
+            cat_counts[cat] = cat_counts.get(cat, 0) + n_tok
+            total_chunked  += chunked
+
+            report_every = max(1, len(work_items) // 20)
+            if (i + 1) % report_every == 0 or (i + 1) == len(work_items):
+                done = sum(r[1] for r in chunk_records)
+                log.info("  [%4d/%d]  %s tokens  (%.1fs)",
+                         i + 1, len(work_items), f"{done:,}", time.time() - t0)
+
+    total_tokens = sum(r[1] for r in chunk_records)
+    log.info("Total tokens : %s%s",
+             f"{total_tokens:,}",
+             f"  (split {total_chunked} oversized doc(s) into pieces)" if total_chunked else "")
+    for cat, n in sorted(cat_counts.items()):
+        pct = 100 * n / total_tokens if total_tokens else 0
+        log.info("  %-14s: %s  (%.1f%%)", cat, f"{n:,}", pct)
+
+    if total_tokens == 0:
+        raise RuntimeError(
+            "No tokens produced — check that JSONL records have a 'text' field."
+        )
+
+    # ---------------------------------------------------------------
+    # Stage 2 — allocate output mmaps, copy chunk files slice-by-slice
+    # ---------------------------------------------------------------
+    val_budget = int(total_tokens * args.val_fraction)
+    n_train    = total_tokens - val_budget
+    log.info("Stage 2 — writing train.bin (%s tok) and val.bin (%s tok) ...",
+             f"{n_train:,}", f"{val_budget:,}")
+
+    train_path = os.path.join(args.cache_dir, "train.bin")
+    val_path   = os.path.join(args.cache_dir, "val.bin")
+
+    train_arr = np.memmap(train_path, dtype=out_dtype, mode="w+", shape=(n_train,))
+    val_arr   = np.memmap(val_path,   dtype=out_dtype, mode="w+",
+                          shape=(max(1, val_budget),))
+
+    train_ptr     = 0
+    val_ptr       = 0
+    val_remaining = val_budget
+
+    for cat, n_tokens, chunk_path in chunk_records:
+        if n_tokens == 0 or chunk_path is None:
+            continue
+        val_ptr, val_remaining, train_ptr = _copy_chunk(
+            chunk_path,
+            val_arr,   val_ptr,   val_remaining,
+            train_arr, train_ptr,
+            out_dtype, slice_tokens,
+        )
+
+    train_arr.flush()
+    val_arr.flush()
+
+    try:
+        os.rmdir(tmp_dir)
+    except OSError:
+        pass
+
+    # ---------------------------------------------------------------
+    # Stage 3 — meta.json
+    # ---------------------------------------------------------------
+    meta = {
+        "vocab_size":            vocab_size,
+        "dtype":                 out_dtype.__name__,
+        "train_tokens":          int(train_ptr),
+        "val_tokens":            int(val_ptr),
+        "total_tokens":          int(total_tokens),
+        "category_token_counts": cat_counts,
+        "chunked_doc_count":     total_chunked,
+        "max_doc_chars":         args.max_doc_chars,
+        "piece_overlap_chars":   args.piece_overlap_chars,
+        "seq_length":            args.seq_length,
+        "tokenizer_dir":         os.path.abspath(args.tokenizer),
+    }
+    meta_path = os.path.join(args.cache_dir, "meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    elapsed  = time.time() - t0
+    sz_train = train_ptr * out_dtype().itemsize / 1024**2
+    sz_val   = val_ptr   * out_dtype().itemsize / 1024**2
+    log.info("Wrote %s tokens -> train.bin  (%.1f MB)", f"{train_ptr:,}", sz_train)
+    log.info("Wrote %s   tokens -> val.bin    (%.1f MB)", f"{val_ptr:,}", sz_val)
+    log.info("Done in %.1fs   Meta: %s", elapsed, meta_path)
+
+
+if __name__ == "__main__":
+    main()

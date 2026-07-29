@@ -82,6 +82,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 from public_sources import discover_hf_datasets, discover_hf_configs, schema_is_suitable
 from topics import HUB_SEARCH_KEYWORDS, TOPIC_SEEDS
 
+# Optional LangGraph reasoning codegen
+try:
+    from codegen_graph import generate_script_with_reasoning as _reasoning_codegen
+    _HAS_REASONING = True
+except ImportError:
+    _HAS_REASONING = False
+
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 QUALITY_PY_PATH = os.path.join(os.path.dirname(__file__), "quality.py")
@@ -478,17 +485,24 @@ def sample_hf_dataset(dataset_id: str, config: Optional[str], split: str = "trai
     return None
 
 
-def discover_candidates(category: str, limit: int = 5) -> list:
+def discover_candidates(category: str, limit: int = 5,
+                        language: Optional[str] = None) -> list:
     """Same discovery keywords dataset_agent.py's --public-only path uses
     (topics.HUB_SEARCH_KEYWORDS), so results are consistent between the two
-    pipelines."""
+    pipelines. When *language* is given (comma-separated codes), appends
+    each language code to every keyword to find datasets in those languages
+    at discovery time (not as a post-hoc content filter)."""
     candidates = []
     seen = set()
-    for kw in HUB_SEARCH_KEYWORDS.get(category, [category]):
-        for dataset_id in discover_hf_datasets(kw, limit=limit):
-            if dataset_id not in seen:
-                seen.add(dataset_id)
-                candidates.append(dataset_id)
+    keywords = HUB_SEARCH_KEYWORDS.get(category, [category])
+    languages = [l.strip() for l in language.split(",")] if language else [None]
+    for kw in keywords:
+        for lang in languages:
+            query = f"{kw} {lang}".strip() if lang else kw
+            for dataset_id in discover_hf_datasets(query, limit=limit):
+                if dataset_id not in seen:
+                    seen.add(dataset_id)
+                    candidates.append(dataset_id)
     return candidates
 
 
@@ -1036,7 +1050,9 @@ def generate_validate_and_run(prompt_fn, script_path: str, target_size: str, out
 def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: str,
                         min_doc_chars: int, discover_limit: int = 5,
                         max_candidates_to_try: int = 3,
-                        max_total_considered: int = 40) -> dict:
+                        max_total_considered: int = 40,
+                        language: str = "en",
+                        reasoning_model: Optional[str] = None) -> dict:
     """Tries candidate datasets one at a time until either budget_bytes is
     filled or max_candidates_to_try datasets have *actually contributed*
     data. A dataset that gets rejected -- whether pre-download (unsupported
@@ -1056,7 +1072,7 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
     os.makedirs(logs_dir, exist_ok=True)
     _stage_shared_modules(scripts_dir)
 
-    candidates = discover_candidates(category, limit=discover_limit)
+    candidates = discover_candidates(category, limit=discover_limit, language=language)
     log_section(category, f"discovered {_paint(str(len(candidates)), _Ansi.BOLD)} "
                 f"candidate dataset(s): {candidates}")
 
@@ -1072,7 +1088,7 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
             # Ran out of candidates without filling the quota -- widen the
             # discovery search instead of giving up.
             widen_limit *= 2
-            more = [c for c in discover_candidates(category, limit=widen_limit)
+            more = [c for c in discover_candidates(category, limit=widen_limit, language=language)
                      if c not in considered]
             if not more:
                 log_warn(f"[{category}] no more candidate datasets left to try "
@@ -1109,13 +1125,33 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
         safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", f"{category}_{dataset_id}")
         script_path = os.path.join(scripts_dir, f"{safe_name}.py")
         remaining = budget_bytes - total_bytes
-        result = generate_validate_and_run(
-            lambda err: build_hf_codegen_prompt(
-                category, mode, dataset_id, config, sample["split"],
-                sample["columns"], sample["rows"], prior_error=err),
-            script_path, f"{remaining}B", out_dir, category, min_doc_chars,
-            log_path=os.path.join(logs_dir, f"{safe_name}.log"),
-        )
+
+        if reasoning_model and _HAS_REASONING:
+            ok = _reasoning_codegen(
+                category=category, mode=mode,
+                dataset_id=dataset_id, config=config,
+                split=sample["split"],
+                columns=sample["columns"], rows=sample["rows"],
+                script_path=script_path,
+                model=reasoning_model,
+            )
+            if not ok:
+                log_warn(f"[{category}] {dataset_id} reasoning codegen failed "
+                         f"-- skipping")
+                rejected += 1
+                continue
+            result = run_generated_script(
+                script_path, f"{remaining}B", out_dir, category, min_doc_chars,
+                log_path=os.path.join(logs_dir, f"{safe_name}.log"),
+            )
+        else:
+            result = generate_validate_and_run(
+                lambda err: build_hf_codegen_prompt(
+                    category, mode, dataset_id, config, sample["split"],
+                    sample["columns"], sample["rows"], prior_error=err),
+                script_path, f"{remaining}B", out_dir, category, min_doc_chars,
+                log_path=os.path.join(logs_dir, f"{safe_name}.log"),
+            )
         if result.get("actual_bytes", 0) <= 0:
             log_warn(f"[{category}] {dataset_id} produced no usable data after "
                      f"download -- not counted toward quota, trying next candidate")
@@ -1134,7 +1170,9 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
 
 
 def run_category_web(category: str, budget_bytes: int, out_dir: str, mode: str,
-                     min_doc_chars: int, raw_headroom: float = 1.4) -> dict:
+                     min_doc_chars: int, raw_headroom: float = 1.4,
+                     language: str = "en",
+                     reasoning_model: Optional[str] = None) -> dict:
     scripts_dir = os.path.join(out_dir, "_generated_scripts")
     logs_dir = os.path.join(out_dir, "_logs")
     raw_dir = os.path.join(out_dir, "_raw")
@@ -1157,12 +1195,29 @@ def run_category_web(category: str, budget_bytes: int, out_dir: str, mode: str,
 
     safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", f"{category}_web")
     script_path = os.path.join(scripts_dir, f"{safe_name}.py")
-    result = generate_validate_and_run(
-        lambda err: build_web_codegen_prompt(category, mode, raw_path, sample_rows, prior_error=err),
-        script_path, f"{budget_bytes}B", out_dir, category, min_doc_chars,
-        log_path=os.path.join(logs_dir, f"{safe_name}.log"),
-        extra_args=["--raw-path", raw_path],
-    )
+
+    if reasoning_model and _HAS_REASONING:
+        ok = _reasoning_codegen(
+            category=category, mode=mode,
+            script_path=script_path,
+            model=reasoning_model,
+            raw_path=raw_path, sample_rows=sample_rows,
+        )
+        if not ok:
+            log_warn(f"[{category}] web reasoning codegen failed -- skipping")
+            return {"target_bytes": budget_bytes, "actual_bytes": 0, "docs": 0}
+        result = run_generated_script(
+            script_path, f"{budget_bytes}B", out_dir, category, min_doc_chars,
+            log_path=os.path.join(logs_dir, f"{safe_name}.log"),
+            extra_args=["--raw-path", raw_path],
+        )
+    else:
+        result = generate_validate_and_run(
+            lambda err: build_web_codegen_prompt(category, mode, raw_path, sample_rows, prior_error=err),
+            script_path, f"{budget_bytes}B", out_dir, category, min_doc_chars,
+            log_path=os.path.join(logs_dir, f"{safe_name}.log"),
+            extra_args=["--raw-path", raw_path],
+        )
     return {"target_bytes": budget_bytes, "actual_bytes": result.get("actual_bytes", 0),
             "docs": result.get("docs", 0)}
 
@@ -1207,6 +1262,16 @@ def main():
                         help="[--public-only] Absolute safety ceiling on how many candidate "
                              "datasets will ever be looked at for one category, including "
                              "rejected ones, before giving up on the quota. Default: 40.")
+    parser.add_argument("--reasoning-model", default=None,
+                        help="Reasoning LLM model (e.g. deepseek-r1:7b, qwq:latest). "
+                             "When set, uses LangGraph with step-by-step schema "
+                             "analysis instead of the direct Ollama codegen loop. "
+                             "Requires: pip install langchain langchain-ollama langgraph")
+    parser.add_argument("--language", default="en",
+                        help="[--public-only] Comma-separated language codes (e.g. en,zh,de,fr) "
+                             "used at dataset discovery time to find HF datasets "
+                             "in those languages. Not used for content filtering. "
+                             "Default: en.")
     args = parser.parse_args()
 
     _env_banner()
@@ -1222,7 +1287,8 @@ def main():
         mix = {c: 1.0 / len(categories) for c in categories}
 
     os.makedirs(args.out_dir, exist_ok=True)
-    manifest = {"target_bytes": target_bytes, "mode": args.mode, "mix": mix, "categories": {}}
+    manifest = {"target_bytes": target_bytes, "mode": args.mode,
+                "language": args.language, "mix": mix, "categories": {}}
 
     for category, frac in mix.items():
         budget = int(target_bytes * frac)
@@ -1235,10 +1301,14 @@ def main():
                 category, budget, args.out_dir, args.mode, args.min_doc_chars,
                 discover_limit=args.discover_limit,
                 max_candidates_to_try=args.max_candidates_to_try,
-                max_total_considered=args.max_total_considered)
+                max_total_considered=args.max_total_considered,
+                language=args.language,
+                reasoning_model=args.reasoning_model)
         else:
             manifest["categories"][category] = run_category_web(
-                category, budget, args.out_dir, args.mode, args.min_doc_chars)
+                category, budget, args.out_dir, args.mode, args.min_doc_chars,
+                language=args.language,
+                reasoning_model=args.reasoning_model)
 
     manifest_path = os.path.join(args.out_dir, "manifest.json")
     with open(manifest_path, "w") as f:

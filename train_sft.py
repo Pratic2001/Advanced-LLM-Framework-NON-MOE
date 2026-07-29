@@ -780,12 +780,20 @@ def main():
 
     # --- training ---
     p.add_argument("--seq-len",        type=int,   default=2048)
+    p.add_argument("--max-seq-len", type=int, default=None,
+                   help="Max position embeddings (default 8192). Separate from --seq-len.")
     p.add_argument("--batch-size",     type=int,   default=4)
     p.add_argument("--num-steps",      type=int,   default=10_000)
     p.add_argument("--grad-accum",     type=int,   default=4)
     p.add_argument("--lr",             type=float, default=2e-5,
-                   help="Peak LR (typically 1e-5 to 5e-5 for SFT)")
+                   help="Peak LR (typically 1e-5 to 5e-5 for SFT). "
+                        "Auto-scaled by model size unless --no-lr-scale.")
     p.add_argument("--min-lr",         type=float, default=2e-6)
+    p.add_argument("--no-lr-scale",    action="store_true",
+                   help="Disable auto LR scaling by model size.")
+    p.add_argument("--z-loss-weight",  type=float, default=1e-4,
+                   help="Z-loss coefficient (0=disabled). "
+                        "Penalises large logit magnitudes for stable training.")
     p.add_argument("--weight-decay",   type=float, default=0.01)
     p.add_argument("--warmup-steps",   type=int,   default=200)
     p.add_argument("--grad-clip",      type=float, default=1.0)
@@ -858,7 +866,11 @@ def main():
     elif args.model_size:
         # Build from scratch using target size
         target_params = ModelConfig.parse_param_count(args.model_size)
-        config = ModelConfig.from_target_size(target_params=target_params)
+        max_pos = getattr(args, "max_seq_len", None) or 8192
+        config = ModelConfig.from_target_size(
+            target_params=target_params,
+            max_position_embeddings=max_pos,
+        )
         model  = TransformerForCausalLM(config).to(device)
 
         if master:
@@ -1000,6 +1012,20 @@ def main():
         # Use the training loader for validation
         val_loader = train_loader
 
+    # ====================================================================
+    # Auto LR scaling
+    # ====================================================================
+    if args.model_size and not args.no_lr_scale:
+        ref_hidden = 2048
+        scale = math.sqrt(ref_hidden / config.hidden_size)
+        scale = max(0.5, min(scale, 2.0))
+        original_lr = args.lr
+        args.lr = args.lr * scale
+        args.min_lr = args.min_lr * scale
+        if master:
+            print(f"[LR] Auto-scaled from {original_lr:.2e} to {args.lr:.2e} "
+                  f"(×{scale:.3f}, hidden={config.hidden_size})")
+
     if len(train_loader) == 0:
         raise RuntimeError(
             "Training dataset has no complete windows. "
@@ -1125,6 +1151,9 @@ def main():
                     logits = out["logits"]
                 # masked loss: only assistant tokens contribute
                 loss = masked_cross_entropy(logits, y, m) / args.grad_accum
+                # Z-loss: penalise large logits for training stability
+                if args.z_loss_weight > 0:
+                    loss = loss + (args.z_loss_weight * logits.float().square().mean() / args.grad_accum)
 
             scaler.scale(loss).backward()
             loss_accum  += loss.item()

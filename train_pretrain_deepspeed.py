@@ -91,12 +91,25 @@ from optim.lr_schedule import build_scheduler
 #
 # Fix: call the engine WITHOUT labels (so model.py does no internal shift)
 # and compute the loss here ourselves directly against the already-shifted y.
-def _pretrain_loss(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    return F.cross_entropy(
+def _pretrain_loss(
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    z_loss_weight: float = 1e-4,
+) -> torch.Tensor:
+    """
+    Cross-entropy with optional z-loss for logit stability.
+
+    Z-loss (``z_loss_weight * logits².mean()``) prevents logit magnitudes
+    from drifting under bf16 mixed precision (PaLM / Gemma recipe).
+    """
+    ce = F.cross_entropy(
         logits.reshape(-1, logits.size(-1)),
         y.reshape(-1),
         ignore_index=-100,
     )
+    if z_loss_weight > 0:
+        return ce + z_loss_weight * logits.float().square().mean()
+    return ce
 
 
 # ---------------------------------------------------------------------------
@@ -967,7 +980,7 @@ def evaluate(engine, val_loader, eval_steps, device, world_size,
             if use_cudagraphs:
                 torch.compiler.cudagraph_mark_step_begin()
             out  = engine(x)
-            loss = _pretrain_loss(out["logits"], y)
+            loss = _pretrain_loss(out["logits"], y, z_loss_weight=0.0)
             losses_random.append(loss.item())
     loss_random = float(np.mean(losses_random))
 
@@ -977,7 +990,7 @@ def evaluate(engine, val_loader, eval_steps, device, world_size,
             if use_cudagraphs:
                 torch.compiler.cudagraph_mark_step_begin()
             out = engine(x)
-            losses_seq.append(_pretrain_loss(out["logits"], y).item())
+            losses_seq.append(_pretrain_loss(out["logits"], y, z_loss_weight=0.0).item())
     loss_seq = float(np.mean(losses_seq)) if losses_seq else loss_random
 
     engine.train()
@@ -1141,8 +1154,10 @@ def train(args):
         if master: print(f"[Resume] loaded config from checkpoint")
     else:
         target_params = ModelConfig.parse_param_count(args.model_size)
+        max_pos = getattr(args, "max_seq_len", None) or 8192
         config = ModelConfig.from_target_size(
             target_params, vocab_size=vocab_size,
+            max_position_embeddings=max_pos,
         )
 
     # Whether to run the forward pass under torch.autocast(bf16) instead
@@ -1222,6 +1237,18 @@ def train(args):
         print(f"[AutoConfig] Selected ZeRO-{zero_stage}  "
               f"cpu_offload_opt={cpu_offload_opt}  "
               f"cpu_offload_param={cpu_offload_param}")
+
+    # ---------------------------------------------------------------- auto LR scaling
+    if not args.resume and not args.no_lr_scale:
+        ref_hidden = 2048
+        scale = math.sqrt(ref_hidden / config.hidden_size)
+        scale = max(0.5, min(scale, 2.0))
+        original_lr = args.lr
+        args.lr = args.lr * scale
+        args.min_lr = args.min_lr * scale
+        if master:
+            print(f"[LR] Auto-scaled from {original_lr:.2e} to {args.lr:.2e} "
+                  f"(x{scale:.3f}, hidden={config.hidden_size})")
 
     # ---------------------------------------------------------------- DS config
     ds_cfg = build_ds_config(
@@ -1388,7 +1415,8 @@ def train(args):
             # Divide by grad_accum_steps so the sum over the inner
             # loop is the true mean loss over one effective batch
             # (= one optimizer step), exactly like train.py.
-            loss = _pretrain_loss(out["logits"], y) / args.grad_accum_steps
+            loss = _pretrain_loss(out["logits"], y,
+                                  z_loss_weight=args.z_loss_weight) / args.grad_accum_steps
             engine.backward(loss)
 
             # Stay on GPU -- no .item() here. The single .item() per
@@ -1490,6 +1518,10 @@ def parse_args():
     # model
     p.add_argument("--model-size", default="0.6B",
                    help="Target size passed to ModelConfig.from_target_size")
+    p.add_argument("--max-seq-len", type=int, default=None,
+                   help="Maximum position embeddings (default 8192). "
+                        "Separate from --seq-len so the model can later "
+                        "extend to longer contexts.")
 
     # data
     p.add_argument("--data-dir", default="./packed")
@@ -1501,8 +1533,14 @@ def parse_args():
     p.add_argument("--grad-accum-steps", type=int,   default=8)
     p.add_argument("--max-steps",        type=int,   default=100_000)
     p.add_argument("--warmup-steps",     type=int,   default=2_000)
-    p.add_argument("--lr",               type=float, default=3e-4)
+    p.add_argument("--lr",               type=float, default=3e-4,
+                   help="Peak LR. Auto-scaled by model size unless --no-lr-scale.")
     p.add_argument("--min-lr",           type=float, default=3e-5)
+    p.add_argument("--no-lr-scale",      action="store_true",
+                   help="Disable automatic LR scaling by model size.")
+    p.add_argument("--z-loss-weight",    type=float, default=1e-4,
+                   help="Z-loss coefficient (0 = disabled). "
+                        "Penalises large logit magnitudes for stable training.")
     p.add_argument("--weight-decay",     type=float, default=0.1)
     p.add_argument("--grad-clip",        type=float, default=1.0)
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])

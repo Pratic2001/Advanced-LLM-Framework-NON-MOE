@@ -76,9 +76,14 @@ def pretrain_loss(
     x: torch.Tensor,
     y: torch.Tensor,
     pad_id: int,
+    z_loss_weight: float = 1e-4,
 ) -> torch.Tensor:
     """
     Compute pretrain cross-entropy loss with pre-shifted targets.
+
+    Includes optional `z-loss` (auxiliary loss on logit magnitudes) which
+    stabilises training by preventing logit magnitudes from drifting,
+    especially under bf16 mixed precision.
 
     Args:
         model: The transformer model (called without labels).
@@ -86,18 +91,24 @@ def pretrain_loss(
         y: Pre-shifted target token IDs, shape (B, T).
            y[t] is the next-token target for logits[t].
         pad_id: Token ID used for padding; masked out of the loss.
+        z_loss_weight: Weight for the auxiliary z-loss (default 1e-4).
+                       0 = disabled.
 
     Returns:
-        Scalar loss tensor (cross-entropy, averaged over non-pad positions).
+        Scalar loss tensor (cross-entropy + optional z-loss).
     """
     out = model(x)
     logits = out["logits"]  # (B, T, V)
-    loss = F.cross_entropy(
+    ce_loss = F.cross_entropy(
         logits.reshape(-1, logits.size(-1)),
         y.reshape(-1),
         ignore_index=pad_id,
     )
-    return loss
+    if z_loss_weight > 0:
+        # Z-loss: penalise large logit magnitudes to stabilise softmax
+        z_loss = z_loss_weight * logits.float().square().mean()
+        return ce_loss + z_loss
+    return ce_loss
 
 
 # ---------------------------------------------------------------------------
@@ -1078,6 +1089,19 @@ def _train(
     )
     train_iter = iter(train_loader)
 
+    # ------------------------------------------------------------------ auto LR scaling
+    # Scale learning rate by model size (scaling laws: LR ∝ 1/√(hidden_size))
+    if args.model_size and not args.no_lr_scale:
+        ref_hidden = 2048  # reference hidden size for 1.7 B
+        scale = math.sqrt(ref_hidden / config.hidden_size)
+        scale = max(0.5, min(scale, 2.0))  # clamp to [0.5×, 2×]
+        original_lr = args.lr
+        args.lr = args.lr * scale
+        args.min_lr = args.min_lr * scale  # scale min_lr proportionally
+        if master:
+            print(f"[LR] Auto-scaled from {original_lr:.2e} to {args.lr:.2e} "
+                  f"(×{scale:.3f}, hidden={config.hidden_size})")
+
     # ------------------------------------------------------------------ optim
     optimizers = build_optimizer_groups(
         model,
@@ -1179,7 +1203,8 @@ def _train(
                 with amp_ctx:
                     if _use_cudagraphs:
                         torch.compiler.cudagraph_mark_step_begin()
-                    loss = pretrain_loss(model, x, y, pad_id=0) / args.grad_accum
+                    loss = pretrain_loss(model, x, y, pad_id=0,
+                                         z_loss_weight=args.z_loss_weight) / args.grad_accum
                 loss.backward()
 
             loss_accum = loss_accum + loss.detach()
@@ -1302,13 +1327,20 @@ def _train(
 
 
 def _build_config(args: argparse.Namespace, vocab_size: int) -> ModelConfig:
-    """Build a ModelConfig from CLI args."""
+    """Build a ModelConfig from CLI args.
+
+    ``max_position_embeddings`` is set to ``args.max_seq_len`` (default 8192)
+    **not** the training ``args.seq_len``, so the model can later be extended
+    to longer contexts without retraining from scratch.
+    """
+    max_pos = getattr(args, "max_seq_len", None) or 8192
+
     if args.model_size:
         target_params = ModelConfig.parse_param_count(args.model_size)
         config = ModelConfig.from_target_size(
             target_params,
             vocab_size=vocab_size,
-            max_position_embeddings=args.seq_len,
+            max_position_embeddings=max_pos,
         )
     else:
         hidden_size = args.hidden_size or 2048
@@ -1324,7 +1356,7 @@ def _build_config(args: argparse.Namespace, vocab_size: int) -> ModelConfig:
             num_attention_heads=num_heads,
             num_key_value_heads=num_kv_heads,
             head_dim=args.head_dim or 128,
-            max_position_embeddings=args.seq_len,
+            max_position_embeddings=max_pos,
         )
     return config
 
@@ -1464,6 +1496,10 @@ def parse_args() -> argparse.Namespace:
                    help="MLP intermediate size.")
     p.add_argument("--head-dim", type=int, default=128,
                    help="Head dimension (default 128).")
+    p.add_argument("--max-seq-len", type=int, default=None,
+                   help="Maximum position embeddings (default 8192). "
+                        "Separate from --seq-len so the model can later "
+                        "extend to longer contexts.")
 
     # ---- data
     p.add_argument("--data-dir", default="./packed",
@@ -1483,9 +1519,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=2_000,
                    help="LR warmup steps.")
     p.add_argument("--lr", type=float, default=3e-4,
-                   help="Peak learning rate.")
+                   help="Peak learning rate. When --model-size is set and "
+                        "--no-lr-scale is not given, the LR is automatically "
+                        "scaled based on model size (scaling laws).")
     p.add_argument("--min-lr", type=float, default=3e-5,
                    help="Minimum LR (cosine decay floor).")
+    p.add_argument("--no-lr-scale", action="store_true",
+                   help="Disable automatic LR scaling by model size.")
+    p.add_argument("--z-loss-weight", type=float, default=1e-4,
+                   help="Z-loss coefficient (0 = disabled). "
+                        "Penalises large logit magnitudes for stable training.")
     p.add_argument("--weight-decay", type=float, default=0.1,
                    help="AdamW weight decay.")
     p.add_argument("--grad-clip", type=float, default=1.0,
