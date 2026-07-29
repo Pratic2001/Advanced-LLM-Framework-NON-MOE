@@ -27,7 +27,8 @@
 17. [Decentralized Hivemind Training](#17-decentralized-hivemind-training)
 18. [Checkpoint Save / Resume](#18-checkpoint-save--resume)
 19. [Model Architecture Reference](#19-model-architecture-reference)
-20. [Appendix A: Full CLI Reference](#appendix-a-full-cli-reference)
+20. [End-to-End Pipeline: Train on an RTX 4090](#20-end-to-end-pipeline-train-a-capable-350m-model-on-an-rtx-4090)
+21. [Appendix A: Full CLI Reference](#appendix-a-full-cli-reference)
 
 ---
 
@@ -2748,6 +2749,418 @@ python train_pretrain.py \
     --z-loss-weight 1e-3 \
     --data-dir ./packed
 ```
+
+---
+
+## 20. End-to-End Pipeline: Train a Capable ~350M Model on an RTX 4090
+
+This section walks through the **complete pipeline** — from nothing to a working model after GRPO and DPO — on a single RTX 4090 (24 GB VRAM) with 28 GB CPU RAM. Every setting is chosen to **safely fit in memory** with headroom.
+
+### 20A. Hardware & Design Constraints
+
+| Constraint | Value | How We Stay Within It |
+|-----------|-------|----------------------|
+| VRAM | 24 GB | ~350M param model (bf16), LoRA for SFT/GRPO/DPO, gradient checkpointing, batch_size=2-4 |
+| CPU RAM | 28 GB | Small dataset budgets, `--target-size 256MB`, short sequences (2048 tok) |
+| Disk | Any | ~3 GB total for checkpoints, data, and tokenizer |
+
+**Model architecture** (auto-sized by the framework):
+
+```
+ModelConfig(
+    vocab_size=16384,       # compact vocabulary
+    d_model=1024,           # hidden dimension
+    n_layers=16,            # transformer layers
+    n_heads=16,             # attention heads
+    head_dim=64,            # d_model / n_heads
+    intermediate_size=2816, # 2.75× d_model (SwiGLU)
+    max_seq_len=2048,       # short context = less activation memory
+    use_flash=True,         # Flash Attention 2 saves VRAM
+)
+```
+
+**Total parameter count**: ~350M → ~700 MB in bf16, ~6 GB training footprint including optimizer and activations.
+
+### 20B. Quick Start (a synthetic smoke test, 10 minutes)
+
+If you want to verify the pipeline works end-to-end before committing to real data, use the built-in smoke test — it creates a tiny model + synthetic data:
+
+```bash
+# Tokenizer smoke test
+python tokenizer_train.py --smoke-test
+
+# Pretrain smoke test (creates a tiny 10M model + synthetic data)
+python train_pretrain.py --smoke-test
+
+# SFT smoke test
+python train_sft.py --smoke-test
+
+# GRPO smoke test
+python train_grpo.py --smoke-test
+
+# DPO smoke test
+python train_dpo.py --smoke-test
+
+# Inference smoke test
+python infer.py --smoke-test
+```
+
+Each smoke test runs in seconds and prints `[PASSED]` on success. Once all pass, proceed with the real pipeline below.
+
+### 20C. Step 1 — Train a Compact Tokenizer
+
+```bash
+# Collect some raw text first (500 KB is enough for a small tokenizer)
+mkdir -p raw_tokens
+python -c "
+import json, os, random
+# Use the codegen pipeline to fetch a tiny sample, or create synthetic data
+with open('raw_tokens/sample.txt', 'w') as f:
+    for i in range(2000):
+        f.write(f'This is sample sentence number {i} for training the tokenizer vocabulary. It contains enough variety to learn byte-pair encodings.\\n')
+"
+
+# Train a 16K-vocabulary tokenizer (tiny vocab = smaller embedding table)
+python tokenizer_train.py \
+    --data-dir ./raw_tokens \
+    --output-dir ./tokenizer_16k \
+    --vocab-size 16384 \
+    --min-frequency 2
+
+# Verify
+ls -lh ./tokenizer_16k/tokenizer.json
+```
+
+For a real project, point `--data-dir` at a few MB of actual .jsonl text from your domain.
+
+### 20D. Step 2 — Collect & Pack Pretraining Data
+
+Use `hf_to_packed.py` with a small byte budget so it fits in 28 GB RAM:
+
+```bash
+# Fetch a small subset of C4 (English), stop at 256 MB of raw JSONL
+python webscrapped_dataset_curator_AI_MCP/agent/hf_to_packed.py \
+    --dataset c4 --config en \
+    --mode pretrain \
+    --tokenizer ./tokenizer_16k \
+    --out-dir ./packed_pretrain \
+    --target-size 256MB \
+    --seq-length 2048 \
+    --min-doc-chars 200 \
+    --max-compression-ratio 0.35 \
+    --max-flagged-ngram-ratio 0.10
+
+# After packing, you should see:
+#   ./packed_pretrain/train.bin
+#   ./packed_pretrain/val.bin
+#   ./packed_pretrain/tokenizer.json
+ls -lh ./packed_pretrain/
+```
+
+> **Memory note:** The `--target-size 256MB` cap keeps CPU RAM usage well under 28 GB during packing. If you have more RAM, increase to `512MB` or `1GB` for better results.
+
+### 20E. Step 2b (Alternative) — Codegen Pipeline for Multi-Source Data
+
+Instead of a single dataset, use the codegen pipeline to discover and mix sources:
+
+```bash
+python webscrapped_dataset_curator_AI_MCP/agent/codegen_pipeline.py \
+    --target-size 256MB \
+    --out-dir ./data_pretrain \
+    --mode pretrain \
+    --public-only \
+    --min-doc-chars 200 \
+    --discover-limit 3 \
+    --max-candidates-to-try 2 \
+    --language "en" \
+    --no-extended-quality
+
+# Then pack the collected JSONL shards
+python data/pack_pretrain.py \
+    --data-dir ./data_pretrain \
+    --tokenizer ./tokenizer_16k \
+    --cache-dir ./packed_pretrain \
+    --seq-length 2048 \
+    --val-fraction 0.01
+```
+
+### 20F. Step 3 — Pretrain the ~350M Model
+
+Now train the base model. The settings below use **~11 GB VRAM** total, leaving 13 GB headroom:
+
+```bash
+python train_pretrain.py \
+    --data-dir ./packed_pretrain \
+    --tokenizer ./tokenizer_16k \
+    --model-size 0.35B \
+    --max-seq-len 2048 \
+    --batch-size 4 \
+    --gradient-accumulation-steps 4 \
+    --max-steps 5000 \
+    --warmup-steps 200 \
+    --lr 3e-4 \
+    --min-lr 3e-5 \
+    --weight-decay 0.1 \
+    --grad-clip 1.0 \
+    --gradient-checkpointing \
+    --bf16 \
+    --save-every 1000 \
+    --output-dir ./checkpoints_pretrain
+```
+
+**VRAM breakdown during pretrain (~10.5 GB):**
+
+| Component | Memory |
+|-----------|--------|
+| Model weights (bf16) | ~700 MB |
+| Optimizer (Adam, fp32) | ~2.1 GB |
+| Gradients (bf16) | ~700 MB |
+| Activations (checkpointed) | ~4-5 GB |
+| CUDA context, buffers | ~2 GB |
+| **Total** | **~10.5 GB** |
+
+> **If you run low on VRAM:** lower `--batch-size` to 2, add `--gradient-accumulation-steps 8`, or set `--gradient-checkpointing` (already on above).
+
+**Expected output after 5K steps** (≈30-60 minutes depending on disk I/O):
+- Loss should drop from ~11 → ~4-5
+- Checkpoint saved at `./checkpoints_pretrain/step_5000/`
+- Perplexity ≈ 50-150 on validation
+
+For a more capable model, train to 20K-50K steps overnight.
+
+### 20G. Step 4 — Collect & Pack SFT Data
+
+```bash
+# Download a small instruction dataset using hf_to_packed
+python webscrapped_dataset_curator_AI_MCP/agent/hf_to_packed.py \
+    --dataset databricks/databricks-dolly-15k \
+    --mode sft \
+    --tokenizer ./tokenizer_16k \
+    --out-dir ./packed_sft \
+    --seq-length 2048 \
+    --min-doc-chars 50 \
+    --target-size 50MB \
+    --no-extended-quality
+```
+
+### 20H. Step 5 — Supervised Fine-Tuning with LoRA
+
+LoRA drastically cuts VRAM by training only low-rank adapters (~0.1% of parameters):
+
+```bash
+python train_sft.py \
+    --checkpoint ./checkpoints_pretrain/step_5000/model.pt \
+    --tokenizer ./tokenizer_16k \
+    --cache-dir ./packed_sft \
+    --batch-size 2 \
+    --gradient-accumulation-steps 8 \
+    --max-steps 1000 \
+    --warmup-steps 50 \
+    --lr 2e-4 \
+    --bf16 \
+    --gradient-checkpointing \
+    --lora-rank 32 \
+    --lora-alpha 64 \
+    --lora-dropout 0.05 \
+    --lora-target-modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+    --save-every 500 \
+    --output-dir ./checkpoints_sft
+```
+
+**VRAM breakdown with LoRA (~7 GB):**
+- Base model (frozen, bf16): ~700 MB
+- LoRA adapters (trainable, fp32): ~10 MB
+- Optimizer (only LoRA params): ~40 MB
+- Activations (checkpointed): ~5 GB
+- **Total**: ~6-7 GB
+
+### 20I. Step 6 — GRPO with LoRA (Reinforcement Learning)
+
+GRPO improves reasoning capabilities. Use the SFT checkpoint as the starting point:
+
+```bash
+python train_grpo.py \
+    --checkpoint ./checkpoints_sft/step_1000 \
+    --tokenizer ./tokenizer_16k \
+    --cache-dir ./packed_sft \
+    --batch-size 2 \
+    --gradient-accumulation-steps 4 \
+    --max-steps 500 \
+    --lr 1e-4 \
+    --bf16 \
+    --gradient-checkpointing \
+    --lora-rank 32 \
+    --lora-alpha 64 \
+    --lora-target-modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+    --grpo-epsilon 0.2 \
+    --grpo-kl-coef 0.01 \
+    --save-every 250 \
+    --output-dir ./checkpoints_grpo
+```
+
+> **⚠️ GRPO on a 4090:** GRPO generates K completions per prompt (default K=4), which multiplies activation memory. With `--batch-size 2` and gradient checkpointing, this uses ~14 GB VRAM. If you see OOM, set `--batch-size 1` or reduce the prompt length with `--max-seq-len 1024`.
+
+### 20J. Step 7 — DPO with LoRA (Preference Optimization)
+
+DPO aligns the model with human preferences. First, generate preference pairs, then train:
+
+```bash
+# (Optional) Generate preference pairs with Ollama judge
+python ollama_judge.py \
+    --prompt-file ./eval_prompts.txt \
+    --output-dir ./dpo_data \
+    --batch-size 4
+
+# Pack DPO data (if you have preference pairs in the right format)
+# Otherwise, DPO can also be trained on the SFT dataset with a reference model
+
+python train_dpo.py \
+    --checkpoint ./checkpoints_grpo/step_500 \
+    --tokenizer ./tokenizer_16k \
+    --cache-dir ./packed_sft \
+    --batch-size 2 \
+    --gradient-accumulation-steps 4 \
+    --max-steps 500 \
+    --lr 1e-4 \
+    --bf16 \
+    --gradient-checkpointing \
+    --lora-rank 32 \
+    --lora-alpha 64 \
+    --lora-target-modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+    --dpo-beta 0.1 \
+    --save-every 250 \
+    --output-dir ./checkpoints_dpo
+
+# On a 4090, DPO uses ~12 GB VRAM with these settings.
+# The LoRA adapters are tiny (~10 MB) so checkpointing is fast.
+```
+
+### 20K. Step 8 — Inference & Evaluation
+
+```bash
+# Interactive REPL with the final checkpoint (auto-merges LoRA adapters into the base model)
+python infer.py \
+    --checkpoint ./checkpoints_dpo/step_500 \
+    --tokenizer ./tokenizer_16k \
+    --max-tokens 512 \
+    --temperature 0.7 \
+    --top-p 0.9
+
+# One-shot generation
+python infer.py \
+    --checkpoint ./checkpoints_dpo/step_500 \
+    --tokenizer ./tokenizer_16k \
+    --prompt "Explain how attention works in transformer models." \
+    --max-tokens 512 \
+    --temperature 0.7
+
+# Compare before and after training
+python infer.py \
+    --checkpoint ./checkpoints_pretrain/step_5000 \
+    --tokenizer ./tokenizer_16k \
+    --prompt "What is 2+2?" \
+    --max-tokens 256
+
+python infer.py \
+    --checkpoint ./checkpoints_dpo/step_500 \
+    --tokenizer ./tokenizer_16k \
+    --prompt "What is 2+2?" \
+    --max-tokens 256
+```
+
+### 20L. Batch Size & Memory Quick Reference
+
+Use this table to pick safe batch sizes for your GPU:
+
+| Model Size | VRAM | Batch Size | Grad Accum | LoRA? | Grad CKPT? | Est. VRAM Use |
+|-----------|------|-----------|------------|-------|-----------|--------------|
+| ~350M | 24 GB | 4 | 4 | No | Yes | ~10.5 GB |
+| ~350M | 24 GB | 2 | 8 | No | Yes | ~8 GB |
+| ~350M | 24 GB | 4 | 4 | Yes (SFT) | Yes | ~7 GB |
+| ~350M | 24 GB | 1 | 8 | Yes (GRPO) | Yes | ~12 GB |
+| ~350M | 24 GB | 2 | 4 | Yes (DPO) | Yes | ~12 GB |
+| ~1B | 24 GB | 2 | 4 | No | Yes | ~18 GB |
+| ~1B | 24 GB | 2 | 8 | Yes | Yes | ~14 GB |
+
+> **Rule of thumb:** If you hit OOM, halve `--batch-size` and double `--gradient-accumulation-steps` — the effective batch size stays the same, so training quality is unchanged.
+
+### 20M. Full Pipeline Script
+
+Save and run this to execute the entire pipeline in one shot (adjust paths as needed):
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== Pretrain ==="
+python train_pretrain.py \
+    --data-dir ./packed_pretrain \
+    --tokenizer ./tokenizer_16k \
+    --model-size 0.35B \
+    --max-seq-len 2048 \
+    --batch-size 4 \
+    --gradient-accumulation-steps 4 \
+    --max-steps 5000 \
+    --warmup-steps 200 \
+    --lr 3e-4 \
+    --gradient-checkpointing \
+    --bf16 \
+    --save-every 1000 \
+    --output-dir ./checkpoints_pretrain
+
+echo "=== SFT with LoRA ==="
+python train_sft.py \
+    --checkpoint ./checkpoints_pretrain/step_5000/model.pt \
+    --tokenizer ./tokenizer_16k \
+    --cache-dir ./packed_sft \
+    --batch-size 2 \
+    --gradient-accumulation-steps 8 \
+    --max-steps 1000 \
+    --lr 2e-4 \
+    --bf16 \
+    --gradient-checkpointing \
+    --lora-rank 32 \
+    --output-dir ./checkpoints_sft
+
+echo "=== GRPO with LoRA ==="
+python train_grpo.py \
+    --checkpoint ./checkpoints_sft/step_1000 \
+    --tokenizer ./tokenizer_16k \
+    --cache-dir ./packed_sft \
+    --batch-size 2 \
+    --gradient-accumulation-steps 4 \
+    --max-steps 500 \
+    --lr 1e-4 \
+    --bf16 \
+    --gradient-checkpointing \
+    --lora-rank 32 \
+    --output-dir ./checkpoints_grpo
+
+echo "=== DPO with LoRA ==="
+python train_dpo.py \
+    --checkpoint ./checkpoints_grpo/step_500 \
+    --tokenizer ./tokenizer_16k \
+    --cache-dir ./packed_sft \
+    --batch-size 2 \
+    --gradient-accumulation-steps 4 \
+    --max-steps 500 \
+    --lr 1e-4 \
+    --bf16 \
+    --gradient-checkpointing \
+    --lora-rank 32 \
+    --output-dir ./checkpoints_dpo
+
+echo "=== Inference test ==="
+python infer.py \
+    --checkpoint ./checkpoints_dpo/step_500 \
+    --tokenizer ./tokenizer_16k \
+    --prompt "Hello, how are you?" \
+    --max-tokens 128
+
+echo "=== Done ==="
+```
+
+> **Expected runtime:** ~2-4 hours total on a 4090 (pretrain: 30-60 min, SFT: 15-30 min, GRPO: 30-60 min, DPO: 15-30 min). Let pretrain run overnight for a noticeably more capable model.
 
 ---
 
