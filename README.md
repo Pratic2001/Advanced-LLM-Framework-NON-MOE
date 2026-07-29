@@ -135,12 +135,18 @@ This framework lets you **pre-train a dense transformer from scratch**, then fin
 ### 🔬 Model Architecture (`model.py`)
 | Feature | Support |
 |---------|---------|
-| **Architecture** | Dense decoder-only transformer (non-MoE) |
+| **Architecture** | Dense decoder-only (non-MoE), **Jamba hybrid (SSM + Attention)**, **MoD (Mixture-of-Depth)** |
+| **Layer computation** | Sequential (default) or **Parallel** (PaLM-style, ~15% faster) |
 | **Attention** | GQA (Grouped-Query Attention) with configurable KV heads |
-| **Position** | RoPE (Rotary Position Embeddings) with NTK/YaRN scaling |
+| **MLA** | **Multi-head Latent Attention** — DeepSeek-style low-rank KV joint compression (~4× smaller cache) |
+| **Mamba SSM** | **Mamba state-space model block** — pure PyTorch + optional `mamba_ssm` CUDA kernel |
+| **Sliding Window** | **Local sliding-window attention** with alternating global/sw layers |
+| **Position** | RoPE (Rotary Position Embeddings) with **YaRN / NTK-aware** frequency scaling |
+| **Multi-Token Prediction** | **MTP** — predict K auxiliary future tokens per position (discounted loss) |
 | **Normalization** | Pre-RMSNorm (or LayerNorm) |
 | **Activation** | SwiGLU or GELU |
 | **QK-Norm** | Optional per-head QK RMSNorm before RoPE |
+| **SDPA Backend** | Explicit FLASH / EFFICIENT pinning with **MATH fallback on CPU** |
 | **Sizes** | Auto-sized from 10M → 1T+ via `ModelConfig.from_target_size()` |
 | **Init** | Carefully tuned std scaling per layer type |
 
@@ -153,11 +159,13 @@ This framework lets you **pre-train a dense transformer from scratch**, then fin
 | **DPO** | Direct Preference Optimization with preference pairs |
 | **Optimizers** | AdamW, FusedAdam, **Muon** (2-3× faster convergence) |
 | **Schedules** | Cosine + WSD (Warmup-Stable-Decay) |
+| **Architecture Variants** | All scripts support `--arch` (dense/jamba), `--layer-type` (sequential/parallel), `--sliding-window-size`, `--mod-alpha`, `--num-mtp-heads`, `--use-mla`, `--jamba-interval` |
 | **Gradient** | Checkpointing, gradient accumulation, gradient clipping |
 | **Logging** | W&B integration, loss curves, VRAM estimates |
 | **Precision** | FP32 / BF16 mixed precision |
 | **Smoke tests** | Every training script has `--smoke-test` |
 | **Resume** | Full checkpoint save/load/continue |
+| **Decentralized** | Hivemind — heterogeneous multi-node async training (see `hivemind/`) |
 
 ### 🗂️ Data Curation
 | Feature | Support |
@@ -262,7 +270,7 @@ python infer.py --smoke-test
 
 | Module | Path | Description |
 |--------|------|-------------|
-| **Model** | `model.py` | `ModelConfig` + `TransformerForCausalLM` — dense decoder-only transformer |
+| **Model** | `model.py` | `ModelConfig` + `TransformerForCausalLM` — dense decoder-only transformer with GQA, RoPE (YaRN/NTK), SwiGLU, QK-Norm. **New in v2:** `MLAAttention` (DeepSeek-style low-rank KV compression), `MambaBlock` (SSM), `JambaModel` (hybrid SSM+Attn), `MixtureOfDepthDecoderLayer` (selective FFN routing), `ParallelDecoderLayer` (PaLM-style), `MTPHeads` (multi-token prediction), sliding-window attention |
 | **Recipe** | `recipe.py` | `TrainingRecipe` — templates, tokens, think modes, formatting |
 | **Tokenizer Trainer** | `tokenizer_train.py` | Byte-level BPE tokenizer from JSONL |
 | **Pretrain (DDP)** | `train_pretrain.py` | Self-supervised next-token prediction, DDP |
@@ -297,7 +305,7 @@ python infer.py --smoke-test
 
 ```
 .
-├── model.py                       # Dense transformer
+├── model.py                       # Dense transformer + MLA / Mamba / Jamba / MoD / MTP / parallel layers / SWA
 ├── recipe.py                      # TrainingRecipe (templates, tokens)
 ├── recipe.json                    # Sample recipe
 ├── tokenizer_train.py             # BBPE tokenizer trainer
@@ -328,6 +336,14 @@ python infer.py --smoke-test
 │   └── pack_dataset.py            # Generic tokenizer/packer
 │
 ├── configs/                       # Training config files
+├── hivemind/                       # Decentralized multi-node training (see hivemind/README.md)
+│   ├── hivemind_utils.py           # Peer setup, DecentralizedOptimizer, checkpoint averaging
+│   ├── train_pretrain_hivemind.py  # Decentralized pretraining
+│   ├── train_sft_hivemind.py       # Decentralized SFT
+│   ├── train_grpo_hivemind.py      # Decentralized GRPO
+│   ├── train_dpo_hivemind.py       # Decentralized DPO
+│   ├── run.sh                      # Convenience launcher
+│   └── requirements-hivemind.txt   # Hivemind dependencies
 ├── tests/                         # Smoke tests (train_*.py --smoke-test)
 ├── requirements.txt               # Dependencies
 ├── MANUAL.md                      # Full user manual
@@ -351,6 +367,64 @@ python infer.py --smoke-test
 
 ---
 
+## 🏗 Architecture Variants
+
+The framework's `model.py` goes beyond a plain dense decoder — every training script accepts flags to choose alternative architectures. All variants share the same auto-sizing, checkpoint format, and training pipeline.
+
+### Supported Variants
+
+| Variant | Flag | Description |
+|---------|------|-------------|
+| **Dense (default)** | `--arch dense --layer-type sequential` | Standard pre-norm decoder-only transformer with GQA, RoPE, SwiGLU |
+| **Parallel** | `--arch dense --layer-type parallel` | PaLM-style: attention + MLP computed from the same normalised input (~15% faster) |
+| **Jamba** | `--arch jamba --jamba-interval 4` | Hybrid SSM + Attention: Mamba blocks every N−1 layers, attention every Nth layer |
+| **MoD** | `--mod-alpha 0.25` | Mixture-of-Depth: per-token router skips FFN for low-scoring tokens (saves compute) |
+| **MLA** | `--use-mla` | Multi-head Latent Attention: low-rank KV joint compression (~4× smaller KV cache) |
+| **MTP** | `--num-mtp-heads 3` | Multi-Token Prediction: predict K future tokens per position (discounted auxiliary loss) |
+| **Sliding Window** | `--sliding-window-size 4096` | Alternating global + local sliding-window attention layers |
+
+### Composing Variants
+
+Variants compose naturally. For example, a **Jamba model with MLA, MTP, and sliding window**:
+
+```bash
+python train_pretrain.py --arch jamba --use-mla --num-mtp-heads 3 \
+  --sliding-window-size 4096 --model-size 1B --data-dir ./packed
+```
+
+Or a **dense parallel model with Mixture-of-Depth routing**:
+
+```bash
+python train_pretrain.py --layer-type parallel --mod-alpha 0.25 \
+  --model-size 300M --data-dir ./packed
+```
+
+### RoPE Scaling
+
+All architectures support YaRN and NTK-aware RoPE scaling for extended contexts:
+
+```bash
+# YaRN: 8× context extension over pretrained length
+python train_pretrain.py --rope-scaling '{"type": "yarn", "factor": 8.0}' ...
+
+# NTK-aware: better high-frequency preservation
+python train_pretrain.py --rope-scaling '{"type": "ntk", "factor": 8.0}' ...
+```
+
+### Architecture Decision Guide
+
+| Goal | Recommended Config |
+|------|-------------------|
+| Maximum throughput | `--layer-type parallel --mod-alpha 0.25` |
+| Long context, efficient KV | `--use-mla` (or `--use-mla --sliding-window-size 8192`) |
+| Best quality-to-compute ratio | `--arch jamba --jamba-interval 4` |
+| Faster convergence | `--num-mtp-heads 3` (auxiliary MTP loss) |
+| Standard baseline | Default (dense sequential) |
+
+All variant flags are also available in the **hivemind** decentralized training scripts — see [`hivemind/README.md`](hivemind/README.md).
+
+---
+
 ## 📖 Full Documentation
 
 > **👉 [MANUAL.md](./MANUAL.md)** — Complete user manual with detailed instructions for every component.
@@ -361,6 +435,7 @@ The manual covers:
 - Data pipeline (dataset agent + codegen pipeline)
 - Packing data for training (pretrain, SFT, GRPO, DPO)
 - Training with DDP and DeepSpeed
+- Architecture variants (MLA, Mamba, Jamba, MoD, MTP, parallel, sliding window)
 - GRPO reward design and hyperparameters
 - DPO loss configuration and end-to-end pipeline
 - Inference (REPL, batched, quantized)

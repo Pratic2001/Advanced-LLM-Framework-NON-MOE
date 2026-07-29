@@ -338,6 +338,20 @@ how Hivemind is designed to work.
 --lr / --min-lr               Learning rate (auto-scaled by model size)
 ```
 
+### Architecture variant arguments (all training scripts)
+
+```
+--arch dense|jamba             Architecture type (default: dense)
+--layer-type sequential|parallel  Layer computation order (default: sequential)
+--sliding-window-size N        Local sliding-window attention (0 = disabled)
+--num-mtp-heads N              Multi-token prediction heads (0 = disabled)
+--mtp-discount F               Discount factor for MTP loss (default 0.5)
+--mod-alpha F                  Mixture-of-Depth threshold (0 = disabled)
+--use-mla                      Enable Multi-head Latent Attention (DeepSeek-style)
+--kv-lora-rank N               KV compression rank for MLA (default: hidden_size//4)
+--jamba-interval N             Attention layer every N layers in Jamba (default 4)
+```
+
 ## Multi-Model Training (GRPO / DPO)
 
 GRPO and DPO involve **two** models — a **policy** (trainable) and a **reference** (frozen). Only the policy's optimizer should be wrapped in `DecentralizedOptimizer`:
