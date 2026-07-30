@@ -1,0 +1,148 @@
+import type { FlagDefinition } from "./types";
+import { commonFlags, optimizerFlags } from "./common";
+import { architectureFlags } from "./architecture";
+import { deepspeedFlags } from "./deepspeed";
+
+/**
+ * Pretrain training-specific flags
+ */
+const pretrainSpecific: FlagDefinition[] = [
+  {
+    key: "data_path",
+    label: "Data Path",
+    type: "string",
+    default: "/mnt/training/data/pretrain",
+    description: "Path to pretraining data (packed .pt files or text directory)",
+    group: "Data",
+    required: true,
+    appliesTo: ["pretrain"],
+  },
+  {
+    key: "train_split",
+    label: "Train Split",
+    type: "number",
+    default: 0.999,
+    description: "Fraction of data for training (rest goes to validation)",
+    group: "Data",
+    appliesTo: ["pretrain"],
+  },
+  {
+    key: "batch_size",
+    label: "Per-Device Batch Size",
+    type: "number",
+    default: 8,
+    description: "Micro-batch size per GPU device",
+    group: "Training",
+    required: true,
+    appliesTo: ["pretrain"],
+    validation: { min: 1, max: 1024 },
+  },
+  {
+    key: "gradient_accumulation",
+    label: "Gradient Accumulation Steps",
+    type: "number",
+    default: 1,
+    description: "Accumulate gradients over N steps before optimizer update",
+    group: "Training",
+    appliesTo: ["pretrain"],
+  },
+  {
+    key: "num_epochs",
+    label: "Number of Epochs",
+    type: "number",
+    default: 1,
+    description: "Number of training epochs over the dataset",
+    group: "Training",
+    appliesTo: ["pretrain"],
+  },
+  {
+    key: "max_steps",
+    label: "Max Steps",
+    type: "number",
+    default: -1,
+    description: "Override max training steps (-1 = auto from epochs)",
+    group: "Training",
+    appliesTo: ["pretrain"],
+  },
+  {
+    key: "model_name",
+    label: "Model Name",
+    type: "string",
+    default: "LLM-Pretrain",
+    description: "Name identifier for the pretrained model",
+    group: "Model",
+    required: true,
+    appliesTo: ["pretrain"],
+  },
+  {
+    key: "init_std",
+    label: "Init Standard Deviation",
+    type: "number",
+    default: 0.02,
+    description: "Standard deviation for weight initialization",
+    group: "Model",
+    appliesTo: ["pretrain"],
+  },
+  {
+    key: "init_method",
+    label: "Init Method",
+    type: "select",
+    default: "normal",
+    options: [
+      { label: "Normal", value: "normal" },
+      { label: "Xavier Uniform", value: "xavier_uniform" },
+      { label: "Xavier Normal", value: "xavier_normal" },
+      { label: "Kaiming Uniform", value: "kaiming_uniform" },
+    ],
+    description: "Weight initialization method",
+    group: "Model",
+    appliesTo: ["pretrain"],
+  },
+  {
+    key: "use_flash_attn",
+    label: "Flash Attention",
+    type: "boolean",
+    default: true,
+    description: "Use Flash Attention 2 for faster training",
+    group: "Performance",
+    appliesTo: ["pretrain", "sft", "grpo", "dpo"],
+  },
+  {
+    key: "use_mup",
+    label: "MuP (Micro-Parameterization)",
+    type: "boolean",
+    default: false,
+    description: "Enable Microsoft's maximal update parameterization for stable large LR",
+    group: "Architecture",
+    appliesTo: ["pretrain"],
+  },
+  {
+    key: "dtype",
+    label: "Data Type",
+    type: "select",
+    default: "bf16",
+    options: [
+      { label: "BF16", value: "bf16" },
+      { label: "FP16", value: "fp16" },
+      { label: "FP32", value: "fp32" },
+    ],
+    description: "Training precision",
+    group: "Performance",
+    appliesTo: ["pretrain", "sft", "grpo", "dpo"],
+  },
+];
+
+export const pretrainSchema = {
+  script: "train_pretrain.py",
+  description: "Pre-train a foundation model from scratch using next-token prediction on large text corpora.",
+  groups: [
+    { label: "Model Architecture", flags: architectureFlags.filter(f => f.appliesTo.includes("pretrain")) },
+    { label: "Data", flags: pretrainSpecific.filter(f => f.group === "Data") },
+    { label: "Training", flags: pretrainSpecific.filter(f => f.group === "Training") },
+    { label: "Optimizer", flags: optimizerFlags.filter(f => f.appliesTo.includes("pretrain")) },
+    { label: "Model Init", flags: pretrainSpecific.filter(f => f.group === "Model") },
+    { label: "Performance", flags: pretrainSpecific.filter(f => f.group === "Performance") },
+    { label: "Logging", flags: commonFlags.filter(f => f.group === "Logging" && f.appliesTo.includes("pretrain")) },
+    { label: "General", flags: commonFlags.filter(f => f.group === "General" && f.appliesTo.includes("pretrain")) },
+  ],
+};

@@ -1,0 +1,47 @@
+import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import prisma from "@/lib/db";
+
+export async function POST(
+  req: Request,
+  { params }: { params: { jobId: string } }
+) {
+  const session = await getServerSession();
+  if (!session?.user?.id) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const job = await prisma.job.findFirst({
+    where: { id: params.jobId, userId: session.user.id },
+  });
+
+  if (!job) {
+    return NextResponse.json({ error: "Job not found" }, { status: 404 });
+  }
+
+  if (job.status !== "RUNNING" && job.status !== "QUEUED") {
+    return NextResponse.json(
+      { error: `Cannot stop job in status: ${job.status}` },
+      { status: 400 }
+    );
+  }
+
+  try {
+    // In production: send SIGTERM to the process group
+    // if (job.pid) {
+    //   process.kill(-job.pid, 'SIGTERM');
+    // }
+
+    const updatedJob = await prisma.job.update({
+      where: { id: params.jobId },
+      data: { status: "CANCELLED" },
+    });
+
+    return NextResponse.json(updatedJob);
+  } catch (error: any) {
+    return NextResponse.json(
+      { error: error.message || "Failed to stop job" },
+      { status: 500 }
+    );
+  }
+}
