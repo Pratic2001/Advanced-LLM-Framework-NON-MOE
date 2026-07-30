@@ -28,6 +28,12 @@ export class JobManager extends EventEmitter {
     super();
     this.pool = getProcessPool();
     this.repoRoot = process.env.REPO_ROOT || path.resolve(process.cwd(), "..");
+    if (!process.env.REPO_ROOT) {
+      console.warn(
+        "[JobManager] REPO_ROOT not set; falling back to cwd parent " +
+          `(${this.repoRoot}). The subprocess may not find training scripts.`
+      );
+    }
     this.setMaxListeners(100);
   }
 

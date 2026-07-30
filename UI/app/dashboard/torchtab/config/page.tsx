@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import {
   PlayCircle,
@@ -12,7 +11,12 @@ import {
   Loader2,
   BookTemplate,
   Terminal,
+  Lightbulb,
 } from "lucide-react";
+import { IntegratedTerminal } from "@/components/IntegratedTerminal";
+import { InteractiveShell } from "@/components/InteractiveShell";
+import { buildCommand } from "@/lib/command-builder";
+import { getExampleExtraArgs } from "@/lib/terminal-helpers";
 
 interface FlagField {
   key: string;
@@ -70,23 +74,49 @@ const allStages = [
   { id: "dpo", label: "DPO", flags: [] as FlagField[] },
 ];
 
+const STAGE_LABELS: Record<string, string> = allStages.reduce(
+  (acc, s) => ({ ...acc, [s.id]: s.label }),
+  {} as Record<string, string>
+);
+
+/** True if the given stage id has any flag fields exposed in the form. */
+function primaryStageHasFlags(
+  stages: typeof allStages,
+  primaryId: string
+): boolean {
+  return stages.find((s) => s.id === primaryId)?.flags.length !== 0;
+}
+
 export default function TorchtabConfigPage() {
-  const router = useRouter();
   const [config, setConfig] = useState<Record<string, any>>({});
   const [selectedStages, setSelectedStages] = useState<string[]>(["pretrain"]);
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [extraArgs, setExtraArgs] = useState("");
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
 
   const setFlag = (key: string, value: any) => {
     setConfig((prev) => ({ ...prev, [key]: value }));
   };
 
   const toggleStage = (id: string) => {
-    setSelectedStages((prev) =>
-      prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id]
-    );
+    setSelectedStages((prev) => {
+      const next = prev.includes(id)
+        ? prev.filter((s) => s !== id)
+        : [...prev, id];
+      // If the just-added stage has no flag fields, prefill extraArgs with a
+      // runnable example so the integrated terminal has something to execute.
+      const justAdded = !prev.includes(id);
+      if (justAdded) {
+        const stage = allStages.find((s) => s.id === id);
+        if (stage && stage.flags.length === 0 && !extraArgs.trim()) {
+          const example = getExampleExtraArgs(id);
+          if (example) setExtraArgs(example);
+        }
+      }
+      return next;
+    });
   };
 
   const toggleGroup = (group: string) => {
@@ -121,8 +151,8 @@ export default function TorchtabConfigPage() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to launch job");
 
-      // Navigate to jobs page on success
-      router.push("/dashboard/torchtab/jobs");
+      // Render the integrated terminal inline (no redirect).
+      setActiveJobId(data.id);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -130,8 +160,23 @@ export default function TorchtabConfigPage() {
     }
   };
 
+  // Command preview — exactly what the server will run. Updates whenever
+  // the form changes so the terminal header is always accurate.
+  const commandPreview = buildCommand({
+    script: stageScriptMap[primaryStage] as any,
+    config,
+    backend: "torch",
+    extraArgs: extraArgs.trim() || undefined,
+  });
+
   return (
     <div className="space-y-6 max-w-4xl mx-auto">
+      {/* Interactive bash shell — always visible at the top of the config page
+          so you can run commands (inspect files, kick off ad-hoc tooling, etc.)
+          before or while configuring the job. Click "Connect" to spawn a PTY
+          session scoped to REPO_ROOT. */}
+      <InteractiveShell tone="cyan" />
+
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold">Configure Pipeline</h1>
@@ -179,13 +224,32 @@ export default function TorchtabConfigPage() {
 
       {/* Config form */}
       {groups.length === 0 ? (
-        <div className="glass rounded-xl p-10 border border-border/50 text-center">
-          <Settings2 className="w-6 h-6 text-muted-foreground mx-auto mb-3" />
-          <h3 className="font-semibold mb-1">No Configuration Available</h3>
-          <p className="text-sm text-muted-foreground">
-            Select pipeline stages above to configure their flags.
-          </p>
-        </div>
+        primaryStageHasFlags(allStages, primaryStage) ? (
+          <div className="glass rounded-xl p-10 border border-border/50 text-center">
+            <Settings2 className="w-6 h-6 text-muted-foreground mx-auto mb-3" />
+            <h3 className="font-semibold mb-1">No Configuration Available</h3>
+            <p className="text-sm text-muted-foreground">
+              Select pipeline stages above to configure their flags.
+            </p>
+          </div>
+        ) : (
+          <div className="glass rounded-xl p-5 border border-neon-cyan/20 bg-neon-cyan/5">
+            <div className="flex items-start gap-3">
+              <Lightbulb className="w-5 h-5 text-neon-cyan flex-shrink-0 mt-0.5" />
+              <div className="flex-1 space-y-2">
+                <h3 className="font-semibold text-neon-cyan">
+                  {STAGE_LABELS[primaryStage] || primaryStage} — Example Command
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  This stage exposes no flag fields, so an example invocation has
+                  been pre-filled into <span className="font-mono">extraArgs</span>{" "}
+                  below. Edit it to match your environment, or click Run to
+                  execute it as-is.
+                </p>
+              </div>
+            </div>
+          </div>
+        )
       ) : (
         <div className="space-y-4">
           {groups.map((group) => {
@@ -327,6 +391,16 @@ export default function TorchtabConfigPage() {
           {extraArgs.trim() && " + custom CLI args"}
         </p>
       </motion.div>
+
+      {/* Integrated terminal — appears below the form once a job is launched. */}
+      {activeJobId && (
+        <IntegratedTerminal
+          key={activeJobId}
+          jobId={activeJobId}
+          backend="torch"
+          commandPreview={commandPreview}
+        />
+      )}
     </div>
   );
 }

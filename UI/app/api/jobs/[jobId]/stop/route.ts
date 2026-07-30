@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import prisma from "@/lib/db";
+import { JobManager } from "@/lib/job-manager";
 
 export async function POST(
   req: Request,
@@ -27,14 +28,16 @@ export async function POST(
   }
 
   try {
-    // In production: send SIGTERM to the process group
-    // if (job.pid) {
-    //   process.kill(-job.pid, 'SIGTERM');
-    // }
+    const killed = await JobManager.getInstance().stop(params.jobId);
+    if (!killed) {
+      return NextResponse.json(
+        { error: "Process not found or already terminated" },
+        { status: 409 }
+      );
+    }
 
-    const updatedJob = await prisma.job.update({
+    const updatedJob = await prisma.job.findUnique({
       where: { id: params.jobId },
-      data: { status: "CANCELLED" },
     });
 
     return NextResponse.json(updatedJob);

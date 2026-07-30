@@ -3,7 +3,14 @@ import type { NextRequest } from "next/server";
 import { getToken } from "next-auth/jwt";
 
 export const config = {
-  matcher: ["/dashboard/:path*", "/login", "/signup", "/api/:path*"],
+  // /api/((?!ws).*) matches everything under /api EXCEPT /api/ws.
+  // Next.js's dev router runs middleware against WebSocket *upgrade*
+  // requests too when the path matches the matcher, which throws
+  // "Cannot read properties of undefined (reading 'bind')" for socket
+  // upgrades (see vercel/next.js#56368 and related issues). The terminal
+  // socket at /api/ws authenticates itself independently via cookies in
+  // lib/ws-manager.ts, so excluding it here does not weaken auth.
+  matcher: ["/dashboard/:path*", "/login", "/signup", "/api/((?!ws).*)"],
 };
 
 // CSP is intentionally not set here — middleware CSP can cause issues with

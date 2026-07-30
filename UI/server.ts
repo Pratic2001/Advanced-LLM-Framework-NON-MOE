@@ -4,8 +4,15 @@
  * Next.js App Router route handlers don't support WebSocket upgrades.
  * This custom server wraps Next.js and mounts the WebSocket server alongside it.
  *
- * Usage: npx tsx server.ts
- * In production: Build first (npm run build) then use the compiled standalone output.
+ * Usage: npx tsx server.ts        # auto-loads .env.local (see package.json script)
+ *        npm run start:ws         # same, via npm script
+ * In production: Build first (npm run build) then use node .next/standalone/server.js
+ * (which does NOT support WebSocket — must run this custom server instead).
+ *
+ * Env loading: `tsx` and bare Node do NOT auto-load .env.local the way
+ * `next dev` / `next start` do. The `start:ws` npm script passes
+ * `--env-file=.env.local` to tsx so env vars are populated before any module
+ * reads them. Don't run plain `tsx server.ts` — env will be missing.
  */
 
 import { createServer } from "http";

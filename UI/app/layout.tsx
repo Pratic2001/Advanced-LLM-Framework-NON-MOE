@@ -1,19 +1,16 @@
 import type { Metadata } from "next";
-import { Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import { Providers } from "./providers";
 
-const inter = Inter({
-  subsets: ["latin"],
-  variable: "--font-inter",
-  display: "swap",
-});
-
-const jetbrainsMono = JetBrains_Mono({
-  subsets: ["latin"],
-  variable: "--font-mono",
-  display: "swap",
-});
+// NOTE: We intentionally do NOT use next/font/google here. That loader
+// fetches font files from fonts.googleapis.com at build/dev-compile time,
+// which throws inside the root layout (and therefore triggers
+// app/global-error.tsx, the "Critical Error" screen) on networks that can't
+// reach the public internet — e.g. this app tunnelled over Tailscale with
+// no outbound access. --font-inter / --font-mono already have system-font
+// fallbacks defined in globals.css and tailwind.config.ts, so we just
+// declare them as static variables here instead of fetching anything.
+const fontVariables = "font-vars";
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://llmforge.dev"),
@@ -45,7 +42,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body
-        className={`${inter.variable} ${jetbrainsMono.variable} min-h-screen bg-background antialiased`}
+        className={`${fontVariables} min-h-screen bg-background antialiased`}
       >
         <div className="grid-overlay" />
         <canvas id="particle-canvas" className="particle-network" />

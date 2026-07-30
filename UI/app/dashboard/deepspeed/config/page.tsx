@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import {
   PlayCircle,
@@ -13,6 +12,9 @@ import {
   BookTemplate,
   Terminal,
 } from "lucide-react";
+import { IntegratedTerminal } from "@/components/IntegratedTerminal";
+import { InteractiveShell } from "@/components/InteractiveShell";
+import { buildCommand } from "@/lib/command-builder";
 
 interface FlagField {
   key: string;
@@ -65,12 +67,12 @@ const allGroups = [
 ];
 
 export default function DeepSpeedConfigPage() {
-  const router = useRouter();
   const [config, setConfig] = useState<Record<string, any>>({});
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [extraArgs, setExtraArgs] = useState("");
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
 
   const setFlag = (key: string, value: any) => {
     setConfig((prev) => ({ ...prev, [key]: value }));
@@ -99,7 +101,8 @@ export default function DeepSpeedConfigPage() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to launch job");
 
-      router.push("/dashboard/deepspeed/jobs");
+      // Render the integrated terminal inline (no redirect).
+      setActiveJobId(data.id);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -107,8 +110,23 @@ export default function DeepSpeedConfigPage() {
     }
   };
 
+  // Command preview — exactly what the server will run. Updates whenever
+  // the form changes so the terminal header is always accurate.
+  const commandPreview = buildCommand({
+    script: "train_pretrain.py" as any,
+    config,
+    backend: "deepspeed",
+    extraArgs: extraArgs.trim() || undefined,
+  });
+
   return (
     <div className="space-y-6 max-w-4xl mx-auto">
+      {/* Interactive bash shell — always visible at the top of the config page
+          so you can run commands (inspect files, kick off ad-hoc tooling, etc.)
+          before or while configuring the job. Click "Connect" to spawn a PTY
+          session scoped to REPO_ROOT. */}
+      <InteractiveShell tone="blue" />
+
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold">Configure DeepSpeed</h1>
@@ -266,6 +284,16 @@ export default function DeepSpeedConfigPage() {
           {extraArgs.trim() && " + custom CLI args"}
         </p>
       </motion.div>
+
+      {/* Integrated terminal — appears below the form once a job is launched. */}
+      {activeJobId && (
+        <IntegratedTerminal
+          key={activeJobId}
+          jobId={activeJobId}
+          backend="deepspeed"
+          commandPreview={commandPreview}
+        />
+      )}
     </div>
   );
 }

@@ -736,31 +736,100 @@ A Prometheus blackbox-probe snippet:
 
 ## Running the UI
 
-### Development mode
+There are two fundamentally different ways Next.js can serve this app:
+
+- **`next dev` (lazy compilation)** — pages, layouts, and API routes are compiled
+  **on demand**, the first time each one is requested. This makes local edits fast,
+  but the first hit to any given route pays a noticeable compile delay, and route
+  compilation happens continuously as you navigate.
+- **`next build` + a production start (fully precompiled)** — the **entire app**
+  (every page, layout, and API route) is compiled ahead of time into `.next/`.
+  Nothing compiles at request time; every route is served straight from the
+  prebuilt output the instant the server starts.
+
+If you want everything precompiled with no lazy/on-demand compilation, use the
+**Production (fully precompiled)** instructions below, not `npm run dev`.
+
+### Development mode (lazy compilation — local iteration only)
 
 ```bash
 cd UI
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+Open [http://localhost:3000](http://localhost:3000). Use this only while actively
+editing code. Do **not** use this mode if you want everything precompiled up front.
 
-### Production build
+### Production (fully precompiled, no lazy compilation)
 
-```bash
-npm run build
-npm start
-```
+This app needs WebSockets for live charts and the interactive shell, and
+`next start` alone does not support them (see the warning below) — so
+production runs go through the custom `server.ts`, driven into full
+production mode via `NODE_ENV=production`. That flag is what tells `server.ts`
+to pass `dev: false` to Next, which skips lazy/on-demand compilation entirely
+and serves only the prebuilt `.next/` output.
 
-### With WebSocket support (for live charts)
+1. **Set up your environment file** (this project is configured to load
+   `.env.local`):
 
-```bash
-npx tsx server.ts
-# or if built:
-node server.js
-```
+   ```bash
+   cd UI
+   cp .env.example .env.local
+   # edit .env.local — fill in DATABASE_URL, AUTH_SECRET, SSH_KEY_ENCRYPTION_KEY, etc.
+   ```
 
-This starts a custom HTTP server that also handles WebSocket upgrades at `/api/ws`.
+   Add (or confirm) this line in `.env.local` so the server never falls back
+   to dev mode:
+
+   ```bash
+   NODE_ENV=production
+   ```
+
+2. **Install dependencies and generate the Prisma client:**
+
+   ```bash
+   npm install
+   npx prisma generate
+   npx prisma db push   # or: npx prisma migrate deploy
+   ```
+
+3. **Precompile everything** (this is the step that removes lazy compilation
+   — it builds every route, page, and API handler ahead of time):
+
+   ```bash
+   npm run build
+   ```
+
+4. **Start the app from the prebuilt output, with WebSocket support:**
+
+   ```bash
+   npm run start:ws
+   ```
+
+   This runs `tsx --env-file=.env.local server.ts`, which:
+   - loads every variable in `.env.local` (including `NODE_ENV=production`)
+     before any module reads `process.env`,
+   - passes `dev: false` into `next({ dev, hostname, port })` because of that
+     `NODE_ENV`, so Next serves only the artifacts produced by `npm run build`
+     in step 3 — no route is compiled at request time,
+   - and still mounts the WebSocket manager on top of the HTTP server, so
+     `/api/ws` keeps working (which plain `next start` cannot do).
+
+   Open the app at `http://<HOSTNAME>:<PORT>` (defaults to
+   `http://localhost:3000`).
+
+> ⚠️  **`npm start` / `next start` does NOT support WebSockets.** It runs
+> Next.js's standalone server, which never initializes the `WSManager`, so
+> `/api/ws` upgrades fall through to a request handler that crashes with
+> `Cannot read properties of undefined (reading 'bind')`. Always use
+> `npm run start:ws` (after `npm run build`) if you need live job updates or
+> the interactive shell — this is the correct fully-precompiled, WebSocket-capable
+> production path for this app.
+
+**Sanity check that nothing is lazily compiling:** after `npm run build`, the
+first request to *any* route (including ones you haven't visited yet) should
+return immediately with no visible compile delay and no new `.next` cache
+files being written — everything was already emitted by the build step.
 
 ---
 

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import prisma from "@/lib/db";
 import { buildCommand } from "@/lib/command-builder";
+import { JobManager } from "@/lib/job-manager";
 import type { ScriptName } from "@/lib/schema";
 import { createJobSchema, formatZodErrors } from "@/lib/validations";
 
@@ -80,8 +81,12 @@ export async function POST(req: Request) {
     },
   });
 
-  // In production: spawn the subprocess via job-manager
-  // const process = await JobManager.getInstance().spawn(job.id, command);
+  // Spawn the subprocess via JobManager. Fire-and-forget: launch() resolves
+  // once the subprocess is up and listeners are attached; stdout/stderr are
+  // streamed to WebSocket subscribers independently of this response.
+  JobManager.getInstance().launch(job.id, command, []).catch((err) => {
+    console.error(`[POST /api/jobs] Failed to launch job ${job.id}:`, err);
+  });
 
   return NextResponse.json(job, { status: 201 });
 }
