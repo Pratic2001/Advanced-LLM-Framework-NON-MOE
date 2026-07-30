@@ -315,6 +315,58 @@ This starts a custom HTTP server that also handles WebSocket upgrades at `/api/w
 
 ---
 
+## Custom CLI Arguments
+
+Every backend config page (Torch/DDP, DeepSpeed, Hivemind) now has an **Extra CLI Arguments** textarea that lets you pass arbitrary CLI flags verbatim. This is useful for flags that aren't covered by the structured form fields, such as `--gradient_checkpointing`, `--use_flash_attn_2`, or custom `--optimizer` settings.
+
+### Torch / DDP and DeepSpeed
+
+1. Go to the backend tab → **Configure**.
+2. Fill in the structured form fields (Model, Training, etc.) as usual.
+3. Scroll to the **Extra CLI Arguments** section.
+4. Type any additional flags, one per line or space-separated:
+   ```
+   --gradient_checkpointing
+   --use_flash_attn_2
+   --optimizer adamw
+   ```
+5. Click **Run Training** — your custom args are appended verbatim after the generated flags.
+
+### Hivemind (Per-Node CLI Arguments)
+
+Hivemind training runs the same script on every peer, but each peer often needs different networking arguments (e.g. the bootstrap peer doesn't use `--bootstrap_peer`, while worker peers do). The Hivemind config page supports **per-peer CLI arguments** in addition to global extra args.
+
+1. Go to **Hivemind** tab → **Configure**.
+2. Fill in shared training flags as usual.
+3. In the **Global Extra CLI Arguments** section, add flags that apply to **all** peers:
+   ```
+   --compression float16
+   --max_peers 32
+   ```
+4. In the **Peer Configuration** section, add each peer with its **peer-specific arguments**:
+   - **Bootstrap peer:** `--host_maddrs /ip4/0.0.0.0/tcp/31337`
+   - **Worker peers:** `--bootstrap_peer /ip4/<bootstrap-ip>/tcp/31337/p2p/<peer-id> --announce_maddrs /ip4/<peer-ip>/tcp/31337`
+5. When you click **Run Hivemind Training**, the UI creates **one job per peer** — each with the shared config, global extra args, and its own peer-specific args combined.
+
+### Equivalent CLI commands
+
+The UI generates these commands internally (torch example):
+
+```bash
+# Without extra args:
+torchrun --nproc_per_node=1 --nnodes=1 train_pretrain.py \
+  --model_type dense --batch_size 8 --learning_rate 3e-4 ...
+
+# With extra args:
+torchrun --nproc_per_node=1 --nnodes=1 train_pretrain.py \
+  --model_type dense --batch_size 8 --learning_rate 3e-4 ... \
+  --gradient_checkpointing --use_flash_attn_2
+```
+
+The extra args are appended after all generated flags, so they can override defaults if the training script reads them left-to-right.
+
+---
+
 ## Usage Scenarios
 
 ### Scenario A: Single Node (Local Machine)
