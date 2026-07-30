@@ -3,7 +3,13 @@ import CredentialsProvider from "next-auth/providers/credentials";
 import { compare } from "bcryptjs";
 import prisma from "./db";
 
+// In NextAuth v5 (Auth.js), `trustHost` must be enabled when running on
+// localhost or any host that is not a known Vercel/Netlify/etc. platform.
+// Without it, every /api/auth/* call throws `UntrustedHost: Host must be
+// trusted`. We default to true and allow `AUTH_TRUST_HOST=false` to opt out
+// for production deployments behind a known proxy.
 export const { handlers, auth, signIn, signOut } = NextAuth({
+  trustHost: (process.env.AUTH_TRUST_HOST ?? "true") !== "false",
   providers: [
     CredentialsProvider({
       name: "Credentials",

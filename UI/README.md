@@ -3,7 +3,7 @@
 > **A browser-based control center for the Dense LLM Framework.** Launch, monitor, and orchestrate your entire LLM training pipeline — tokenizer training → data packing → pretrain → SFT → GRPO/DPO — across single-node, multi-node, and decentralized (Hivemind) backends, all from a modern web interface.
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-beta-blue" alt="Status"/>
+  <img src="https://img.shields.io/badge/status-stable-brightgreen" alt="Status"/>
   <img src="https://img.shields.io/badge/next.js-14-black" alt="Next.js 14"/>
   <img src="https://img.shields.io/badge/postgresql-16%2B-blue" alt="PostgreSQL 16+"/>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"/>
@@ -268,10 +268,19 @@ Edit `.env.local` in the `UI/` directory:
 # Use the connection string for your PostgreSQL setup
 DATABASE_URL="postgresql://postgres:postgres@localhost:5432/llm_training_ui"
 
-# ─── NextAuth ─────────────────────────────────────
-NEXTAUTH_URL="http://localhost:3000"
-# Generate a strong secret via: openssl rand -base64 32
-NEXTAUTH_SECRET="change-this-to-a-random-secret-in-production"
+# ─── Auth.js (NextAuth v5) ─────────────────────────
+# AUTH_SECRET signs JWTs and encrypts cookies — required.
+# Generate with: openssl rand -base64 32
+AUTH_SECRET="change-this-to-a-random-secret-in-production"
+
+# AUTH_URL sets the canonical app origin. Optional — leave unset and Auth.js
+# will infer it from the request when trustHost is enabled.
+# AUTH_URL="http://localhost:3000"
+
+# AUTH_TRUST_HOST must be true when running on localhost or any host that
+# isn't a known platform (Vercel/Netlify/etc.). Without it, /api/auth/* throws
+# `UntrustedHost: Host must be trusted`. Defaults to true in this UI.
+AUTH_TRUST_HOST="true"
 
 # ─── SSH Key Encryption ────────────────────────────
 # 32 hex chars for AES-256-GCM (used to encrypt SSH keys at rest)
@@ -649,6 +658,17 @@ The UI exposes a REST API at `/api/*` for programmatic access:
 ---
 
 ## Troubleshooting
+
+### "UntrustedHost: Host must be trusted" from /api/auth/*
+
+Auth.js v5 requires the host of the incoming request to be explicitly trusted. The UI enables this by default, so this error only appears when you override `AUTH_TRUST_HOST`:
+
+```bash
+# In .env.local — make sure this is set to "true" (or unset entirely, since true is the default)
+AUTH_TRUST_HOST="true"
+```
+
+If you intentionally serve the UI from a host that isn't `localhost` (e.g. a LAN IP or a reverse proxy), keep `AUTH_TRUST_HOST="true"` and ensure your reverse proxy forwards the original `Host` header. Set `AUTH_TRUST_HOST="false"` only behind a platform that Auth.js recognises automatically (Vercel, Netlify, Cloudflare, etc.).
 
 ### PostgreSQL connection refused
 
