@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import {
   PlayCircle,
@@ -10,6 +11,7 @@ import {
   ChevronRight,
   Loader2,
   BookTemplate,
+  Terminal,
 } from "lucide-react";
 
 interface FlagField {
@@ -50,6 +52,15 @@ const sftFlags: FlagField[] = [
   { key: "data_path", label: "Data Path", type: "string", default: "/mnt/training/data/sft", description: "SFT dataset path", required: true, group: "Data" },
 ];
 
+const stageScriptMap: Record<string, string> = {
+  tokenizer: "tokenizer_train.py",
+  packing: "hf_to_packed.py",
+  pretrain: "train_pretrain.py",
+  sft: "train_sft.py",
+  grpo: "train_grpo.py",
+  dpo: "train_dpo.py",
+};
+
 const allStages = [
   { id: "tokenizer", label: "Tokenizer Train", flags: [] as FlagField[] },
   { id: "packing", label: "Data Packing", flags: [] as FlagField[] },
@@ -60,10 +71,13 @@ const allStages = [
 ];
 
 export default function TorchtabConfigPage() {
+  const router = useRouter();
   const [config, setConfig] = useState<Record<string, any>>({});
   const [selectedStages, setSelectedStages] = useState<string[]>(["pretrain"]);
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const [launching, setLaunching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [extraArgs, setExtraArgs] = useState("");
 
   const setFlag = (key: string, value: any) => {
     setConfig((prev) => ({ ...prev, [key]: value }));
@@ -85,9 +99,35 @@ export default function TorchtabConfigPage() {
 
   const groups = [...new Set(activeFlags.map((f) => f.group))];
 
-  const launchAll = () => {
+  // Use the first selected stage to determine the script type
+  const primaryStage = selectedStages[0] || "pretrain";
+
+  const launchAll = async () => {
     setLaunching(true);
-    setTimeout(() => setLaunching(false), 2000);
+    setError(null);
+
+    try {
+      const res = await fetch("/api/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: stageScriptMap[primaryStage],
+          backend: "torch",
+          config,
+          extraArgs: extraArgs.trim() || undefined,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to launch job");
+
+      // Navigate to jobs page on success
+      router.push("/dashboard/torchtab/jobs");
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLaunching(false);
+    }
   };
 
   return (
@@ -133,7 +173,7 @@ export default function TorchtabConfigPage() {
           })}
         </div>
         <p className="text-xs text-muted-foreground mt-2">
-          Select the stages you want to run in sequence.
+          Select the stages you want to run.
         </p>
       </div>
 
@@ -230,6 +270,35 @@ export default function TorchtabConfigPage() {
         </div>
       )}
 
+      {/* Extra CLI Arguments */}
+      <div className="glass rounded-xl border border-border/50 overflow-hidden">
+        <div className="px-5 py-3 text-sm font-semibold flex items-center gap-2">
+          <Terminal className="w-4 h-4 text-muted-foreground" />
+          Extra CLI Arguments
+        </div>
+        <div className="px-5 pb-5">
+          <textarea
+            value={extraArgs}
+            onChange={(e) => setExtraArgs(e.target.value)}
+            placeholder={`--gradient_checkpointing
+--use_flash_attn_2
+--optimizer adamw`}
+            rows={4}
+            className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-cyan focus:ring-1 focus:ring-neon-cyan outline-none text-sm font-mono resize-y"
+          />
+          <p className="text-xs text-muted-foreground mt-1">
+            These arguments are appended verbatim to the CLI command after the generated flags.
+          </p>
+        </div>
+      </div>
+
+      {/* Error display */}
+      {error && (
+        <div className="glass rounded-xl p-4 border border-red-500/30 bg-red-500/5">
+          <p className="text-sm text-red-400">{error}</p>
+        </div>
+      )}
+
       {/* Run button */}
       <motion.div
         initial={{ opacity: 0 }}
@@ -244,20 +313,18 @@ export default function TorchtabConfigPage() {
           {launching ? (
             <>
               <Loader2 className="w-5 h-5 animate-spin" />
-              Launching Pipeline...
+              Launching...
             </>
           ) : (
             <>
               <PlayCircle className="w-5 h-5" />
-              Run Pipeline
+              Run Training
             </>
           )}
         </button>
         <p className="text-xs text-muted-foreground mt-3">
-          Launches pipeline stages in sequence:{" "}
-          {selectedStages
-            .map((s) => allStages.find((st) => st.id === s)?.label)
-            .join(" → ")}
+          Launches {stageScriptMap[primaryStage]} with Torch DDP backend
+          {extraArgs.trim() && " + custom CLI args"}
         </p>
       </motion.div>
     </div>

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import {
   PlayCircle,
@@ -10,6 +11,7 @@ import {
   ChevronRight,
   Loader2,
   BookTemplate,
+  Terminal,
 } from "lucide-react";
 
 interface FlagField {
@@ -63,9 +65,12 @@ const allGroups = [
 ];
 
 export default function DeepSpeedConfigPage() {
+  const router = useRouter();
   const [config, setConfig] = useState<Record<string, any>>({});
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const [launching, setLaunching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [extraArgs, setExtraArgs] = useState("");
 
   const setFlag = (key: string, value: any) => {
     setConfig((prev) => ({ ...prev, [key]: value }));
@@ -73,6 +78,33 @@ export default function DeepSpeedConfigPage() {
 
   const toggleGroup = (group: string) => {
     setExpandedGroups((prev) => ({ ...prev, [group]: !prev[group] }));
+  };
+
+  const launchAll = async () => {
+    setLaunching(true);
+    setError(null);
+
+    try {
+      const res = await fetch("/api/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: "train_pretrain.py",
+          backend: "deepspeed",
+          config,
+          extraArgs: extraArgs.trim() || undefined,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to launch job");
+
+      router.push("/dashboard/deepspeed/jobs");
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLaunching(false);
+    }
   };
 
   return (
@@ -176,6 +208,35 @@ export default function DeepSpeedConfigPage() {
         })}
       </div>
 
+      {/* Extra CLI Arguments */}
+      <div className="glass rounded-xl border border-border/50 overflow-hidden">
+        <div className="px-5 py-3 text-sm font-semibold flex items-center gap-2">
+          <Terminal className="w-4 h-4 text-muted-foreground" />
+          Extra CLI Arguments
+        </div>
+        <div className="px-5 pb-5">
+          <textarea
+            value={extraArgs}
+            onChange={(e) => setExtraArgs(e.target.value)}
+            placeholder={`--gradient_checkpointing
+--use_flash_attn_2
+--deepspeed_config ds_config.json`}
+            rows={4}
+            className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-blue focus:ring-1 focus:ring-neon-blue outline-none text-sm font-mono resize-y"
+          />
+          <p className="text-xs text-muted-foreground mt-1">
+            These arguments are appended verbatim to the CLI command after the generated flags.
+          </p>
+        </div>
+      </div>
+
+      {/* Error display */}
+      {error && (
+        <div className="glass rounded-xl p-4 border border-red-500/30 bg-red-500/5">
+          <p className="text-sm text-red-400">{error}</p>
+        </div>
+      )}
+
       {/* Run button */}
       <motion.div
         initial={{ opacity: 0 }}
@@ -183,7 +244,7 @@ export default function DeepSpeedConfigPage() {
         className="glass rounded-xl p-6 border border-border/50 text-center"
       >
         <button
-          onClick={() => setLaunching(true)}
+          onClick={launchAll}
           disabled={launching}
           className="inline-flex items-center gap-3 px-8 py-3 rounded-xl bg-gradient-to-r from-neon-blue to-blue-500 text-white font-bold text-lg hover:opacity-90 transition-all disabled:opacity-50"
           style={{ boxShadow: "0 0 30px rgba(0,136,255,0.2)" }}
@@ -201,7 +262,8 @@ export default function DeepSpeedConfigPage() {
           )}
         </button>
         <p className="text-xs text-muted-foreground mt-3">
-          Launches with deepspeed launcher using the configured ZeRO stage.
+          Launches train_pretrain.py with DeepSpeed launcher
+          {extraArgs.trim() && " + custom CLI args"}
         </p>
       </motion.div>
     </div>

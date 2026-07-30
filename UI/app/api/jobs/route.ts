@@ -40,11 +40,13 @@ export async function POST(req: Request) {
     backend,
     config,
     nodeIds,
+    extraArgs,
   } = body as {
     type: string;
     backend: BackendType;
     config: Record<string, any>;
     nodeIds?: string[];
+    extraArgs?: string;
   };
 
   if (!type || !backend) {
@@ -74,16 +76,17 @@ export async function POST(req: Request) {
     nodes: nodes.map((n) => n.host),
     nodeCount: Math.max(nodes.length, 1),
     gpuCount: nodes[0]?.gpuCount || 1,
+    extraArgs,
   });
 
-  // Create the job record
+  // Create the job record (store extraArgs in config for later use)
   const job = await prisma.job.create({
     data: {
       userId: session.user.id,
       type: type.toUpperCase() as any,
       backend: backend.toUpperCase() as any,
       status: "QUEUED",
-      config,
+      config: extraArgs ? { ...config, __extraArgs: extraArgs } : config,
     },
   });
 

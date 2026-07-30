@@ -19,7 +19,7 @@ export async function POST(req: Request) {
   } = body as {
     name: string;
     backend: BackendType;
-    stages: { type: string; config: Record<string, any> }[];
+    stages: { type: string; config: Record<string, any>; extraArgs?: string }[];
     nodeIds?: string[];
   };
 
@@ -40,6 +40,7 @@ export async function POST(req: Request) {
       type: normalizeStageType(s.type),
       label: s.type,
       config: s.config,
+      extraArgs: s.extraArgs,
     })),
     nodeIds,
   });

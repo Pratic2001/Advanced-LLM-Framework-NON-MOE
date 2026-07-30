@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import {
   PlayCircle,
@@ -10,6 +11,11 @@ import {
   ChevronRight,
   Loader2,
   BookTemplate,
+  Terminal,
+  Plus,
+  Trash2,
+  Radio,
+  Monitor,
 } from "lucide-react";
 
 interface FlagField {
@@ -23,8 +29,16 @@ interface FlagField {
   group: string;
 }
 
+interface PeerEntry {
+  id: string;
+  name: string;
+  host: string;
+  role: "BOOTSTRAP" | "PEER";
+  extraArgs: string;
+}
+
 const hivemindFlags: FlagField[] = [
-  { key: "bootstrap_peer", label: "Bootstrap Peer", type: "string", default: "/ip4/0.0.0.0/tcp/31337/p2p/...", description: "Multi-address of the bootstrap peer", required: true, group: "Hivemind" },
+  { key: "bootstrap_peer", label: "Bootstrap Peer Multi-Address", type: "string", default: "/ip4/0.0.0.0/tcp/31337/p2p/...", description: "Multi-address of the bootstrap peer for DHT discovery", required: true, group: "Hivemind" },
   { key: "host_maddrs", label: "Host Address", type: "string", default: "/ip4/0.0.0.0/tcp/31337", description: "Local multi-address to listen on", group: "Hivemind" },
   { key: "announce_maddrs", label: "Announce Address", type: "string", description: "Public multi-address to announce to peers", group: "Hivemind" },
   { key: "dht_port", label: "DHT Port", type: "number", default: 31337, description: "Port for DHT peer discovery", group: "Hivemind" },
@@ -62,9 +76,15 @@ const allGroups = [
 ];
 
 export default function HivemindConfigPage() {
+  const router = useRouter();
   const [config, setConfig] = useState<Record<string, any>>({});
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const [launching, setLaunching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [extraArgs, setExtraArgs] = useState("");
+  const [peers, setPeers] = useState<PeerEntry[]>([]);
+  const [showAddPeer, setShowAddPeer] = useState(false);
+  const [newPeer, setNewPeer] = useState({ name: "", host: "", role: "PEER" as "BOOTSTRAP" | "PEER" });
 
   const setFlag = (key: string, value: any) => {
     setConfig((prev) => ({ ...prev, [key]: value }));
@@ -72,6 +92,85 @@ export default function HivemindConfigPage() {
 
   const toggleGroup = (group: string) => {
     setExpandedGroups((prev) => ({ ...prev, [group]: !prev[group] }));
+  };
+
+  const addPeer = () => {
+    if (!newPeer.name || !newPeer.host) return;
+    const peer: PeerEntry = {
+      id: Date.now().toString(),
+      name: newPeer.name,
+      host: newPeer.host,
+      role: newPeer.role,
+      extraArgs: newPeer.role === "BOOTSTRAP"
+        ? "--host_maddrs /ip4/0.0.0.0/tcp/31337"
+        : `--bootstrap_peer /ip4/${newPeer.host}/tcp/31337`,
+    };
+    setPeers((prev) => [...prev, peer]);
+    setNewPeer({ name: "", host: "", role: "PEER" });
+    setShowAddPeer(false);
+  };
+
+  const removePeer = (id: string) => {
+    setPeers((prev) => prev.filter((p) => p.id !== id));
+  };
+
+  const updatePeerExtraArgs = (id: string, args: string) => {
+    setPeers((prev) => prev.map((p) => (p.id === id ? { ...p, extraArgs: args } : p)));
+  };
+
+  const launchAll = async () => {
+    if (peers.length === 0) {
+      setError("Add at least one peer before launching.");
+      return;
+    }
+
+    setLaunching(true);
+    setError(null);
+
+    const globalExtra = extraArgs.trim();
+    const results: { name: string; success: boolean; error?: string }[] = [];
+
+    for (const peer of peers) {
+      // Combine global extra args with per-peer extra args
+      const peerExtra = [globalExtra, peer.extraArgs.trim()].filter(Boolean).join("\n");
+
+      try {
+        const res = await fetch("/api/jobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "train_pretrain.py",
+            backend: "hivemind",
+            config: {
+              ...config,
+              peer_name: peer.name,
+              peer_role: peer.role,
+              peer_host: peer.host,
+            },
+            extraArgs: peerExtra || undefined,
+          }),
+        });
+
+        const data = await res.json();
+        if (res.ok) {
+          results.push({ name: peer.name, success: true });
+        } else {
+          results.push({ name: peer.name, success: false, error: data.error || "Unknown error" });
+        }
+      } catch (err: any) {
+        results.push({ name: peer.name, success: false, error: err.message });
+      }
+    }
+
+    const allSucceeded = results.every((r) => r.success);
+    if (allSucceeded) {
+      router.push("/dashboard/hivemind/jobs");
+    } else {
+      const failed = results.filter((r) => !r.success).map((r) => `${r.name}: ${r.error}`);
+      setError(`Failed to launch some peers:\n${failed.join("\n")}`);
+    }
+
+    setLaunching(false);
   };
 
   return (
@@ -95,6 +194,7 @@ export default function HivemindConfigPage() {
         </div>
       </div>
 
+      {/* Config groups */}
       <div className="space-y-4">
         {allGroups.map((group) => {
           const expanded = expandedGroups[group.label] !== false;
@@ -175,6 +275,156 @@ export default function HivemindConfigPage() {
         })}
       </div>
 
+      {/* Global Extra CLI Arguments */}
+      <div className="glass rounded-xl border border-border/50 overflow-hidden">
+        <div className="px-5 py-3 text-sm font-semibold flex items-center gap-2">
+          <Terminal className="w-4 h-4 text-muted-foreground" />
+          Global Extra CLI Arguments
+          <span className="text-xs text-muted-foreground font-normal">(applied to all peers)</span>
+        </div>
+        <div className="px-5 pb-5">
+          <textarea
+            value={extraArgs}
+            onChange={(e) => setExtraArgs(e.target.value)}
+            placeholder={`--compression float16
+--max_peers 32
+--verbose`}
+            rows={3}
+            className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm font-mono resize-y"
+          />
+          <p className="text-xs text-muted-foreground mt-1">
+            These arguments are appended to every peer's CLI command.
+          </p>
+        </div>
+      </div>
+
+      {/* Per-Peer Configuration */}
+      <div className="glass rounded-xl border border-border/50 overflow-hidden">
+        <div className="px-5 py-3 text-sm font-semibold flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Radio className="w-4 h-4 text-muted-foreground" />
+            Peer Configuration
+          </div>
+          <button
+            onClick={() => setShowAddPeer(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-gradient-to-r from-neon-purple to-purple-600 text-white text-xs font-medium hover:opacity-90 transition-all"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            Add Peer
+          </button>
+        </div>
+
+        {/* Add peer form */}
+        {showAddPeer && (
+          <div className="px-5 pb-3">
+            <div className="grid md:grid-cols-4 gap-3 mb-3">
+              <div>
+                <label className="block text-xs font-medium mb-1">Name</label>
+                <input
+                  type="text"
+                  value={newPeer.name}
+                  onChange={(e) => setNewPeer({ ...newPeer, name: e.target.value })}
+                  placeholder="peer-1"
+                  className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1">Host / IP</label>
+                <input
+                  type="text"
+                  value={newPeer.host}
+                  onChange={(e) => setNewPeer({ ...newPeer, host: e.target.value })}
+                  placeholder="192.168.1.100"
+                  className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1">Role</label>
+                <select
+                  value={newPeer.role}
+                  onChange={(e) => setNewPeer({ ...newPeer, role: e.target.value as "BOOTSTRAP" | "PEER" })}
+                  className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                >
+                  <option value="PEER">Worker Peer</option>
+                  <option value="BOOTSTRAP">Bootstrap Peer</option>
+                </select>
+              </div>
+              <div className="flex items-end gap-2">
+                <button
+                  onClick={addPeer}
+                  disabled={!newPeer.name || !newPeer.host}
+                  className="px-4 py-2 rounded-lg bg-gradient-to-r from-neon-purple to-purple-600 text-white text-sm font-medium hover:opacity-90 transition-all disabled:opacity-50"
+                >
+                  Add
+                </button>
+                <button
+                  onClick={() => setShowAddPeer(false)}
+                  className="px-4 py-2 rounded-lg glass text-sm font-medium hover:bg-accent/50 transition-all"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Peer list */}
+        <div className="px-5 pb-5 space-y-3">
+          {peers.length === 0 ? (
+            <div className="text-center py-6">
+              <Monitor className="w-6 h-6 text-muted-foreground mx-auto mb-2" />
+              <p className="text-sm text-muted-foreground">
+                No peers configured. Add peers with their specific CLI arguments.
+              </p>
+            </div>
+          ) : (
+            peers.map((peer) => (
+              <div
+                key={peer.id}
+                className="rounded-lg border border-border/50 bg-accent/20 p-4"
+              >
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    {peer.role === "BOOTSTRAP" ? (
+                      <Radio className="w-4 h-4 text-neon-purple" />
+                    ) : (
+                      <Monitor className="w-4 h-4 text-muted-foreground" />
+                    )}
+                    <span className="font-medium text-sm">{peer.name}</span>
+                    <span className="text-xs font-mono text-muted-foreground">{peer.host}</span>
+                    <span className={`text-xs px-2 py-0.5 rounded-full ${
+                      peer.role === "BOOTSTRAP"
+                        ? "bg-neon-purple/10 text-neon-purple"
+                        : "bg-accent/30 text-muted-foreground"
+                    }`}>
+                      {peer.role}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => removePeer(peer.id)}
+                    className="text-muted-foreground hover:text-red-400 transition-all"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                <label className="block text-xs font-medium text-muted-foreground mb-1">
+                  Peer-specific CLI Arguments
+                </label>
+                <textarea
+                  value={peer.extraArgs}
+                  onChange={(e) => updatePeerExtraArgs(peer.id, e.target.value)}
+                  placeholder={peer.role === "BOOTSTRAP"
+                    ? "--host_maddrs /ip4/0.0.0.0/tcp/31337"
+                    : `--bootstrap_peer /ip4/${peer.host}/tcp/31337/p2p/...`}
+                  rows={2}
+                  className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-xs font-mono resize-y"
+                />
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
       {/* Decentralized architecture note */}
       <div className="glass rounded-xl p-5 border border-border/50">
         <h3 className="font-semibold text-sm mb-2">How Hivemind Training Works</h3>
@@ -187,6 +437,13 @@ export default function HivemindConfigPage() {
         </p>
       </div>
 
+      {/* Error display */}
+      {error && (
+        <div className="glass rounded-xl p-4 border border-red-500/30 bg-red-500/5">
+          <p className="text-sm text-red-400 whitespace-pre-line">{error}</p>
+        </div>
+      )}
+
       {/* Run button */}
       <motion.div
         initial={{ opacity: 0 }}
@@ -194,7 +451,7 @@ export default function HivemindConfigPage() {
         className="glass rounded-xl p-6 border border-border/50 text-center"
       >
         <button
-          onClick={() => setLaunching(true)}
+          onClick={launchAll}
           disabled={launching}
           className="inline-flex items-center gap-3 px-8 py-3 rounded-xl bg-gradient-to-r from-neon-purple to-purple-600 text-white font-bold text-lg hover:opacity-90 transition-all disabled:opacity-50"
           style={{ boxShadow: "0 0 30px rgba(124,58,237,0.2)" }}
@@ -202,7 +459,7 @@ export default function HivemindConfigPage() {
           {launching ? (
             <>
               <Loader2 className="w-5 h-5 animate-spin" />
-              Launching...
+              Launching {peers.length} Peer{peers.length > 1 ? "s" : ""}...
             </>
           ) : (
             <>
@@ -212,7 +469,9 @@ export default function HivemindConfigPage() {
           )}
         </button>
         <p className="text-xs text-muted-foreground mt-3">
-          Launches decentralized training across all configured peers.
+          {peers.length > 0
+            ? `Launches training across ${peers.length} peer${peers.length > 1 ? "s" : ""}`
+            : "Add at least one peer to launch"}
         </p>
       </motion.div>
     </div>

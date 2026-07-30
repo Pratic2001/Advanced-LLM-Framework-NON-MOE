@@ -14,6 +14,7 @@ export interface StageDefinition {
   label: string;
   config: Record<string, any>;
   dependsOn?: string[]; // Stage types this depends on
+  extraArgs?: string;   // Raw CLI args appended to the command
 }
 
 export interface PipelineConfig {
@@ -64,6 +65,7 @@ export class PipelineOrchestrator {
         backend,
         nodeCount: nodeIds?.length || 1,
         gpuCount: 1,
+        extraArgs: stage.extraArgs,
       });
 
       // Create job record
@@ -73,7 +75,9 @@ export class PipelineOrchestrator {
           type: stage.type.toUpperCase() as any,
           backend: backend.toUpperCase() as any,
           status: i === 0 ? "QUEUED" : "PENDING",
-          config: stage.config,
+          config: stage.extraArgs
+            ? { ...stage.config, __extraArgs: stage.extraArgs }
+            : stage.config,
           ...(previousJobId ? { parentJobId: previousJobId } : {}),
         },
       });
@@ -132,10 +136,18 @@ export class PipelineOrchestrator {
     });
 
     // Build and launch the job
+    const storedConfig = nextStage.config as Record<string, any> || {};
+    const storedExtraArgs = typeof storedConfig.__extraArgs === "string"
+      ? storedConfig.__extraArgs
+      : undefined;
+    // Remove __extraArgs so buildFlags doesn't render it as --__extraArgs
+    const { __extraArgs, ...cleanConfig } = storedConfig;
+
     const command = buildCommand({
       script: this.getScriptName(nextStage.jobType),
-      config: nextStage.config as Record<string, any>,
+      config: cleanConfig,
       backend: (nextStage.job.backend as string).toLowerCase() as BackendType,
+      extraArgs: storedExtraArgs,
     });
 
     const success = await this.jobManager.launch(

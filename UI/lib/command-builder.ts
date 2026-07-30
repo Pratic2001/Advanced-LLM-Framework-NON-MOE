@@ -13,6 +13,8 @@ export interface BuildCommandInput {
   nodeCount?: number;
   gpuCount?: number;
   pythonBin?: string;
+  /** Raw CLI arguments appended verbatim after generated flags */
+  extraArgs?: string;
 }
 
 /**
@@ -27,6 +29,7 @@ export function buildCommand(input: BuildCommandInput): string {
     nodeCount = 1,
     gpuCount = 1,
     pythonBin = "python3",
+    extraArgs,
   } = input;
 
   // Base command
@@ -64,6 +67,11 @@ export function buildCommand(input: BuildCommandInput): string {
   // Append flags from config
   const flags = buildFlags(config);
   cmd += ` ${flags}`;
+
+  // Append extra CLI args (pip install through raw text)
+  if (extraArgs && extraArgs.trim()) {
+    cmd += ` ${extraArgs.trim()}`;
+  }
 
   return cmd;
 }
