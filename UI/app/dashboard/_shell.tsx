@@ -249,9 +249,17 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
 
         {/* Page content */}
         <main className="flex-1 p-4 lg:p-6 overflow-auto">
+          {/*
+            Animate page transitions only on top-level tab changes
+            (torchtab / deepspeed / hivemind), not on every micro-pathname
+            update. Using `key={pathname}` re-mounts the entire page tree
+            on any Next.js client-side router normalization (trailing
+            slash, query string, etc.), which tears down long-lived
+            resources like the InteractiveShell's SSE stream mid-flight.
+          */}
           <AnimatePresence mode="wait">
             <motion.div
-              key={pathname}
+              key={activeTab.id}
               initial={{ opacity: 0, y: 4 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -4 }}

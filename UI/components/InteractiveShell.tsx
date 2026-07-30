@@ -1,84 +1,80 @@
-"use client";
-
 /**
- * InteractiveShell — full bash shell embedded in the page.
+ * InteractiveShell
  *
- * browser xterm.js <-- text frames --> server WS --stdin--> node-pty (bash)
- *                                                            |
- *                              stdout/stderr <----------------'
+ * xterm.js backed bash shell that runs on the server. The transport is
+ * SSE (server → client, PTY output) + HTTP POST (client → server, PTY
+ * input / resize / close).
  *
- * xterm.js is mounted with `disableStdin: false` so user typing is forwarded
- * to the PTY. The PTY echoes back through `pty:data` frames so we render the
- * same content the user sees in a real terminal.
+ * Why not WebSocket? Tailscale Funnel aggressively kills WebSocket upgrade
+ * requests within milliseconds of opening, so a plain public HTTPS tunnel
+ * can't carry them. SSE rides on the same long-lived HTTP semantics as a
+ * normal `fetch`, which Funnel lets through.
  *
- * Auth: the WS server reads the Auth.js session cookie (which is httpOnly,
- * so JavaScript can't access it) directly from the upgrade request and
- * authenticates the connection at handshake time. The client never touches
- * the JWT — it just sends `pty:open` after the socket opens.
+ * Wire shape:
+ *   POST /api/shell/open   { cols, rows }                → { sessionId, pid }
+ *   GET  /api/shell/stream?sessionId=…                   → SSE: opened / data / exit
+ *   POST /api/shell/input  { sessionId, data }           → 204
+ *   POST /api/shell/resize { sessionId, cols, rows }     → 204
+ *   POST /api/shell/close  { sessionId }                 → 204 (idempotent)
  *
- * Reconnect: PTY is intentionally NOT auto-reconnected — losing a connection
- * kills the bash process. The user sees a "disconnected" banner and a
- * Reconnect button which starts a fresh shell.
+ * The session cookie is automatically attached to all of these — no extra
+ * handshake step, since `auth()` on the server validates per request.
  */
-
 import {
   forwardRef,
+  useCallback,
   useEffect,
   useImperativeHandle,
   useRef,
   useState,
-  useCallback,
 } from "react";
-import {
-  Terminal as TerminalIcon,
-  Plug,
-  RefreshCw,
-  AlertTriangle,
-  Power,
-} from "lucide-react";
+import { Power, Plug, RefreshCw, Terminal as TerminalIcon, AlertTriangle } from "lucide-react";
 
-type ShellState = "idle" | "connecting" | "connected" | "disconnected" | "error";
+import "@xterm/xterm/css/xterm.css";
 
-export interface InteractiveShellHandle {
-  /**
-   * Paste text into the terminal's input buffer (does NOT auto-execute).
-   * Useful for the example-command chips: click → user sees the command
-   * sitting in the prompt, then presses Enter.
-   */
-  pasteIntoPrompt: (text: string) => void;
-  /** Connect if not already connected. Resolves once `pty:opened` is received. */
-  connect: () => void;
-}
+type Tone = "cyan" | "blue";
 
-interface InteractiveShellProps {
-  /** Optional subtitle shown in the header (e.g. "scoped to REPO_ROOT"). */
-  subtitle?: string;
-  /** Accent color — cyan for torch, blue for deepspeed. */
-  tone: "cyan" | "blue";
-}
-
-const TONE_CLASSES = {
+const TONE_CLASSES: Record<
+  Tone,
+  { border: string; glow: string; text: string }
+> = {
   cyan: {
+    border: "border-neon-cyan/40",
+    glow: "shadow-[0_0_18px_-6px_rgba(34,211,238,0.35)]",
     text: "text-neon-cyan",
-    border: "border-neon-cyan/30",
-    glow: "neon-glow-cyan",
-    headerBorder: "border-neon-cyan/20",
   },
   blue: {
+    border: "border-neon-blue/40",
+    glow: "shadow-[0_0_18px_-6px_rgba(59,130,246,0.35)]",
     text: "text-neon-blue",
-    border: "border-neon-blue/30",
-    glow: "neon-glow-blue",
-    headerBorder: "border-neon-blue/20",
   },
-} as const;
+};
+
+type ShellState =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "disconnected"
+  | "error";
 
 const ANSI = {
   reset: "\x1b[0m",
-  dim: "\x1b[90m",
-  red: "\x1b[31m",
-  yellow: "\x1b[33m",
+  dim: "\x1b[2m",
   green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  red: "\x1b[31m",
 };
+
+export interface InteractiveShellHandle {
+  pasteIntoPrompt: (text: string) => void;
+  connect: () => void;
+  disconnect: () => void;
+}
+
+interface InteractiveShellProps {
+  subtitle?: string;
+  tone?: Tone;
+}
 
 export const InteractiveShell = forwardRef<
   InteractiveShellHandle,
@@ -87,158 +83,161 @@ export const InteractiveShell = forwardRef<
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<any>(null);
   const fitAddonRef = useRef<any>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  // Track whether the PTY has actually opened so we can distinguish
+  // "transport closed before opening" (auth/connect failure) from
+  // "shell exited on its own" (normal exit).
+  const openedRef = useRef<boolean>(false);
+  // Tracks whether the user explicitly disconnected — if so, don't
+  // try to auto-reconnect after the EventSource closes.
+  const intentionallyClosedRef = useRef<boolean>(false);
+  // Holds keystrokes that arrived while we were waiting for `opened`.
+  // Drained once the SSE stream reports the PTY is up.
+  const pendingInputRef = useRef<string>("");
+  // Coalesces rapid keystrokes into one POST every INPUT_BATCH_MS.
+  const inputBufferRef = useRef<string>("");
+  const inputFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const colsRef = useRef<number>(80);
   const rowsRef = useRef<number>(24);
   const connectRef = useRef<() => void>(() => {});
-  // Mirror of `state` that the connect handler can read synchronously
-  // without depending on the closure-captured React state (which would be
-  // stale by the time async ws callbacks fire).
-  const stateRef = useRef<ShellState>("idle");
 
   const [state, _setState] = useState<ShellState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [pid, setPid] = useState<number | null>(null);
 
-  /**
-   * Wrapper that mirrors every state change into `stateRef` so async
-   * WebSocket callbacks can read the *current* connection state without
-   * depending on a (potentially stale) closure-captured `state`.
-   */
-  const setState = useCallback((next: ShellState | ((prev: ShellState) => ShellState)) => {
-    _setState((prev) => {
-      const resolved =
-        typeof next === "function" ? (next as (p: ShellState) => ShellState)(prev) : next;
-      stateRef.current = resolved;
-      return resolved;
-    });
-  }, []);
-
-  const accent = TONE_CLASSES[tone];
-
-  // Expose an imperative API so the example-command chips can paste into
-  // the terminal's prompt (`pasteIntoPrompt`) and so the parent can trigger
-  // a connection from outside (e.g. a "Connect" footer button).
-  useImperativeHandle(
-    ref,
-    () => ({
-      pasteIntoPrompt: (text: string) => {
-        if (!termRef.current) return;
-        if (wsRef.current?.readyState !== WebSocket.OPEN) {
-          // Auto-connect, then paste once the shell is ready.
-          const tryPasteWhenReady = () => {
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
-              wsRef.current.send(JSON.stringify({ type: "pty:input", data: text }));
-            } else {
-              setTimeout(tryPasteWhenReady, 100);
-            }
-          };
-          connectRef.current();
-          tryPasteWhenReady();
-          return;
-        }
-        // Send to the PTY directly so the shell receives the same bytes the
-        // user would have typed. The PTY will echo it back through `pty:data`,
-        // so we don't write to xterm ourselves — that avoids a double-render.
-        wsRef.current.send(JSON.stringify({ type: "pty:input", data: text }));
-      },
-      connect: () => connectRef.current(),
-    }),
+  const setState = useCallback(
+    (next: ShellState | ((prev: ShellState) => ShellState)) => {
+      _setState((prev) => {
+        const resolved =
+          typeof next === "function"
+            ? (next as (p: ShellState) => ShellState)(prev)
+            : next;
+        return resolved;
+      });
+    },
     []
   );
 
-  /** Mount xterm.js once. The terminal is reused across reconnects. */
-  const mountTerminal = useCallback(async () => {
-    if (termRef.current || !containerRef.current) return;
+  // Mirror of `state` readable synchronously inside async callbacks. Kept in
+  // a separate effect-free ref so closures don't capture stale values.
+  const stateRef = useRef<ShellState>("idle");
+  stateRef.current = state;
 
-    const [{ Terminal }, { FitAddon }] = await Promise.all([
-      import("@xterm/xterm"),
-      import("@xterm/addon-fit"),
-    ]);
-    await import("@xterm/xterm/css/xterm.css");
+  const accent = TONE_CLASSES[tone ?? "cyan"];
 
-    if (!containerRef.current) return;
-
-    const term = new Terminal({
-      convertEol: true,
-      cursorBlink: true,
-      fontFamily: '"JetBrains Mono", "Fira Code", Menlo, Consolas, monospace',
-      fontSize: 12,
-      lineHeight: 1.2,
-      scrollback: 10000,
-      theme: {
-        background: "#000000",
-        foreground: "#e5e7eb",
-        cursor: tone === "cyan" ? "#00f0ff" : "#0088ff",
-        selectionBackground: "rgba(0,240,255,0.25)",
-      },
-    });
-
-    const fitAddon = new FitAddon();
-    term.loadAddon(fitAddon);
-    term.open(containerRef.current);
-
-    // Forward typed characters to the PTY via the WebSocket. xterm normalizes
-    // keys into printable strings and arrow/control sequences through `onData`.
-    term.onData((data: string) => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: "pty:input", data }));
-      }
-    });
-
-    // First paint. `fit()` may throw if the container has zero size; the
-    // ResizeObserver below retries.
-    try {
-      fitAddon.fit();
-      colsRef.current = term.cols;
-      rowsRef.current = term.rows;
-    } catch {
-      // ignore
-    }
-
-    termRef.current = term;
-    fitAddonRef.current = fitAddon;
-
-    const observer = new ResizeObserver(() => {
+  /**
+   * POST helper used by all shell endpoints. Uses `fetch` with `keepalive`
+   * so requests fire reliably even when the page is navigating away, and
+   * swallows 204s (the success response on close/input/resize).
+   */
+  const postShell = useCallback(
+    async (path: string, body: unknown): Promise<boolean> => {
       try {
-        fitAddon.fit();
-        const cols = term.cols;
-        const rows = term.rows;
-        if (
-          (cols !== colsRef.current || rows !== rowsRef.current) &&
-          wsRef.current?.readyState === WebSocket.OPEN
-        ) {
-          colsRef.current = cols;
-          rowsRef.current = rows;
-          wsRef.current.send(
-            JSON.stringify({ type: "pty:resize", cols, rows })
-          );
+        const res = await fetch(path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          keepalive: true,
+        });
+        if (res.ok || res.status === 204) return true;
+        // Surface server-side error messages when present.
+        try {
+          const errBody = await res.json();
+          const message =
+            errBody?.error || `Request failed (${res.status})`;
+          if (stateRef.current === "connecting") {
+            setError(message);
+            setState("error");
+          }
+        } catch {
+          if (stateRef.current === "connecting") {
+            setError(`Request failed (${res.status})`);
+            setState("error");
+          }
         }
+        return false;
       } catch {
-        // Ignore transient fit failures during layout shifts.
+        // Network-level failure — leave the current state alone; the
+        // EventSource's `onerror` will report it more accurately.
+        return false;
       }
-    });
-    observer.observe(containerRef.current);
+    },
+    []
+  );
 
-    return () => observer.disconnect();
-  }, [tone]);
+  /**
+   * Flush buffered keystrokes to the server. We coalesce very rapid input
+   * (a paste of several KB) into one POST so we don't drown the server in
+   * tiny requests — but the timer is short (50ms) so it still feels
+   * instant to the user.
+   */
+  const INPUT_BATCH_MS = 50;
 
-  /** Connect to the WS, then open the PTY (server authenticates from cookies). */
-  const connect = useCallback(async () => {
-    // Read the ref, not the closure-captured `state` — by the time a second
-    // click handler fires, `state` may be stale and a second ws would be
-    // opened in parallel.
-    const current = stateRef.current;
-    if (current === "connecting" || current === "connected") return;
-
-    setError(null);
-    setState("connecting");
-
-    // Mount xterm on first connect.
-    if (!termRef.current) {
-      await mountTerminal();
+  const flushInputBuffer = useCallback(() => {
+    const sessionId = sessionIdRef.current;
+    const buffered = inputBufferRef.current;
+    inputBufferRef.current = "";
+    if (inputFlushTimerRef.current) {
+      clearTimeout(inputFlushTimerRef.current);
+      inputFlushTimerRef.current = null;
     }
+    if (!sessionId || buffered.length === 0) return;
+    void postShell("/api/shell/input", { sessionId, data: buffered });
+  }, [postShell]);
 
+  const queueInput = useCallback(
+    (data: string) => {
+      // If the PTY isn't open yet, hold the input until it is — otherwise
+      // the server will return 404 and the keystrokes would be lost.
+      if (!openedRef.current || !sessionIdRef.current) {
+        pendingInputRef.current += data;
+        return;
+      }
+      inputBufferRef.current += data;
+      if (inputFlushTimerRef.current) return;
+      inputFlushTimerRef.current = setTimeout(() => {
+        flushInputBuffer();
+      }, INPUT_BATCH_MS);
+    },
+    [flushInputBuffer]
+  );
+
+  /**
+   * Tear down the current session: close the EventSource, kill the PTY
+   * (idempotent on the server), and clear local refs. Used by both
+   * `disconnect` and the cleanup path on unmount.
+   */
+  const tearDownTransport = useCallback(() => {
+    const sessionId = sessionIdRef.current;
+    if (eventSourceRef.current) {
+      try {
+        eventSourceRef.current.close();
+      } catch {}
+      eventSourceRef.current = null;
+    }
+    if (sessionId) {
+      // Fire-and-forget; the server treats this as idempotent.
+      void postShell("/api/shell/close", { sessionId });
+      sessionIdRef.current = null;
+    }
+    openedRef.current = false;
+    pendingInputRef.current = "";
+    if (inputFlushTimerRef.current) {
+      clearTimeout(inputFlushTimerRef.current);
+      inputFlushTimerRef.current = null;
+    }
+    inputBufferRef.current = "";
+  }, [postShell]);
+
+  /**
+   * Open a new PTY on the server, then attach an EventSource to stream
+   * its output. Used for the initial connection and for reconnects.
+   */
+  const connect = useCallback(async () => {
+    if (stateRef.current === "connecting" || stateRef.current === "connected") {
+      return;
+    }
     if (!termRef.current) {
       setState("error");
       setError("Terminal failed to initialize");
@@ -246,140 +245,155 @@ export const InteractiveShell = forwardRef<
     }
 
     const term = termRef.current;
+    setError(null);
+    intentionallyClosedRef.current = false;
+    setState("connecting");
     term.writeln(`${ANSI.dim}# Connecting to interactive shell...${ANSI.reset}`);
 
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/api/ws`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
-
-    let opened = false;
-
-    ws.onopen = () => {
-      // The server reads the Auth.js session cookie from the upgrade request
-      // at connection time. Nothing for the client to send for auth.
-      // Subscribe to dashboard broadcasts (job updates) anyway.
-      ws.send(JSON.stringify({ type: "subscribe", channel: "dashboard" }));
-      // Open the PTY immediately.
-      ws.send(
-        JSON.stringify({
-          type: "pty:open",
+    // 1. Open a PTY session on the server.
+    let sessionId: string;
+    try {
+      const res = await fetch("/api/shell/open", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
           cols: colsRef.current,
           rows: rowsRef.current,
-        })
-      );
-    };
-
-    ws.onmessage = (event) => {
-      let msg: any;
-      try {
-        msg = JSON.parse(event.data);
-      } catch {
+        }),
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => null);
+        const message = errBody?.error || `Open failed (${res.status})`;
+        term.writeln(`${ANSI.red}# ${message}${ANSI.reset}`);
+        setError(message);
+        setState("error");
         return;
       }
-
-      switch (msg.type) {
-        case "pty:opened":
-          opened = true;
-          setPid(msg.pid);
-          setState("connected");
-          term.writeln(
-            `${ANSI.green}# Connected (pid=${msg.pid}, ${msg.activePtys} active shells)${ANSI.reset}`
-          );
-          break;
-
-        case "pty:data":
-          if (typeof msg.data === "string") {
-            term.write(msg.data);
-          }
-          break;
-
-        case "pty:exit":
-          setState("disconnected");
-          term.writeln(
-            `\r\n${ANSI.yellow}# Shell exited (code=${msg.exitCode}, signal=${msg.signal ?? 0})${ANSI.reset}`
-          );
-          break;
-
-        case "pty:err":
-          setState("error");
-          setError(msg.error || "PTY error");
-          term.writeln(`${ANSI.red}# ${msg.error || "PTY error"}${ANSI.reset}`);
-          break;
+      const data = await res.json();
+      sessionId = data.sessionId;
+      if (!sessionId) {
+        const message = "Server returned no sessionId";
+        term.writeln(`${ANSI.red}# ${message}${ANSI.reset}`);
+        setError(message);
+        setState("error");
+        return;
       }
-    };
-
-    ws.onclose = (event) => {
-      if (opened) {
-        setState((prev) => {
-          if (prev === "disconnected") return prev;
-          if (termRef.current) {
-            termRef.current.writeln(
-              `\r\n${ANSI.yellow}# Connection closed.${ANSI.reset}`
-            );
-          }
-          return "disconnected";
-        });
-      } else {
-        // Closed before the PTY ever opened — most likely an auth failure
-        // (the server closes with 1008 "Not authenticated" when the session
-        // cookie is missing/invalid). Surface a clear error instead of
-        // leaving the user stuck in "connecting".
-        const reason = event.reason || "Connection closed before shell opened";
-        setState((prev) => {
-          if (prev === "connected" || prev === "disconnected") return prev;
-          if (termRef.current) {
-            termRef.current.writeln(
-              `${ANSI.red}# ${reason}${ANSI.reset}`
-            );
-          }
-          setError(reason);
-          return "error";
-        });
-      }
-      wsRef.current = null;
-    };
-
-    ws.onerror = () => {
-      // Functional setter — reads latest state without depending on the
-      // closure-captured value (which can be stale by the time onerror fires).
-      setState((prev) => {
-        if (prev !== "connecting") return prev;
-        setError("WebSocket connection failed");
-        return "error";
-      });
-    };
-  }, [mountTerminal]);
-
-  /** Tidy disconnect: close WS, kill PTY, leave terminal buffer visible. */
-  const disconnect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "pty:close" }));
-      try {
-        wsRef.current.close();
-      } catch {}
+      sessionIdRef.current = sessionId;
+    } catch (err: any) {
+      const message = err?.message || "Failed to reach /api/shell/open";
+      term.writeln(`${ANSI.red}# ${message}${ANSI.reset}`);
+      setError(message);
+      setState("error");
+      return;
     }
-    wsRef.current = null;
+
+    // 2. Open the SSE stream for this session.
+    const es = new EventSource(
+      `/api/shell/stream?sessionId=${encodeURIComponent(sessionId)}`
+    );
+    eventSourceRef.current = es;
+
+    es.addEventListener("opened", (ev: MessageEvent) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        openedRef.current = true;
+        setPid(typeof payload?.pid === "number" ? payload.pid : null);
+        setState("connected");
+        term.writeln(
+          `${ANSI.green}# Connected (pid=${payload?.pid ?? "?"}${
+            typeof payload?.activePtys === "number"
+              ? `, ${payload.activePtys} active shells`
+              : ""
+          })${ANSI.reset}`
+        );
+        // Drain any keystrokes that arrived while we were waiting.
+        const pending = pendingInputRef.current;
+        if (pending) {
+          pendingInputRef.current = "";
+          queueInput(pending);
+        }
+      } catch {
+        // Malformed payload — treat as error so the user sees a message
+        // instead of a silently broken terminal.
+        setState("error");
+        setError("Malformed 'opened' event from server");
+      }
+    });
+
+    es.addEventListener("data", (ev: MessageEvent) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        if (typeof payload?.data === "string") {
+          term.write(payload.data);
+        }
+      } catch {
+        // Ignore unparseable data frames — they're transient and the next
+        // frame will usually still be useful.
+      }
+    });
+
+    es.addEventListener("exit", (ev: MessageEvent) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        openedRef.current = false;
+        term.writeln(
+          `\r\n${ANSI.yellow}# Shell exited (code=${payload?.exitCode ?? "?"}, signal=${
+            payload?.signal ?? 0
+          })${ANSI.reset}`
+        );
+        // If we hadn't marked this disconnect as intentional, leave the
+        // state machine in "disconnected" so the user can reconnect.
+        setState((prev) =>
+          prev === "error" ? prev : intentionallyClosedRef.current ? prev : "disconnected"
+        );
+      } catch {
+        openedRef.current = false;
+        setState((prev) => (prev === "error" ? prev : "disconnected"));
+      }
+      // The EventSource will close on its own after the server's `close()`
+      // call in the stream route — let it.
+    });
+
+    es.addEventListener("error", () => {
+      // EventSource auto-reconnects internally on transient errors, but
+      // closes the connection if it gets a non-recoverable status. We
+      // treat an outright close as a transport failure unless the user
+      // asked for it.
+      if (intentionallyClosedRef.current) return;
+      openedRef.current = false;
+      setState((prev) => {
+        if (prev === "connected") {
+          term.writeln(
+            `\r\n${ANSI.yellow}# Connection lost. Reconnecting...${ANSI.reset}`
+          );
+          return "connecting";
+        }
+        if (prev === "connecting") {
+          term.writeln(
+            `${ANSI.red}# Connection closed before shell opened${ANSI.reset}`
+          );
+          setError("Connection closed before shell opened");
+          return "error";
+        }
+        return prev;
+      });
+    });
+  }, [queueInput]);
+
+  /** Tidy disconnect: kill the PTY, leave the terminal buffer visible. */
+  const disconnect = useCallback(() => {
+    intentionallyClosedRef.current = true;
+    tearDownTransport();
     setPid(null);
     setState("disconnected");
     if (termRef.current) {
-      termRef.current.writeln(
-        `\r\n${ANSI.yellow}# Disconnected.${ANSI.reset}`
-      );
+      termRef.current.writeln(`\r\n${ANSI.yellow}# Disconnected.${ANSI.reset}`);
     }
-  }, []);
+  }, [tearDownTransport]);
 
   /** Tear down the whole terminal (used on unmount). */
   const dispose = useCallback(() => {
-    if (wsRef.current) {
-      try {
-        wsRef.current.send(JSON.stringify({ type: "pty:close" }));
-      } catch {}
-      try {
-        wsRef.current.close();
-      } catch {}
-      wsRef.current = null;
-    }
+    tearDownTransport();
     if (termRef.current) {
       try {
         termRef.current.dispose();
@@ -388,9 +402,76 @@ export const InteractiveShell = forwardRef<
     }
     fitAddonRef.current = null;
     setPid(null);
-  }, []);
+  }, [tearDownTransport]);
 
-  // Mount terminal on first render (it persists across reconnects).
+  useImperativeHandle(
+    ref,
+    () => ({
+      pasteIntoPrompt: (text: string) => {
+        if (!termRef.current) return;
+        // If the PTY isn't open yet, just queue the text — once `opened`
+        // arrives, `connect` will drain pendingInputRef automatically.
+        queueInput(text);
+        if (stateRef.current !== "connected") {
+          connectRef.current();
+        }
+      },
+      connect,
+      disconnect,
+    }),
+    [connect, disconnect, queueInput]
+  );
+
+  // Keep the imperative handle's `connect` callback fresh so chips and
+  // external buttons always invoke the latest version.
+  connectRef.current = connect;
+
+  /** Mount xterm.js once on first render. */
+  const mountTerminal = useCallback(async () => {
+    if (termRef.current || !containerRef.current) return;
+
+    const [{ Terminal }, { FitAddon }] = await Promise.all([
+      import("@xterm/xterm"),
+      import("@xterm/addon-fit"),
+    ]);
+
+    const fit = new FitAddon();
+    const term = new Terminal({
+      fontFamily:
+        '"JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace, monospace',
+      fontSize: 13,
+      lineHeight: 1.2,
+      cursorBlink: true,
+      convertEol: true,
+      scrollback: 5000,
+      theme: {
+        background: "#000000",
+        foreground: "#e5e7eb",
+        cursor: "#22d3ee",
+        selectionBackground: "#0e7490",
+      },
+    });
+    term.loadAddon(fit);
+    term.open(containerRef.current);
+    fit.fit();
+
+    termRef.current = term;
+    fitAddonRef.current = fit;
+
+    colsRef.current = term.cols;
+    rowsRef.current = term.rows;
+
+    // Forward keystrokes to the PTY (queued; flushed in batches).
+    term.onData((data: string) => {
+      queueInput(data);
+    });
+
+    // Initial welcome — gives the user something to see before they hit
+    // Connect.
+    term.writeln(`${ANSI.dim}# Interactive shell — press Connect.${ANSI.reset}`);
+  }, [queueInput]);
+
+  // Mount the terminal on first render, dispose on unmount.
   useEffect(() => {
     mountTerminal();
     return () => {
@@ -399,12 +480,34 @@ export const InteractiveShell = forwardRef<
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Resize the PTY whenever the visible size of the terminal changes.
+  // We avoid sending a resize on the very first paint — xterm fires one
+  // synchronously after open() before the user has had a chance to size
+  // anything, and the server's `getSession` check requires the sessionId
+  // to be valid, which it isn't until after `connect()`.
+  useEffect(() => {
+    const handler = () => {
+      if (!termRef.current || !fitAddonRef.current) return;
+      try {
+        fitAddonRef.current.fit();
+      } catch {}
+      colsRef.current = termRef.current.cols;
+      rowsRef.current = termRef.current.rows;
+      const sessionId = sessionIdRef.current;
+      if (sessionId && openedRef.current) {
+        void postShell("/api/shell/resize", {
+          sessionId,
+          cols: colsRef.current,
+          rows: rowsRef.current,
+        });
+      }
+    };
+    window.addEventListener("resize", handler);
+    return () => window.removeEventListener("resize", handler);
+  }, [postShell]);
+
   const isConnected = state === "connected";
   const isBusy = state === "connecting";
-
-  // Keep the imperative handle's `connect` callback fresh so the parent can
-  // trigger a connection from chips / external buttons.
-  connectRef.current = connect;
 
   return (
     <section className="space-y-3">
@@ -417,7 +520,7 @@ export const InteractiveShell = forwardRef<
           </span>
         </h2>
         <div className="flex items-center gap-2">
-          <ShellStateBadge state={state} pid={pid} tone={tone} />
+          <ShellStateBadge state={state} pid={pid} tone={accent} />
           {isConnected ? (
             <button
               onClick={disconnect}
@@ -483,7 +586,7 @@ function ShellStateBadge({
 }: {
   state: ShellState;
   pid: number | null;
-  tone: "cyan" | "blue";
+  tone: { text: string };
 }) {
   const map: Record<ShellState, { label: string; className: string; pulsing?: boolean }> = {
     idle: {
@@ -497,10 +600,7 @@ function ShellStateBadge({
     },
     connected: {
       label: pid ? `running · pid ${pid}` : "running",
-      className:
-        tone === "cyan"
-          ? "bg-neon-cyan/10 text-neon-cyan border border-neon-cyan/30"
-          : "bg-neon-blue/10 text-neon-blue border border-neon-blue/30",
+      className: `${tone.text} bg-accent/30 border border-current/30`,
       pulsing: true,
     },
     disconnected: {
