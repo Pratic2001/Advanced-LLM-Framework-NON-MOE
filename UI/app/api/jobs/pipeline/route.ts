@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import prisma from "@/lib/db";
-import { buildCommand } from "@/lib/command-builder";
-import type { ScriptName, BackendType } from "@/lib/schema";
+import { getPipelineOrchestrator } from "@/lib/pipeline-orchestrator";
+import type { BackendType } from "@/lib/schema";
 
 export async function POST(req: Request) {
   const session = await getServerSession();
@@ -30,69 +30,38 @@ export async function POST(req: Request) {
     );
   }
 
-  // Create pipeline record
-  const pipeline = await prisma.pipeline.create({
-    data: {
-      userId: session.user.id,
-      name,
-      backend: backend.toUpperCase() as any,
-      status: "PENDING",
-    },
+  const orchestrator = getPipelineOrchestrator();
+
+  const pipelineId = await orchestrator.launch({
+    name,
+    userId: session.user.id,
+    backend,
+    stages: stages.map((s) => ({
+      type: normalizeStageType(s.type),
+      label: s.type,
+      config: s.config,
+    })),
+    nodeIds,
   });
 
-  // Create pipeline stages and initial jobs
-  for (let i = 0; i < stages.length; i++) {
-    const stage = stages[i];
-    const scriptName = getScriptName(stage.type);
-
-    const command = buildCommand({
-      script: scriptName,
-      config: stage.config,
-      backend,
-      nodeCount: nodeIds?.length || 1,
-      gpuCount: 1,
-    });
-
-    const job = await prisma.job.create({
-      data: {
-        userId: session.user.id,
-        type: stage.type.toUpperCase() as any,
-        backend: backend.toUpperCase() as any,
-        status: i === 0 ? "QUEUED" : "PENDING",
-        config: stage.config,
-      },
-    });
-
-    await prisma.pipelineStage.create({
-      data: {
-        pipelineId: pipeline.id,
-        stageOrder: i,
-        jobType: stage.type.toUpperCase(),
-        config: stage.config,
-        status: i === 0 ? "WAITING" : "PENDING",
-        jobId: job.id,
-      },
-    });
-  }
-
-  const fullPipeline = await prisma.pipeline.findUnique({
-    where: { id: pipeline.id },
+  const pipeline = await prisma.pipeline.findUnique({
+    where: { id: pipelineId },
     include: {
       stages: { orderBy: { stageOrder: "asc" } },
     },
   });
 
-  return NextResponse.json(fullPipeline, { status: 201 });
+  return NextResponse.json(pipeline, { status: 201 });
 }
 
-function getScriptName(type: string): ScriptName {
-  const map: Record<string, ScriptName> = {
-    tokenizer: "tokenizer_train.py",
-    packing: "hf_to_packed.py",
-    pretrain: "train_pretrain.py",
-    sft: "train_sft.py",
-    grpo: "train_grpo.py",
-    dpo: "train_dpo.py",
+function normalizeStageType(type: string): string {
+  const map: Record<string, string> = {
+    tokenizer: "TOKENIZER_TRAIN",
+    packing: "PACK_PRETRAIN",
+    pretrain: "PRETRAIN",
+    sft: "SFT",
+    grpo: "GRPO",
+    dpo: "DPO",
   };
-  return map[type.toLowerCase()] || "train_pretrain.py";
+  return map[type.toLowerCase()] || type.toUpperCase();
 }

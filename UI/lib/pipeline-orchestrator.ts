@@ -161,7 +161,9 @@ export class PipelineOrchestrator {
     }
 
     // Listen for job completion to launch next stage
-    this.jobManager.once(`job:status:${nextStage.job.id}`, async (event) => {
+    // JobManager emits "job:status" with jobId in event data — filter by our job ID
+    const onStatus = async (event: any) => {
+      if (event.jobId !== nextStage.job.id) return;
       const status = event.data.status;
       if (status === "COMPLETED") {
         await prisma.pipelineStage.update({
@@ -184,7 +186,9 @@ export class PipelineOrchestrator {
         // Send pipeline failure alert
         this.sendPipelineAlert(pipelineId, nextStage);
       }
-    });
+    };
+
+    this.jobManager.on("job:status", onStatus);
   }
 
   /**

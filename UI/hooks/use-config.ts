@@ -76,6 +76,7 @@ export function useConfigPreset(configId: string) {
     fetch(`/api/configs/${configId}`)
       .then((r) => r.json())
       .then(setPreset)
+      .catch(() => setPreset(null))
       .finally(() => setLoading(false));
   }, [configId]);
 

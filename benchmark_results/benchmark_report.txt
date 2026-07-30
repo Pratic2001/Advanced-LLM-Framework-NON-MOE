@@ -1,0 +1,51 @@
+=================================================================
+  Hardware Benchmark & Hyperparameter Report
+=================================================================
+
+── Hardware Profile ──────────────────────────────────────
+  GPU              : NVIDIA GeForce RTX 3050
+  VRAM total       : 6.0 GiB (6144 MiB)
+  CPU RAM          : 15.5 GiB
+  CPU cores        : 12
+  Python           : 3.13.9
+  CUDA available   : Yes
+
+── Model Size Ceiling (estimated) ────────────────────────
+  Benchmark model size : 0.3B
+  AdamW (no ckpt)      : 292M
+  AdamW (+ckpt)        : 437M
+  Muon (no ckpt)       : 874M
+  Muon (+ckpt)         : 872M
+
+  → Up to 292M with AdamW + gradient checkpointing
+  → Up to 874M with Muon + gradient checkpointing
+
+── Training Benchmark Results ────────────────────────────
+
+── Recommended Pipeline Commands ─────────────────────────
+
+  # These commands are tailored to your hardware based on benchmarks.
+
+  # 1. Data preparation (run once per machine)
+  python tokenizer_train.py --data-dir ./data --output-dir ./tokenizer --vocab-size 65536 --mode reasoning
+  python data/pack_pretrain.py --data-dir ./data --tokenizer ./tokenizer --cache-dir ./packed --seq-length 2048 --val-fraction 0.01
+
+  # 2. Pretrain
+  python train_pretrain.py --model-size 0.3B --data-dir ./packed --seq-len 2048 --batch-size 4 --grad-accum 4 --num-steps 100000 --dtype bf16 --gradient-checkpointing --optimizer muon --schedule wsd --stable-ratio 0.8 --lr 3e-4 --checkpoint-dir ./checkpoints/pretrain
+
+  # 3. SFT (LoRA)
+  python train_sft.py --checkpoint-dir ./checkpoints/pretrain/latest.pt --data-dir ./sft_packed --output-dir ./checkpoints/sft --batch-size 2 --grad-accum 4 --num-steps 10000 --lora-rank 32 --lora-alpha 64 --dtype bf16 --lr 2e-5 --ckpt-interval 1000
+
+  # 4. GRPO (RL, requires SFT checkpoint)
+  python train_grpo.py --checkpoint ./checkpoints/sft/latest.pt --tokenizer ./tokenizer --data-dir ./grpo_packed --out-dir ./checkpoints/grpo --batch-size 1 --num-steps 500 --num-generations 4 --max-new-tokens 512 --lora --lora-rank 32 --lora-alpha 64 --dtype bf16 --lr 1e-6 --kl-coef 0.02 --clip-range 0.2
+
+  # 5. DPO (preference tuning, requires SFT checkpoint)
+  python train_dpo.py --checkpoint ./checkpoints/sft/latest.pt --tokenizer ./tokenizer --data-dir ./dpo_packed --out-dir ./checkpoints/dpo --batch-size 1 --num-steps 500 --beta 0.1 --lora --lora-rank 32 --lora-alpha 64 --dtype bf16 --lr 1e-6
+
+── Tips ──────────────────────────────────────────────────
+
+  ✅ You have enough headroom for Muon optimizer (saves ~2x VRAM vs AdamW).
+  💡 Consider Muon over AdamW — it offers 50%+ larger model capacity.
+  💡 Use --gradient-checkpointing for any model > 1B parameters.
+  💡 For production: increase --num-steps to convergence (100K+).
+  💡 Benchmark precision: run --full to get stable measurements.

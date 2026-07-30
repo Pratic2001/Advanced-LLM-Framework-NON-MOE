@@ -11,7 +11,6 @@
 import { createServer } from "http";
 import { parse } from "url";
 import next from "next";
-import { WebSocketServer } from "ws";
 import { getWSManager } from "./lib/ws-manager";
 
 const dev = process.env.NODE_ENV !== "production";
@@ -27,56 +26,8 @@ app.prepare().then(() => {
     handle(req, res, parsedUrl);
   });
 
-  // Initialize WebSocket server
-  const wss = new WebSocketServer({ server, path: "/api/ws" });
-
-  wss.on("connection", (ws, req) => {
-    console.log("[WS] Client connected");
-
-    ws.on("message", (data: Buffer) => {
-      try {
-        const message = JSON.parse(data.toString());
-
-        switch (message.type) {
-          case "subscribe":
-            console.log(`[WS] Client subscribed to: ${message.jobId || message.channel}`);
-            ws.send(
-              JSON.stringify({
-                type: "subscribed",
-                channel: message.jobId || message.channel,
-                timestamp: new Date().toISOString(),
-              })
-            );
-            break;
-          case "unsubscribe":
-            console.log(`[WS] Client unsubscribed from: ${message.jobId || message.channel}`);
-            break;
-          default:
-            ws.send(
-              JSON.stringify({
-                type: "echo",
-                ...message,
-                timestamp: new Date().toISOString(),
-              })
-            );
-        }
-      } catch {
-        ws.send(JSON.stringify({ type: "error", message: "Invalid JSON" }));
-      }
-    });
-
-    ws.on("close", () => {
-      console.log("[WS] Client disconnected");
-    });
-
-    // Send connection confirmation
-    ws.send(
-      JSON.stringify({
-        type: "connected",
-        timestamp: new Date().toISOString(),
-      })
-    );
-  });
+  // Initialize WebSocket manager (broadcasts job events to subscribed clients)
+  getWSManager().init(server);
 
   server.listen(port, () => {
     console.log(

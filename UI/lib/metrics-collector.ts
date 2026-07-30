@@ -34,7 +34,7 @@ export class MetricsCollector {
     const step = extractStep(line);
     const parsed = parseMetricLine(line);
 
-    if (!step || !parsed) return null;
+    if (step === undefined || step === null || !parsed) return null;
 
     const metrics: ParsedMetrics = {
       step,

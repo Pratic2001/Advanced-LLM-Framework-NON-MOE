@@ -14,6 +14,10 @@ export function useMetricsStream(jobId: string) {
   const [lrData, setLrData] = useState<{ step: number; lr: number }[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
 
+  // Use refs to avoid stale closures in the polling interval
+  const lossDataRef = useRef(lossData);
+  lossDataRef.current = lossData;
+
   useEffect(() => {
     if (!jobId) return;
 
@@ -44,9 +48,10 @@ export function useMetricsStream(jobId: string) {
     // Poll for new metrics
     const interval = setInterval(async () => {
       try {
-        const lastStep = lossData[lossData.length - 1]?.step || 0;
+        const currentData = lossDataRef.current;
+        const lastStep = currentData[currentData.length - 1]?.step ?? 0;
         const res = await fetch(
-          `/api/jobs/${jobId}/metrics?after=${lastStep}&limit=100`
+          `/api/jobs/${jobId}/metrics?after=${lastStep}&limit=500`
         );
         const newMetrics = await res.json();
 

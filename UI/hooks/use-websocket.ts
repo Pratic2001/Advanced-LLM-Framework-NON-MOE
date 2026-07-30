@@ -22,6 +22,10 @@ export function useWebSocket(
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
 
+  // Keep callbacks in a ref to avoid unstable dependency identity
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
+
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
@@ -46,21 +50,22 @@ export function useWebSocket(
         const data = JSON.parse(event.data);
         setLastMessage(data);
 
+        const opts = optionsRef.current;
         switch (data.type) {
           case "status":
-            options.onStatus?.(data);
+            opts.onStatus?.(data);
             break;
           case "metric":
-            options.onMetric?.(data);
+            opts.onMetric?.(data);
             break;
           case "log":
-            options.onLog?.(data);
+            opts.onLog?.(data);
             break;
           case "error":
-            options.onError?.(data);
+            opts.onError?.(data);
             break;
           default:
-            options.onMessage?.(data);
+            opts.onMessage?.(data);
         }
       } catch {}
     };
@@ -74,7 +79,7 @@ export function useWebSocket(
     ws.onerror = () => {
       ws.close();
     };
-  }, [jobId, options]);
+  }, [jobId]); // Only reconnect when jobId changes — options via ref
 
   const disconnect = useCallback(() => {
     if (reconnectTimeoutRef.current) {

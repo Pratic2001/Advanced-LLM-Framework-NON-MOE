@@ -102,7 +102,7 @@ export function useLaunchJob() {
   const [error, setError] = useState<string | null>(null);
 
   const launch = async (params: {
-    type: string;
+    type: ScriptName;
     backend: BackendType;
     config: Record<string, any>;
     nodeIds?: string[];

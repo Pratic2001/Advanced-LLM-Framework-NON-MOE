@@ -147,7 +147,7 @@ export default function DashboardLayout({
                 href={tab.href}
                 className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-all ${
                   isActive
-                    ? `bg-${tab.color}/10 text-${tab.color} border border-${tab.color}/20`
+                    ? "text-muted-foreground border"
                     : "text-muted-foreground hover:text-foreground hover:bg-accent/50"
                 }`}
                 style={

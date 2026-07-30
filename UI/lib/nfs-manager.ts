@@ -3,7 +3,10 @@
  * Manages NFS server setup and client mounts
  */
 
-import { execSync } from "child_process";
+import { exec } from "child_process";
+import { promisify } from "util";
+
+const asyncExec = promisify(exec);
 
 export interface NFSConfig {
   exportPath: string;
@@ -15,9 +18,9 @@ export class NFSManager {
   /**
    * Check if NFS server packages are installed
    */
-  static isServerInstalled(): boolean {
+  static async isServerInstalled(): Promise<boolean> {
     try {
-      execSync("dpkg -l nfs-kernel-server 2>/dev/null | grep -q ^ii", {
+      await asyncExec("dpkg -l nfs-kernel-server 2>/dev/null | grep -q ^ii", {
         timeout: 5000,
       });
       return true;
@@ -29,9 +32,11 @@ export class NFSManager {
   /**
    * Check if NFS common packages are installed (client)
    */
-  static isClientInstalled(): boolean {
+  static async isClientInstalled(): Promise<boolean> {
     try {
-      execSync("dpkg -l nfs-common 2>/dev/null | grep -q ^ii", { timeout: 5000 });
+      await asyncExec("dpkg -l nfs-common 2>/dev/null | grep -q ^ii", {
+        timeout: 5000,
+      });
       return true;
     } catch {
       return false;
@@ -41,42 +46,47 @@ export class NFSManager {
   /**
    * Create NFS export directory and set permissions
    */
-  static setupExportDir(exportPath: string): void {
-    execSync(`sudo mkdir -p ${exportPath}`, { timeout: 10000 });
-    execSync(`sudo chown -R $(whoami):$(whoami) ${exportPath}`, { timeout: 10000 });
-    execSync(`sudo chmod 755 ${exportPath}`, { timeout: 5000 });
+  static async setupExportDir(exportPath: string): Promise<void> {
+    await asyncExec(`sudo mkdir -p ${exportPath}`, { timeout: 10000 });
+    await asyncExec(`sudo chown -R $(whoami):$(whoami) ${exportPath}`, {
+      timeout: 10000,
+    });
+    await asyncExec(`sudo chmod 755 ${exportPath}`, { timeout: 5000 });
   }
 
   /**
    * Add an export to /etc/exports
    */
-  static addExport(config: NFSConfig): void {
+  static async addExport(config: NFSConfig): Promise<void> {
     const options = config.options || "rw,sync,no_subtree_check,no_root_squash";
     const line = `${config.exportPath} ${config.clients.join(" ")}(${options})`;
 
     // Check if export already exists
-    const exports = execSync("sudo cat /etc/exports 2>/dev/null || echo ''")
-      .toString()
-      .trim();
+    const { stdout: exports } = await asyncExec(
+      "sudo cat /etc/exports 2>/dev/null || echo ''",
+      { timeout: 5000 }
+    );
 
     if (!exports.includes(config.exportPath)) {
-      execSync(`echo "${line}" | sudo tee -a /etc/exports`, { timeout: 5000 });
+      await asyncExec(`echo "${line}" | sudo tee -a /etc/exports`, {
+        timeout: 5000,
+      });
     }
 
     // Reload exports
-    execSync("sudo exportfs -ra", { timeout: 10000 });
+    await asyncExec("sudo exportfs -ra", { timeout: 10000 });
   }
 
   /**
    * Mount NFS on a client
    */
-  static mountClient(
+  static async mountClient(
     serverIp: string,
     exportPath: string,
     mountPoint: string
-  ): void {
-    execSync(`sudo mkdir -p ${mountPoint}`, { timeout: 5000 });
-    execSync(`sudo mount -t nfs ${serverIp}:${exportPath} ${mountPoint}`, {
+  ): Promise<void> {
+    await asyncExec(`sudo mkdir -p ${mountPoint}`, { timeout: 5000 });
+    await asyncExec(`sudo mount -t nfs ${serverIp}:${exportPath} ${mountPoint}`, {
       timeout: 15000,
     });
   }
@@ -84,9 +94,9 @@ export class NFSManager {
   /**
    * Unmount NFS
    */
-  static unmount(mountPoint: string): void {
+  static async unmount(mountPoint: string): Promise<void> {
     try {
-      execSync(`sudo umount ${mountPoint}`, { timeout: 10000 });
+      await asyncExec(`sudo umount ${mountPoint}`, { timeout: 10000 });
     } catch {
       // Not mounted or already unmounted
     }
@@ -95,25 +105,31 @@ export class NFSManager {
   /**
    * Add NFS mount to /etc/fstab for persistence across reboots
    */
-  static addToFstab(
+  static async addToFstab(
     serverIp: string,
     exportPath: string,
     mountPoint: string
-  ): void {
+  ): Promise<void> {
     const fstabLine = `${serverIp}:${exportPath} ${mountPoint} nfs rw,defaults 0 0`;
 
-    const fstab = execSync("sudo cat /etc/fstab").toString();
+    const { stdout: fstab } = await asyncExec("sudo cat /etc/fstab", {
+      timeout: 5000,
+    });
     if (!fstab.includes(mountPoint)) {
-      execSync(`echo "${fstabLine}" | sudo tee -a /etc/fstab`, { timeout: 5000 });
+      await asyncExec(`echo "${fstabLine}" | sudo tee -a /etc/fstab`, {
+        timeout: 5000,
+      });
     }
   }
 
   /**
    * Check if NFS is mounted at a path
    */
-  static isMounted(mountPoint: string): boolean {
+  static async isMounted(mountPoint: string): Promise<boolean> {
     try {
-      const output = execSync("mount | grep nfs", { timeout: 5000 }).toString();
+      const { stdout: output } = await asyncExec("mount | grep nfs", {
+        timeout: 5000,
+      });
       return output.includes(mountPoint);
     } catch {
       return false;
