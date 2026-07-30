@@ -69,15 +69,15 @@ export class PipelineOrchestrator {
       });
 
       // Create job record
-      const job = await prisma.job.create({
+      const job: any = await prisma.job.create({
         data: {
           userId,
           type: stage.type.toUpperCase() as any,
           backend: backend.toUpperCase() as any,
           status: i === 0 ? "QUEUED" : "PENDING",
-          config: stage.extraArgs
+          config: (stage.extraArgs
             ? { ...stage.config, __extraArgs: stage.extraArgs }
-            : stage.config,
+            : stage.config) as any,
           ...(previousJobId ? { parentJobId: previousJobId } : {}),
         },
       });
@@ -87,10 +87,10 @@ export class PipelineOrchestrator {
         data: {
           pipelineId: pipeline.id,
           stageOrder: i,
-          jobType: stage.type.toUpperCase(),
-          config: stage.config,
+          jobType: stage.type.toUpperCase() as any,
+          config: stage.config as any,
           status: i === 0 ? "WAITING" : "PENDING",
-          jobId: job.id,
+          job: { connect: { id: job.id } },
         },
       });
 
@@ -175,7 +175,7 @@ export class PipelineOrchestrator {
     // Listen for job completion to launch next stage
     // JobManager emits "job:status" with jobId in event data — filter by our job ID
     const onStatus = async (event: any) => {
-      if (event.jobId !== nextStage.job.id) return;
+      if (event.jobId !== nextStage.job!.id) return;
       const status = event.data.status;
       if (status === "COMPLETED") {
         await prisma.pipelineStage.update({

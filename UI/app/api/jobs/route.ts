@@ -1,11 +1,12 @@
 import { NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
+import { auth } from "@/lib/auth";
 import prisma from "@/lib/db";
 import { buildCommand } from "@/lib/command-builder";
-import type { ScriptName, BackendType } from "@/lib/schema";
+import type { ScriptName } from "@/lib/schema";
+import { createJobSchema, formatZodErrors } from "@/lib/validations";
 
 export async function GET() {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -29,32 +30,21 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const body = await req.json();
-  const {
-    type,
-    backend,
-    config,
-    nodeIds,
-    extraArgs,
-  } = body as {
-    type: string;
-    backend: BackendType;
-    config: Record<string, any>;
-    nodeIds?: string[];
-    extraArgs?: string;
-  };
-
-  if (!type || !backend) {
+  const parsed = createJobSchema.safeParse(body);
+  if (!parsed.success) {
     return NextResponse.json(
-      { error: "Type and backend are required" },
+      { error: "Validation failed", details: formatZodErrors(parsed.error) },
       { status: 400 }
     );
   }
+
+  const { type, backend, config, nodeIds, extraArgs } = parsed.data;
 
   // Look up nodes if specified
   let nodes: { host: string; gpuCount: number }[] = [];
@@ -86,7 +76,7 @@ export async function POST(req: Request) {
       type: type.toUpperCase() as any,
       backend: backend.toUpperCase() as any,
       status: "QUEUED",
-      config: extraArgs ? { ...config, __extraArgs: extraArgs } : config,
+      config: (extraArgs ? { ...config, __extraArgs: extraArgs } : config) as any,
     },
   });
 

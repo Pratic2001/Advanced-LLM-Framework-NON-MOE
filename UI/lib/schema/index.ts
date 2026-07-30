@@ -10,12 +10,14 @@ export { architectureFlags } from "./architecture";
 export { deepspeedFlags, deepspeedSchema } from "./deepspeed";
 export { hivemindFlags, hivemindSchema } from "./hivemind";
 
-export { pretrainSchema } from "./pretrain";
-export { sftSchema } from "./sft";
-export { grpoSchema } from "./grpo";
-export { dpoSchema } from "./dpo";
-export { tokenizerSchema } from "./tokenizer";
-export { packingSchema } from "./packing";
+import { pretrainSchema } from "./pretrain";
+import { sftSchema } from "./sft";
+import { grpoSchema } from "./grpo";
+import { dpoSchema } from "./dpo";
+import { tokenizerSchema } from "./tokenizer";
+import { packingSchema } from "./packing";
+
+export { pretrainSchema, sftSchema, grpoSchema, dpoSchema, tokenizerSchema, packingSchema };
 
 /**
  * All schemas indexed by script name

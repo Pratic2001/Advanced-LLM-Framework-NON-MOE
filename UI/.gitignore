@@ -3,4 +3,17 @@ node_modules/
 next-env.d.ts
 .env.local
 .env.*.local
+.env
+.env.production
 *.tsbuildinfo
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
+coverage/
+.vercel/
+dist/
+.vscode/
+.idea/
+*.swp
+*.swo

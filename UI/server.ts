@@ -5,23 +5,40 @@
  * This custom server wraps Next.js and mounts the WebSocket server alongside it.
  *
  * Usage: npx tsx server.ts
- * In production: Build first (npm run build) then use compiled version
+ * In production: Build first (npm run build) then use the compiled standalone output.
  */
 
 import { createServer } from "http";
 import { parse } from "url";
 import next from "next";
 import { getWSManager } from "./lib/ws-manager";
+import { env } from "./lib/env";
 
-const dev = process.env.NODE_ENV !== "production";
-const hostname = "localhost";
-const port = parseInt(process.env.PORT || "3000", 10);
+const dev = env.NODE_ENV !== "production";
+const hostname = env.HOSTNAME;
+const port = env.PORT;
 
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 
 app.prepare().then(() => {
   const server = createServer((req, res) => {
+    // Basic CORS headers
+    const origin = req.headers.origin;
+    const allowedOrigin = process.env.NEXTAUTH_URL || `http://${hostname}:${port}`;
+    if (origin && origin === allowedOrigin) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    }
+
+    // Handle preflight
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     const parsedUrl = parse(req.url!, true);
     handle(req, res, parsedUrl);
   });
@@ -31,7 +48,28 @@ app.prepare().then(() => {
 
   server.listen(port, () => {
     console.log(
-      `> Server listening at http://${hostname}:${port} (WebSocket: ws://${hostname}:${port}/api/ws)`
+      `[server] Listening at http://${hostname}:${port} (WebSocket: ws://${hostname}:${port}/api/ws)`
     );
   });
+
+  // ── Graceful shutdown ──────────────────────────────────────────────────
+  const shutdown = (signal: string) => {
+    console.log(`[server] Received ${signal}, shutting down gracefully...`);
+    server.close(() => {
+      console.log("[server] HTTP server closed");
+      process.exit(0);
+    });
+
+    // Force exit after 10s if graceful shutdown hangs
+    setTimeout(() => {
+      console.error("[server] Forced shutdown after timeout");
+      process.exit(1);
+    }, 10000).unref();
+  };
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+}).catch((err) => {
+  console.error("[server] Failed to start:", err);
+  process.exit(1);
 });

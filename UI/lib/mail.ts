@@ -7,17 +7,18 @@
  */
 
 import nodemailer from "nodemailer";
+import { env } from "./env";
 
 // ── Config ────────────────────────────────────────────────────────────
 
 function getMailConfig() {
   return {
-    host: process.env.SMTP_HOST || "",
-    port: parseInt(process.env.SMTP_PORT || "587", 10),
-    user: process.env.SMTP_USER || "",
-    pass: process.env.SMTP_PASS || "",
-    from: process.env.SMTP_FROM || process.env.SMTP_USER || "noreply@llmforge.local",
-    to: process.env.NOTIFICATION_EMAIL || "",
+    host: env.SMTP_HOST || "",
+    port: env.SMTP_PORT || 587,
+    user: env.SMTP_USER || "",
+    pass: env.SMTP_PASS || "",
+    from: env.SMTP_FROM || env.SMTP_USER || "noreply@llmforge.local",
+    to: env.NOTIFICATION_EMAIL || "",
   };
 }
 

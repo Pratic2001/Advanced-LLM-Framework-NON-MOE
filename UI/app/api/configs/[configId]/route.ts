@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
+import { auth } from "@/lib/auth";
 import prisma from "@/lib/db";
+import { updateConfigSchema, formatZodErrors } from "@/lib/validations";
 
 export async function GET(
   req: Request,
   { params }: { params: { configId: string } }
 ) {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -26,12 +27,20 @@ export async function PUT(
   req: Request,
   { params }: { params: { configId: string } }
 ) {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const body = await req.json();
+  const parsed = updateConfigSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Validation failed", details: formatZodErrors(parsed.error) },
+      { status: 400 }
+    );
+  }
+
   const preset = await prisma.configPreset.findFirst({
     where: { id: params.configId, userId: session.user.id },
   });
@@ -43,9 +52,9 @@ export async function PUT(
   const updated = await prisma.configPreset.update({
     where: { id: params.configId },
     data: {
-      name: body.name ?? preset.name,
-      description: body.description ?? preset.description,
-      config: body.config ?? preset.config,
+      name: parsed.data.name ?? preset.name,
+      description: parsed.data.description ?? preset.description,
+      config: (parsed.data.config ?? preset.config) as any,
     },
   });
 
@@ -56,7 +65,7 @@ export async function DELETE(
   req: Request,
   { params }: { params: { configId: string } }
 ) {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }

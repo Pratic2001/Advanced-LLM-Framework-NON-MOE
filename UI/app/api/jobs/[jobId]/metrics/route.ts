@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
+import { auth } from "@/lib/auth";
 import prisma from "@/lib/db";
+import { createMetricSchema, formatZodErrors } from "@/lib/validations";
 
 export async function GET(
   req: Request,
   { params }: { params: { jobId: string } }
 ) {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -33,13 +34,21 @@ export async function POST(
   req: Request,
   { params }: { params: { jobId: string } }
 ) {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const body = await req.json();
-  const { step, loss, vramUsed, tokensPerSec, lr, gradNorm, throughput, nodeName } = body;
+  const parsed = createMetricSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Validation failed", details: formatZodErrors(parsed.error) },
+      { status: 400 }
+    );
+  }
+
+  const { step, loss, vramUsed, tokensPerSec, lr, gradNorm, throughput, nodeName } = parsed.data;
 
   const metric = await prisma.jobMetric.create({
     data: {

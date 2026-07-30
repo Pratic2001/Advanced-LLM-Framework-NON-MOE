@@ -91,7 +91,7 @@ export class SSHManager {
 
     const result = await ssh.execCommand(command, {
       timeout: options?.timeout || 30000,
-    });
+    } as any);
 
     return {
       stdout: result.stdout,
@@ -215,9 +215,9 @@ export class SSHManager {
    * Disconnect all
    */
   disconnectAll(): void {
-    for (const [id] of this.connections) {
+    this.connections.forEach((_conn, id) => {
       this.disconnect(id);
-    }
+    });
   }
 }
 

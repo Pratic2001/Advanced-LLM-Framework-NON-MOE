@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
+import { auth } from "@/lib/auth";
 import prisma from "@/lib/db";
 
 export async function POST(
   req: Request,
   { params }: { params: { nodeId: string } }
 ) {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -43,7 +43,7 @@ export async function POST(
     const updatedNode = await prisma.node.update({
       where: { id: params.nodeId },
       data: {
-        status: "ONLINE",
+        status: "AUDITED",
         gpuName: auditResult.gpuName,
         gpuCount: auditResult.gpuCount,
         vramGb: auditResult.vramGb,

@@ -1,24 +1,40 @@
 import { NextResponse } from "next/server";
 import { hash } from "bcryptjs";
 import prisma from "@/lib/db";
+import { registerSchema, formatZodErrors } from "@/lib/validations";
+import { rateLimit } from "@/lib/rate-limit";
 
 export async function POST(req: Request) {
   try {
-    const { email, password, name } = await req.json();
-
-    if (!email || !password) {
+    // Rate limit: 5 registration attempts per IP per minute
+    const ip =
+      req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+      req.headers.get("x-real-ip") ||
+      "unknown";
+    const rlResult = rateLimit(`register:${ip}`, 5, 60_000);
+    if (!rlResult.success) {
       return NextResponse.json(
-        { error: "Email and password are required" },
+        { error: "Too many requests. Please try again later." },
+        {
+          status: 429,
+          headers: {
+            "X-RateLimit-Limit": "5",
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": String(Math.ceil(rlResult.resetAt / 1000)),
+          },
+        }
+      );
+    }
+    const body = await req.json();
+    const parsed = registerSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(
+        { error: "Validation failed", details: formatZodErrors(parsed.error) },
         { status: 400 }
       );
     }
 
-    if (password.length < 8) {
-      return NextResponse.json(
-        { error: "Password must be at least 8 characters" },
-        { status: 400 }
-      );
-    }
+    const { email, password, name } = parsed.data;
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {

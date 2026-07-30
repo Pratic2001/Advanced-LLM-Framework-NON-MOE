@@ -107,9 +107,9 @@ export class ProcessPool {
   }
 
   stopAll(signal: NodeJS.Signals = "SIGTERM"): void {
-    for (const [id] of this.processes) {
+    this.processes.forEach((_proc, id) => {
       this.stop(id, signal);
-    }
+    });
   }
 
   list(): PoolProcess[] {

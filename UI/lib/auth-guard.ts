@@ -17,9 +17,8 @@ export function useRequiredSession() {
 
 export function requireAuth() {
   return async function getSession() {
-    const { getServerSession } = await import("next-auth");
-    const { authOptions } = await import("./auth");
-    const session = await getServerSession(authOptions);
+    const { auth } = await import("./auth");
+    const session = await auth();
 
     if (!session?.user?.id) {
       return null;

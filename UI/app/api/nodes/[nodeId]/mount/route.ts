@@ -1,18 +1,27 @@
 import { NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
+import { auth } from "@/lib/auth";
 import prisma from "@/lib/db";
+import { mountNfsSchema, formatZodErrors } from "@/lib/validations";
 
 export async function POST(
   req: Request,
   { params }: { params: { nodeId: string } }
 ) {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const body = await req.json();
-  const { nfsServer, exportPath, mountPoint } = body;
+  const parsed = mountNfsSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Validation failed", details: formatZodErrors(parsed.error) },
+      { status: 400 }
+    );
+  }
+
+  const { nfsServer, exportPath, mountPoint } = parsed.data;
 
   const node = await prisma.node.findFirst({
     where: { id: params.nodeId, userId: session.user.id },
@@ -50,7 +59,7 @@ export async function DELETE(
   req: Request,
   { params }: { params: { nodeId: string } }
 ) {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }

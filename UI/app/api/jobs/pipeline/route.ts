@@ -1,34 +1,25 @@
 import { NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
+import { auth } from "@/lib/auth";
 import prisma from "@/lib/db";
 import { getPipelineOrchestrator } from "@/lib/pipeline-orchestrator";
-import type { BackendType } from "@/lib/schema";
+import { pipelineSchema, formatZodErrors } from "@/lib/validations";
 
 export async function POST(req: Request) {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const body = await req.json();
-  const {
-    name,
-    backend,
-    stages,
-    nodeIds,
-  } = body as {
-    name: string;
-    backend: BackendType;
-    stages: { type: string; config: Record<string, any>; extraArgs?: string }[];
-    nodeIds?: string[];
-  };
-
-  if (!name || !backend || !stages || stages.length === 0) {
+  const parsed = pipelineSchema.safeParse(body);
+  if (!parsed.success) {
     return NextResponse.json(
-      { error: "Name, backend, and at least one stage are required" },
+      { error: "Validation failed", details: formatZodErrors(parsed.error) },
       { status: 400 }
     );
   }
+
+  const { name, backend, stages, nodeIds } = parsed.data;
 
   const orchestrator = getPipelineOrchestrator();
 

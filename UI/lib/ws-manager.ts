@@ -110,7 +110,7 @@ export class WSManager {
    * Broadcast an event to subscribers
    */
   private broadcast(channel: string, event: JobEvent): void {
-    for (const client of this.clients.values()) {
+    Array.from(this.clients.values()).forEach((client) => {
       if (client.subscriptions.has(channel)) {
         try {
           client.ws.send(JSON.stringify(event));
@@ -118,7 +118,7 @@ export class WSManager {
           // Client disconnected
         }
       }
-    }
+    });
   }
 
   /**

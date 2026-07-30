@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
+import { auth } from "@/lib/auth";
 import prisma from "@/lib/db";
+import { createNodeSchema, formatZodErrors } from "@/lib/validations";
 
 export async function GET() {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -17,20 +18,21 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
-  const session = await getServerSession();
+  const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const body = await req.json();
-  const { name, host, port, username, role, sshKeyId } = body;
-
-  if (!name || !host || !username) {
+  const parsed = createNodeSchema.safeParse(body);
+  if (!parsed.success) {
     return NextResponse.json(
-      { error: "Name, host, and username are required" },
+      { error: "Validation failed", details: formatZodErrors(parsed.error) },
       { status: 400 }
     );
   }
+
+  const { name, host, port, username, role, sshKeyId } = parsed.data;
 
   const node = await prisma.node.create({
     data: {

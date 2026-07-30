@@ -2,8 +2,6 @@
 @tailwind components;
 @tailwind utilities;
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
-
 @layer base {
   :root {
     --background: 240 10% 3.9%;
@@ -34,8 +32,8 @@
     @apply border-border;
   }
   body {
-    @apply bg-background text-foreground font-sans antialiased;
-    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-inter), system-ui, -apple-system, sans-serif;
   }
 }
 
@@ -165,7 +163,7 @@
 /* ── Log viewer styling ──────────────────────────── */
 
 .log-line {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono), 'JetBrains Mono', monospace;
   font-size: 0.8125rem;
   line-height: 1.5;
   white-space: pre-wrap;

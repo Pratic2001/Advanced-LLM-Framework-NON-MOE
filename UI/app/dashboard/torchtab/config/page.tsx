@@ -97,7 +97,7 @@ export default function TorchtabConfigPage() {
     .filter((s) => selectedStages.includes(s.id))
     .flatMap((s) => s.flags);
 
-  const groups = [...new Set(activeFlags.map((f) => f.group))];
+  const groups = Array.from(new Set(activeFlags.map((f) => f.group)));
 
   // Use the first selected stage to determine the script type
   const primaryStage = selectedStages[0] || "pretrain";
