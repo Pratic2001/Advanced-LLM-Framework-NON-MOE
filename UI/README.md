@@ -21,6 +21,15 @@
   - [Arch Linux](#arch-linux)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Production Deployment](#production-deployment)
+  - [Pre-Deployment Checklist](#pre-deployment-checklist)
+  - [Option A: Docker (Recommended)](#option-a-docker-recommended)
+  - [Option B: Bare-Metal / VM](#option-b-bare-metal--vm)
+  - [Option C: Reverse Proxy + TLS](#option-c-reverse-proxy--tls)
+  - [Post-Deployment](#post-deployment)
+  - [Upgrades](#upgrades)
+  - [Rollback](#rollback)
+  - [Monitoring](#monitoring)
 - [Running the UI](#running-the-ui)
 - [Usage Scenarios](#usage-scenarios)
   - [Scenario A: Single Node (Local Machine)](#scenario-a-single-node-local-machine)
@@ -290,6 +299,437 @@ SSH_KEY_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef"
 # Absolute or relative path to the training framework root
 # (where train_pretrain.py, train_sft.py, etc. live)
 REPO_ROOT="../"
+```
+
+---
+
+## Production Deployment
+
+A production deployment serves the UI over HTTPS on a public or LAN host, with PostgreSQL on a separate (or the same) machine, runs `npm run start` (or the Docker image) under a process manager, and is fronted by a reverse proxy for TLS termination and WebSocket pass-through. Pick one of the three options below based on your environment.
+
+### Pre-Deployment Checklist
+
+Tick every box before you ship.
+
+- [ ] **Strong `AUTH_SECRET`.** Generate with `openssl rand -base64 48` (or `openssl rand -hex 32`). Never reuse the dev secret.
+- [ ] **Strong `SSH_KEY_ENCRYPTION_KEY`.** Exactly 32 hex chars (16 bytes) for AES-256-GCM. Generate with `openssl rand -hex 16`. **Losing this key destroys all stored SSH keys.**
+- [ ] **Strong Postgres password** and a dedicated user (not `postgres` if avoidable).
+- [ ] **`AUTH_URL`** set to the canonical public origin, e.g. `https://forge.example.com`. Required when serving behind a reverse proxy; optional if `AUTH_TRUST_HOST` is true and Auth.js can infer the host.
+- [ ] **`DATABASE_URL`** uses the production host and TLS mode (`?sslmode=require`).
+- [ ] **`NODE_ENV=production`** (the Dockerfile and `next start` both set this).
+- [ ] **HTTPS is terminated upstream** (nginx / Caddy / a managed LB). Cookies are `Secure` in production.
+- [ ] **Reverse proxy forwards the original `Host` and `X-Forwarded-*` headers** so Auth.js trusts the request and middleware can build correct redirect URLs.
+- [ ] **Backups** of the Postgres database — at minimum a daily `pg_dump` with offsite copy. Test restore quarterly.
+- [ ] **Firewall** opens `3000/tcp` (UI) only to the proxy host; Postgres `5432/tcp` only allows the UI host (or is socket-only).
+- [ ] **First user** will be created via `/signup`. To make sign-up private, see the *Disable public sign-up* note below.
+
+**Generate the secrets once and store them somewhere safe before building:**
+
+```bash
+echo "AUTH_SECRET=$(openssl rand -base64 48)"
+echo "SSH_KEY_ENCRYPTION_KEY=$(openssl rand -hex 16)"
+```
+
+### Option A: Docker (Recommended)
+
+The included `Dockerfile` is a 3-stage Node 22-alpine build that produces a [Next.js standalone](https://nextjs.org/docs/app/api-reference/config/next-config-js/output#standalone) image (~150 MB). It runs as a non-root user (`nextjs`, uid 1001) and listens on port 3000.
+
+#### 1. Prepare a deployment directory
+
+```bash
+mkdir -p /opt/llmforge-ui && cd /opt/llmforge-ui
+# Copy in: the project source (or a built tarball) so the Dockerfile can find it.
+# You only need the Dockerfile, package.json, package-lock.json, app/, lib/,
+# hooks/, components/, public/, prisma/, next.config.mjs, tsconfig.json,
+# server.ts, instrumentation.ts, middleware.ts.
+```
+
+#### 2. Build the image
+
+```bash
+docker build -t llmforge-ui:1.0.0 .
+# Tagged :1.0.0 so you can pin to a known-good image during rollback.
+```
+
+#### 3. Provide secrets at runtime, not in the image
+
+Create `.env.production` on the host (NOT inside the image):
+
+```bash
+cat > /opt/llmforge-ui/.env.production <<'EOF'
+NODE_ENV=production
+PORT=3000
+HOSTNAME=0.0.0.0
+AUTH_TRUST_HOST=true
+AUTH_URL=https://forge.example.com
+
+# 48+ chars — generated above
+AUTH_SECRET=replace-with-the-secret-you-generated
+
+# 32 hex chars — generated above
+SSH_KEY_ENCRYPTION_KEY=replace-with-the-key-you-generated
+
+DATABASE_URL=postgresql://llmforge:STRONG_PASSWORD@db.internal:5432/llmforge?sslmode=require
+
+# Absolute path inside the container to where the framework is mounted.
+# This is a path *inside* the container; mount the framework volume below.
+REPO_ROOT=/framework
+EOF
+chmod 600 /opt/llmforge-ui/.env.production
+```
+
+#### 4. Start the container
+
+```bash
+docker run -d \
+  --name llmforge-ui \
+  --restart unless-stopped \
+  --env-file /opt/llmforge-ui/.env.production \
+  -p 127.0.0.1:3000:3000 \
+  -v /mnt/framework:/framework:ro \   # training scripts + data (read-only)
+  -v /var/lib/llmforge/output:/output \  # training checkpoints
+  llmforge-ui:1.0.0
+```
+
+Notes:
+- `--restart unless-stopped` brings the container back after a host reboot.
+- Bind `127.0.0.1:3000` (loopback only) — the reverse proxy on the same host connects to `127.0.0.1:3000` and the UI is **not** directly reachable from the internet.
+- Mount the training framework and the output directory so jobs survive container restarts.
+- **Migrations:** the image does not run `prisma migrate deploy` automatically. Before the first start:
+
+  ```bash
+  docker run --rm \
+    --env-file /opt/llmforge-ui/.env.production \
+    llmforge-ui:1.0.0 \
+    npx prisma migrate deploy
+  ```
+
+  Then start the main container as above.
+
+#### 5. Docker Compose (alternative)
+
+```yaml
+# /opt/llmforge-ui/docker-compose.yml
+services:
+  ui:
+    image: llmforge-ui:1.0.0
+    restart: unless-stopped
+    env_file: .env.production
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - /mnt/framework:/framework:ro
+      - /var/lib/llmforge/output:/output
+    depends_on:
+      - db
+    # healthcheck is built into the image at /api/system/health
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: llmforge
+      POSTGRES_USER: llmforge
+      POSTGRES_PASSWORD: STRONG_PASSWORD
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Expose ONLY to the UI service — see notes below.
+
+volumes:
+  pgdata:
+```
+
+Run migrations once after first deploy:
+
+```bash
+docker compose run --rm ui npx prisma migrate deploy
+docker compose up -d
+```
+
+#### 6. Verify
+
+```bash
+curl -s http://127.0.0.1:3000/api/system/health | jq
+# Should return { "status": "ok", "db": "ok", ... }
+```
+
+### Option B: Bare-Metal / VM
+
+Use this when you don't want Docker (e.g., on a single GPU workstation where you also want to run training jobs directly, without bind-mounting).
+
+#### 1. Provision
+
+- Linux (Ubuntu 22.04+ / Debian 12+ / RHEL 9+) — Windows is not supported.
+- Node.js 20 LTS via [`nvm`](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), or NodeSource.
+- PostgreSQL 16+ via your distro's package manager (see PostgreSQL Setup above).
+- A dedicated `llmforge` system user:
+
+  ```bash
+  sudo useradd -r -m -d /var/lib/llmforge -s /bin/bash llmforge
+  sudo mkdir -p /opt/llmforge-ui /var/lib/llmforge/output
+  sudo chown -R llmforge:llmforge /opt/llmforge-ui /var/lib/llmforge/output
+  ```
+
+#### 2. Install
+
+```bash
+sudo -u llmforge -H bash <<'EOF'
+cd /opt/llmforge-ui
+git clone https://github.com/your-repo/Advanced-LLM-Framework-NON-MOE.git .
+cd UI
+npm ci --legacy-peer-deps
+npx prisma generate
+npm run build
+EOF
+```
+
+#### 3. Configure
+
+Write `/opt/llmforge-ui/UI/.env.production` (see the file above for contents). Make sure permissions are tight:
+
+```bash
+sudo chown llmforge:llmforge /opt/llmforge-ui/UI/.env.production
+sudo chmod 600 /opt/llmforge-ui/UI/.env.production
+```
+
+Run migrations:
+
+```bash
+sudo -u llmforge -H bash -c 'cd /opt/llmforge-ui/UI && npx prisma migrate deploy'
+```
+
+> **Use `migrate deploy` in production, not `db push`.** `migrate deploy` applies SQL files from `prisma/migrations/` in order — it's safe to re-run on each deploy.
+
+#### 4. Run under a process manager (systemd)
+
+`/etc/systemd/system/llmforge-ui.service`:
+
+```ini
+[Unit]
+Description=LLMForge UI (Next.js)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llmforge
+Group=llmforge
+WorkingDirectory=/opt/llmforge-ui/UI
+EnvironmentFile=/opt/llmforge-ui/UI/.env.production
+Environment=NODE_ENV=production
+Environment=PORT=3000
+ExecStart=/usr/bin/node node_modules/next/dist/bin/next start
+Restart=on-failure
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/llmforge/output /var/lib/llmforge/cache
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> If you need WebSocket support for the live charts page, swap `ExecStart` to run the custom server: `ExecStart=/usr/bin/node server.js` (after `next build`).
+
+Then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now llmforge-ui
+sudo systemctl status llmforge-ui
+curl -s http://127.0.0.1:3000/api/system/health | jq
+```
+
+### Option C: Reverse Proxy + TLS
+
+A reverse proxy gives you TLS, rate-limiting, and the `Host` / `X-Forwarded-Proto` headers Auth.js needs. Bind the UI only to `127.0.0.1:3000` (above) so nothing in this section is optional.
+
+The middleware already sets `Strict-Transport-Security` in production. Pick whichever proxy you prefer:
+
+#### Caddy (automatic HTTPS via Let's Encrypt / ZeroSSL)
+
+`/etc/caddy/Caddyfile`:
+
+```caddyfile
+forge.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:3000 {
+        # WebSocket upgrade for /api/ws and HMR
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
+```
+
+```bash
+sudo systemctl reload caddy
+```
+
+#### nginx
+
+`/etc/nginx/sites-available/forge`:
+
+```nginx
+upstream llmforge_app {
+    server 127.0.0.1:3000;
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name forge.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name forge.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/forge.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/forge.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    # Security headers (the app sets some of these; nginx adds the rest)
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    client_max_body_size 50m;   # training-config uploads
+
+    location / {
+        proxy_pass         http://llmforge_app;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Connection        "";
+        proxy_read_timeout 3600s;
+    }
+
+    # WebSocket — required for the Jobs live chart
+    location /api/ws {
+        proxy_pass         http://llmforge_app;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/forge /etc/nginx/sites-enabled/forge
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Certbot one-shot for the cert above:
+
+```bash
+sudo certbot --nginx -d forge.example.com
+```
+
+### Post-Deployment
+
+1. **Smoke test the auth flow.** Open the URL, sign up, sign out, sign back in. Confirm `/api/system/health` returns `db: ok` and that the **Jobs** page loads (charts need the WebSocket).
+2. **Verify the cookie name.** In DevTools → Application → Cookies, look for `authjs.session-token` (HTTPS) or `__Secure-authjs.session-token`. If you only see a `next-auth.session-token`, the proxy is stripping cookies.
+3. **Backups.** Schedule a daily backup of the Postgres database:
+   ```bash
+   # /etc/cron.d/llmforge-backup
+   0 3 * * * pg_dump -h db.internal -U llmforge llmforge | \
+     gzip > /var/backups/llmforge/$(date -u +\%Y\%m\%dT\%H\%M\%SZ).sql.gz
+   ```
+4. **Disable public sign-up** if you want accounts to be invite-only. Edit `app/api/auth/register/route.ts` to require an `INVITE_TOKEN` header and read it from `.env.production`. The middleware already protects everything except `/signup` itself.
+
+### Upgrades
+
+```bash
+# 1. Pull the new source
+cd /opt/llmforge-ui
+sudo -u llmforge git pull --ff-only
+
+# 2. Install + build
+cd UI
+sudo -u llmforge npm ci --legacy-peer-deps
+sudo -u llmforge npx prisma generate
+
+# 3. Apply migrations BEFORE rolling the new image
+sudo -u llmforge npx prisma migrate deploy
+
+# 4. Rebuild the image and roll
+cd ..
+docker build -t llmforge-ui:1.1.0 .
+docker stop llmforge-ui && docker rm llmforge-ui
+docker run -d --name llmforge-ui \
+  --restart unless-stopped \
+  --env-file .env.production \
+  -p 127.0.0.1:3000:3000 \
+  -v /mnt/framework:/framework:ro \
+  -v /var/lib/llmforge/output:/output \
+  llmforge-ui:1.1.0
+```
+
+For the bare-metal variant, swap `docker build` for `npm run build`, then:
+
+```bash
+sudo systemctl restart llmforge-ui
+```
+
+### Rollback
+
+Container: redeploy the previous tag.
+
+```bash
+docker stop llmforge-ui && docker rm llmforge-ui
+docker run -d --name llmforge-ui \
+  --restart unless-stopped \
+  --env-file .env.production \
+  -p 127.0.0.1:3000:3000 \
+  -v /mnt/framework:/framework:ro \
+  -v /var/lib/llmforge/output:/output \
+  llmforge-ui:1.0.0   # <-- previous image
+```
+
+Bare-metal: check out the previous commit and restart.
+
+```bash
+cd /opt/llmforge-ui
+sudo -u llmforge git log --oneline -10   # find the last good commit
+sudo -u llmforge git checkout <sha> -- UI
+cd UI && sudo -u llmforge npm ci --legacy-peer-deps && sudo -u llmforge npm run build
+sudo systemctl restart llmforge-ui
+```
+
+> **Database rollbacks** are risky — a forward migration that altered columns may not have a clean inverse. If you must roll back an app version that depended on a new column, restore the latest `pg_dump` into a fresh database and switch `DATABASE_URL` instead.
+
+### Monitoring
+
+Minimum viable monitoring in production:
+
+- **Health endpoint.** Hit `https://forge.example.com/api/system/health` every 30 s with an external probe (curl + jq, [Blackbox exporter](https://github.com/prometheus/blackbox_exporter), [UptimeRobot](https://uptimerobot.com)). Alert on non-200 or `db != "ok"`.
+- **Process check.** `systemctl status llmforge-ui` or `docker ps` + a restart-count alert.
+- **Disk.** Alert when the disk hosting `/var/lib/llmforge/output` is >85% full — a runaway training job can fill it overnight.
+- **Logs.** Capture both app and reverse-proxy logs to a centralised sink (Loki, CloudWatch, syslog-ng). `journalctl -u llmforge-ui -f` or `docker logs -f llmforge-ui` for ad-hoc.
+- **Postgres metrics.** `pg_stat_activity`, replica lag if you set one up.
+
+A Prometheus blackbox-probe snippet:
+
+```yaml
+- name: llmforge_ui_health
+  interval: 30s
+  prober: http
+  url: https://forge.example.com/api/system/health
+  valid_status_codes: [200]
+  fail_if_body_not_matches_regexp: ['"status":"ok"']
 ```
 
 ---

@@ -33,6 +33,10 @@ export default function LoginPage() {
         return;
       }
 
+      // On success, Auth.js has set the session cookie. Clear the button
+      // spinner BEFORE pushing — if anything downstream stalls (e.g. the
+      // dashboard layout's loading state) the form must not stay frozen.
+      setLoading(false);
       router.push("/dashboard");
       router.refresh();
     } catch {
