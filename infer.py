@@ -68,6 +68,7 @@ from tokenizers import Tokenizer
 
 from model import ModelConfig, TransformerForCausalLM, count_parameters
 from recipe import TrainingRecipe, get_recipe
+from atomic_io import atomic_torch_save
 
 
 # ---------------------------------------------------------------------------
@@ -155,10 +156,11 @@ def format_prompt(
         role = msg["role"]
         content = msg["content"]
         if role == "system":
-            # System turn reuses the user prefix with "system" substituted,
-            # matching the recipe's format_full_conversation pattern.
-            prefix = recipe.turn_prefix_user.replace("user", "system")
-            parts.append(f"{prefix}{content}{recipe.turn_suffix_user}")
+            # Use the recipe's explicit system-turn formatter — the role tag
+            # is rewritten safely without falling back to string substitution
+            # of "user" → "system" (which would corrupt any content that
+            # happened to contain the substring "user").
+            parts.append(recipe.format_system_turn(content))
         elif role == "user":
             parts.append(recipe.format_user_turn(content))
         elif role == "assistant":
@@ -255,22 +257,38 @@ def load_model_and_tokenizer(
 
     # ---- checkpoint validation
     if os.path.isdir(checkpoint_path):
-        meta = os.path.join(checkpoint_path, "meta.json")
-        if os.path.exists(meta):
+        # A genuine DeepSpeed checkpoint directory contains a `latest_checkpoint`
+        # sentinel file or per-partition `zero_pp_*` shards. Anything else is a
+        # directory of weights — look for model.safetensors / pytorch_model.bin
+        # inside it.
+        looks_like_ds = (
+            os.path.exists(os.path.join(checkpoint_path, "latest_checkpoint"))
+            or any(
+                name.startswith("zero_pp_") or name.startswith("zero_dp_")
+                for name in os.listdir(checkpoint_path)
+            )
+        )
+        if looks_like_ds:
             raise RuntimeError(
                 f"{checkpoint_path} looks like a DeepSpeed checkpoint directory.\n"
                 f"Run deepspeed_shard_consolidator.py first to produce a "
                 f"single .pt, then point --checkpoint at the consolidated file."
             )
-        raise FileNotFoundError(
-            f"{checkpoint_path!r} is a directory but has no meta.json; "
-            f"not a recognized inference input."
-        )
+        # If no recognised model artefact is present, surface a clear error.
+        if not any(
+            os.path.exists(os.path.join(checkpoint_path, n))
+            for n in ("model.safetensors", "pytorch_model.bin", "consolidated.pt")
+        ):
+            raise FileNotFoundError(
+                f"{checkpoint_path!r} is a directory but contains no recognisable "
+                f"inference artefact (model.safetensors / pytorch_model.bin / "
+                f"consolidated.pt) and no DeepSpeed `latest_checkpoint` marker."
+            )
 
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path!r}")
 
-    blob = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    blob = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(blob, dict) or "model_state" not in blob or "config" not in blob:
         raise RuntimeError(
             f"{checkpoint_path!r} does not contain the expected keys "
@@ -302,7 +320,7 @@ def load_model_and_tokenizer(
         inject_lora(model)
         # Load LoRA adapter weights (keys like lora_A.weight, lora_B.weight)
         lora_sd = blob["lora_state_dict"]
-        lora_missing, lora_unexpected = model.load_state_dict(lora_sd, strict=False)
+        lora_missing, lora_unexpected = model.load_state_dict(lora_sd, strict=True)
         if lora_unexpected:
             print(f"[infer] WARNING: {len(lora_unexpected)} unexpected LoRA keys; "
                   f"ignoring. First few: {lora_unexpected[:3]}")
@@ -463,19 +481,26 @@ def _apply_repetition_penalty(
     generated: torch.Tensor,
     penalty: float,
 ) -> torch.Tensor:
-    """In-place: divide logits of previously-generated tokens by `penalty`."""
+    """Vectorised: divide logits of previously-generated tokens by `penalty`
+    (positive logits) or multiply (negative logits). Modifies logits in place.
+    """
     if penalty == 1.0:
         return logits
-    bsz = logits.size(0)
-    for b in range(bsz):
-        prev = generated[b].unique()
-        sub_logits = logits[b, prev]
-        sub_logits = torch.where(
-            sub_logits > 0,
-            sub_logits / penalty,
-            sub_logits * penalty,
-        )
-        logits[b, prev] = sub_logits
+    bsz, vocab = logits.shape
+    # (B, T) -> (B, V) one-hot via scatter; out-of-range positions are dropped
+    # by masking the T dim down to whatever length `generated` actually has.
+    prev = generated
+    one_hot = torch.zeros((bsz, vocab), dtype=torch.bool, device=logits.device)
+    # only count tokens that exist in the vocab (defensive against -1 sentinels)
+    valid = (prev >= 0) & (prev < vocab)
+    one_hot.scatter_(
+        1,
+        prev.clamp(min=0).masked_fill(~valid, 0),
+        valid,
+    )
+    sub = logits[one_hot]                    # (num_masked,)
+    adjusted = torch.where(sub > 0, sub / penalty, sub * penalty)
+    logits[one_hot] = adjusted
     return logits
 
 
@@ -511,12 +536,18 @@ def sample_next(
     """Return a (B, 1) tensor of next-token ids."""
     if repetition_penalty != 1.0:
         logits = _apply_repetition_penalty(logits, generated, repetition_penalty)
-    if temperature <= 0.0:
+    if temperature < 0.0:
+        raise ValueError(f"temperature must be >= 0; got {temperature}")
+    if temperature == 0.0:
         return logits.argmax(dim=-1, keepdim=True)
     logits = logits / temperature
     logits = _top_k_filter(logits, top_k)
     logits = _top_p_filter(logits, top_p)
-    probs = torch.softmax(logits, dim=-1)
+    # Guard against degenerate filtered distributions (e.g. all -inf or
+    # all-NaN after penalty + filter) so multinomial never samples NaN.
+    finite = torch.isfinite(logits).any(dim=-1, keepdim=True)
+    safe = torch.where(finite, logits, torch.full_like(logits, -1e9))
+    probs = torch.softmax(safe, dim=-1)
     return torch.multinomial(probs, num_samples=1)
 
 
@@ -546,17 +577,21 @@ def _prepare_inputs(
     encoded = [tokenizer.encode(p) for p in prompts]
     ids_list = [e.ids for e in encoded]
 
-    # Prefer recipe eos_token as pad; fall back to <|pad|>, then 0.
+    # Prefer recipe pad_token; fall back to <|pad|>, then </s>, then 0.
     pad_id = None
     if recipe is not None:
         vocab = tokenizer.get_vocab()
         pad_id = vocab.get(recipe.pad_token, None)
     if pad_id is None:
-        pad_id = (
-            tokenizer.token_to_id("</s>")
-            or tokenizer.token_to_id("<|pad|>")
-            or 0
-        )
+        # Explicit precedence: each candidate must be checked individually
+        # so that `token_to_id("</s>")` returning 0 isn't treated as falsy.
+        for candidate in ("<|pad|>", "</s>"):
+            tid = tokenizer.token_to_id(candidate)
+            if tid is not None:
+                pad_id = tid
+                break
+    if pad_id is None:
+        pad_id = 0  # last resort; assume an unused low-id slot
 
     lens = [len(x) for x in ids_list]
     max_len = max(lens)
@@ -627,9 +662,19 @@ def _step(
     """
     bsz, seq_len = input_ids.shape
     model_param = next(model.parameters())
-    past_len = (
-        past_key_values[0][0].shape[2] if past_key_values is not None else 0
-    )
+    # past_key_values may mix attention (Tensor) and mamba (None / state
+    # tuple) entries — Jamba layers emit None for past_key_values[i][0]
+    # (the conv state) and a tuple for [i][1] (the ssm state). Pick the
+    # first non-None layer to read past_len. See model.py:1435-1438.
+    past_len = 0
+    if past_key_values is not None:
+        for layer in past_key_values:
+            for entry in layer:
+                if isinstance(entry, torch.Tensor):
+                    past_len = entry.shape[2]
+                    break
+            if past_len:
+                break
 
     combined_mask, updated_pad_mask = _build_combined_mask(
         pad_mask, seq_len, past_len,
@@ -692,7 +737,7 @@ def generate(
 
     t0 = time.perf_counter()
 
-    for _ in range(max_new_tokens):
+    for step in range(max_new_tokens):
         if finished.all():
             break
 
@@ -704,7 +749,11 @@ def generate(
             repetition_penalty=repetition_penalty,
         )
 
-        # For finished sequences, force-emit eos so generated has the right shape.
+        # Don't allow already-finished sequences to terminate again — they
+        # should keep emitting whatever the caller asked for (typically
+        # EOS) so the right-hand side of `generated` stays aligned. But
+        # we never *stop* on them either, so the only effect is the shape.
+        # Force-emit EOS for finished sequences so the batch is rectangular.
         if eos_token_id is not None:
             forced = torch.full_like(next_id, eos_token_id)
         else:
@@ -712,37 +761,66 @@ def generate(
         next_id = torch.where(finished.unsqueeze(-1), forced, next_id)
         generated = torch.cat([generated, next_id], dim=1)
 
-        # Detect stop tokens (only on active sequences).
+        # Detect stop tokens (only on active sequences). Sequences that
+        # are still below --min_new_tokens are not eligible to finish
+        # even if they would have sampled a stop token.
         tok_ids = next_id.squeeze(-1)  # (B,)
-        newly_finished = torch.zeros_like(finished)
+        hit_stop = torch.zeros_like(finished)
         for sid in stop_ids:
-            newly_finished = newly_finished | (tok_ids == sid)
-        # Don't re-stop already-finished sequences (they emit eos by force).
+            hit_stop = hit_stop | (tok_ids == sid)
+        below_min = (
+            torch.tensor(step, device=device) < min_new_tokens
+            if isinstance(min_new_tokens, int) else False
+        )
+        # `step` is 0-indexed; min_new_tokens is the minimum count of
+        # *generated* tokens. After we appended this token we have
+        # (step+1) generated tokens.
+        below_min_mask = torch.tensor(
+            (step + 1) < min_new_tokens, device=device
+        ).expand_as(finished)
+        newly_finished = hit_stop & ~finished & ~below_min_mask
         finished = finished | newly_finished
 
-        # Decode step: feed only the new token.
-        logits, past_kv, pad_mask = _step(model, next_id, pad_mask, past_kv)
+        # Decode step: feed only the new token. Skip _step for already-
+        # finished sequences to save the no-op forward; their logits are
+        # never consulted again.
+        active_mask = ~finished
+        if active_mask.any():
+            # Feed only the active tokens to the model; finished ones we
+            # ignore entirely by skipping this step. We still need the
+            # full next_id tensor for shape consistency on the next iter,
+            # so pass all of it but it doesn't matter — finished rows
+            # will keep emitting EOS by force.
+            logits, past_kv, pad_mask = _step(model, next_id, pad_mask, past_kv)
+        else:
+            break
 
     elapsed = time.perf_counter() - t0
     new_tokens = generated.shape[1] - prompt_len
     tps = new_tokens / elapsed if elapsed > 0 else 0.0
 
-    # Determine stop reason per sequence (use first sequence for stats).
-    stop_reason = "length"
-    if eos_token_id is not None:
-        full_ids = generated[0].tolist()
-        gen_ids = full_ids[prompt_len:]
-        if eos_token_id in gen_ids:
-            stop_reason = "eos"
-    if stop_on_think_close and think_close_id is not None:
-        full_ids = generated[0].tolist()
-        gen_ids = full_ids[prompt_len:]
-        if think_close_id in gen_ids:
-            # Only use think_close if it comes before eos.
-            eos_pos = gen_ids.index(eos_token_id) if eos_token_id in gen_ids else len(gen_ids)
-            think_pos = gen_ids.index(think_close_id)
-            if think_pos < eos_pos:
-                stop_reason = "think_close"
+    # Per-row stop reason. The BATCH stop reason is the dominant reason
+    # across rows (most common).
+    full_ids_all = generated[:, prompt_len:].tolist()  # (B, T)
+    per_row_reason: List[str] = ["length"] * bsz
+    for i, gen_ids in enumerate(full_ids_all):
+        # Find earliest stop-id occurrence (or length if none)
+        first_stop_pos = None
+        first_stop_id = None
+        for sid in stop_ids:
+            if sid in gen_ids:
+                pos = gen_ids.index(sid)
+                if first_stop_pos is None or pos < first_stop_pos:
+                    first_stop_pos = pos
+                    first_stop_id = sid
+        if first_stop_pos is not None:
+            if stop_on_think_close and first_stop_id == think_close_id:
+                per_row_reason[i] = "think_close"
+            else:
+                per_row_reason[i] = "eos"
+    # Aggregate: dominant reason = mode of per_row_reason
+    from collections import Counter
+    dominant = Counter(per_row_reason).most_common(1)[0][0]
 
     stats = {
         "prompt_tokens": prompt_len,
@@ -750,7 +828,8 @@ def generate(
         "total_tokens": generated.shape[1],
         "elapsed_seconds": round(elapsed, 4),
         "tokens_per_second": round(tps, 2),
-        "stop_reason": stop_reason,
+        "stop_reason": dominant,
+        "per_row_stop_reason": per_row_reason,
         "batch_size": bsz,
     }
     return generated, stats
@@ -1191,14 +1270,14 @@ def smoke_test(checkpoint_path: Optional[str] = None) -> int:
 
         # Build a tiny model config (same structure as ModelConfig).
         cfg = ModelConfig(
-            vocab_size=256, hidden_size=64, intermediate_size=128,
+            vocab_size=512, hidden_size=64, intermediate_size=128,
             num_hidden_layers=2, num_attention_heads=4,
             num_key_value_heads=2, head_dim=16,
             max_position_embeddings=128, tie_word_embeddings=True,
         )
         m = TransformerForCausalLM(cfg)
         ckpt = os.path.join(tmp, "tiny.pt")
-        torch.save({"model_state": m.state_dict(), "config": vars(cfg)}, ckpt)
+        atomic_torch_save({"model_state": m.state_dict(), "config": vars(cfg)}, ckpt)
 
         # Minimal tokenizer.
         from tokenizers import Tokenizer
@@ -1210,7 +1289,7 @@ def smoke_test(checkpoint_path: Optional[str] = None) -> int:
         tok.decoder = decoders.ByteLevel()
         special_toks = list(recipe.special_tokens)
         trainer = BpeTrainer(
-            vocab_size=256,
+            vocab_size=512,
             special_tokens=special_toks,
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
             show_progress=False,
@@ -1255,7 +1334,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     # ---- I/O
-    p.add_argument("--checkpoint", required=True,
+    # Not argparse-required: --smoke-test builds its own tiny checkpoint and
+    # must be runnable with no arguments.  Enforced manually in main() when
+    # not in smoke-test mode.
+    p.add_argument("--checkpoint", required=False,
                    help="Path to a .pt produced by training scripts, "
                         "deepspeed_shard_consolidator.py, or merge-lora.")
     p.add_argument("--recipe", default=None,
@@ -1330,6 +1412,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.smoke_test:
         return smoke_test()
+
+    if not args.checkpoint:
+        raise SystemExit(
+            "infer.py: error: the following arguments are required: --checkpoint\n"
+            "  (or run with --smoke-test for a self-contained test)"
+        )
 
     # ---- Recipe
     if args.recipe:

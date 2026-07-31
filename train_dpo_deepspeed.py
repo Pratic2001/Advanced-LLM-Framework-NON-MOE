@@ -57,6 +57,7 @@ Reference:
 """
 
 import argparse
+import atexit
 import json
 import math
 import os
@@ -66,6 +67,7 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -76,9 +78,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
-import deepspeed
-
 from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, count_parameters
+
+from atomic_io import atomic_symlink, atomic_torch_save, atomic_write_json, load_torch_checkpoint
+from shutdown import install_signal_handlers, should_stop
+from logging_utils import setup_logging, get_logger, log_event
 
 # Re-use the DPO machinery so this script stays focused on the engine swap.
 from train_dpo import (
@@ -506,7 +510,10 @@ def save_ds_dpo_checkpoint(
     For LoRA: writes a .pt checkpoint via train_dpo.save_dpo_checkpoint logic.
     """
     if is_lora:
-        # LoRA: save as .pt (small, compatible with merge_lora path)
+        # LoRA: save as .pt (small, compatible with merge_lora path). This is
+        # a plain file write — NOT a collective — so only rank 0 writes it.
+        if getattr(engine, "global_rank", 0) != 0:
+            return None
         tag = f"dpo_step{step:07d}.pt"
         path = os.path.join(out_dir, tag)
 
@@ -519,28 +526,35 @@ def save_ds_dpo_checkpoint(
             "step": step,
             "model_state": lora_sd,
             "config": vars(config),
-            "args": args_dict,
+            "args": {
+                **args_dict,
+                "lora_rank": args.lora_rank,
+                "lora_alpha": args.lora_alpha,
+                "lora_type": args.lora_type,
+                "lora_target_modules": args.lora_target_modules,
+            },
             "is_lora": True,
         }
         os.makedirs(out_dir, exist_ok=True)
-        torch.save(ckpt, path)
+        atomic_torch_save(ckpt, path)
 
         latest = os.path.join(out_dir, "latest.pt")
-        if os.path.islink(latest):
-            os.remove(latest)
-        try:
-            os.symlink(os.path.abspath(path), latest)
-        except OSError:
-            pass
+        atomic_symlink(path, latest)
 
-        if dist.get_rank() == 0:
+        if getattr(engine, "global_rank", 0) == 0:
             print(f"[Checkpoint] saved LoRA {path}")
+            log_event(get_logger(), "checkpoint_saved", step=step, path=path,
+                      is_lora=True)
         return path
     else:
-        # Full-FT: DeepSpeed native checkpoint directory
+        # Full-FT: DeepSpeed native checkpoint directory.
+        # engine.save_checkpoint is a COLLECTIVE under ZeRO — every rank must
+        # call it, or non-master ranks hang. Sidecar writes are rank-0 only.
         tag = f"step_{step:07d}"
         path = os.path.join(out_dir, tag)
         engine.save_checkpoint(out_dir, tag=tag)
+        if getattr(engine, "global_rank", 0) != 0:
+            return None
 
         meta = {
             "step":   step,
@@ -549,17 +563,16 @@ def save_ds_dpo_checkpoint(
             "ds_tag": tag,
             "is_lora": False,
         }
-        with open(os.path.join(path, "meta.json"), "w") as f:
-            json.dump(meta, f, indent=2)
+        atomic_write_json(meta, os.path.join(path, "meta.json"))
 
         recipe.to_json(os.path.join(path, "recipe.json"))
 
         latest = os.path.join(out_dir, "latest_ds")
-        if os.path.islink(latest):
-            os.remove(latest)
-        os.symlink(os.path.abspath(path), latest)
-        if dist.get_rank() == 0:
+        atomic_symlink(path, latest)
+        if getattr(engine, "global_rank", 0) == 0:
             print(f"[Checkpoint] saved {path}")
+            log_event(get_logger(), "checkpoint_saved", step=step, path=path,
+                      is_lora=False)
         return path
 
 
@@ -597,7 +610,7 @@ def load_ds_dpo_checkpoint(
     if os.path.isfile(recipe_path):
         recipe = TrainingRecipe.from_json(recipe_path)
 
-    if dist.get_rank() == 0:
+    if getattr(engine, "global_rank", 0) == 0:
         print(f"[Checkpoint] resumed from {resume_path} at step {step}")
     return step, recipe
 
@@ -631,8 +644,7 @@ def prune_checkpoints_ds(out_dir: str, keep: int = 3, is_lora: bool = False):
         )
         for old in files[:-keep]:
             old.unlink()
-            if dist.get_rank() == 0:
-                print(f"[Checkpoint] pruned {old.name}")
+            print(f"[Checkpoint] pruned {old.name}")
     else:
         dirs = sorted(
             [d for d in Path(out_dir).iterdir()
@@ -642,8 +654,7 @@ def prune_checkpoints_ds(out_dir: str, keep: int = 3, is_lora: bool = False):
         for old in dirs[:-keep]:
             import shutil
             shutil.rmtree(old)
-            if dist.get_rank() == 0:
-                print(f"[Checkpoint] pruned {old.name}")
+            print(f"[Checkpoint] pruned {old.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +695,17 @@ def train(args):
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
+    # Ensure the process group is torn down even if an exception unwinds train().
+    atexit.register(lambda: dist.destroy_process_group() if dist.is_initialized() else None)
+
+    # Graceful shutdown on SIGINT/SIGTERM (scheduler preemption, Ctrl+C).
+    install_signal_handlers()
+    log = setup_logging()
+    if master:
+        log_event(log, "dpo_start",
+                  num_steps=args.max_steps, beta=args.beta,
+                  ref_policy=args.ref_policy, resume=args.resume)
+
     torch.manual_seed(args.seed + global_rank)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32        = True
@@ -700,11 +722,12 @@ def train(args):
             "--checkpoint is required. Point it at the SFT checkpoint "
             "produced by train_sft.py."
         )
-    ckpt_data = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ckpt_data = load_torch_checkpoint(args.checkpoint, map_location="cpu")
     config    = ModelConfig(**ckpt_data["config"])
 
-    # ---- architecture variant passthrough
-    apply_architecture_args(config, args)
+    # ---- architecture variant passthrough (only flags the user explicitly
+    # ---- set, so the checkpoint's arch like jamba / MTP heads is preserved)
+    apply_architecture_args(config, args, defaults=args.arch_defaults)
 
     # ---------------------------------------------------------------- auto LR scaling
     if not args.no_lr_scale:
@@ -732,12 +755,21 @@ def train(args):
     # ----------------------------------------------------------------- LoRA
     is_lora = args.lora
     if is_lora:
-        n_replaced = inject_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
+        target_modules = tuple(args.lora_target_modules)
+        lora_type = args.lora_type
+        n_replaced = inject_lora(
+            model,
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            target_modules=target_modules,
+            lora_type=lora_type,
+        )
         freeze_base(model)
         n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         if master:
             print(f"[LoRA] injected {n_replaced} adapters | "
-                  f"trainable={n_trainable:,} / total={count_parameters(model):,}")
+                  f"trainable={n_trainable:,} / total={count_parameters(model):,}  "
+                  f"type={lora_type}")
     else:
         n_params = count_parameters(model)
         if master:
@@ -845,7 +877,17 @@ def train(args):
     acc_window: List[float] = []
     data_iter = iter(train_ds)
 
+    interrupted = False
     for step in range(start_step, args.max_steps):
+        # --- graceful shutdown (collective-safe: all ranks agree to stop)
+        if should_stop(device, world_size):
+            interrupted = True
+            if master:
+                print(f"\n[Shutdown] requested at step {step} — "
+                      f"saving final checkpoint …")
+                log_event(log, "shutdown_requested", step=step)
+            break
+
         # LR
         lr = _cosine_lr(step, args.warmup_steps, args.max_steps,
                          args.lr, args.min_lr)
@@ -920,24 +962,38 @@ def train(args):
 
         # 7. checkpoint
         if step > start_step and step % args.save_every == 0:
+            # save_ds_dpo_checkpoint is collective for full-FT (all ranks
+            # join engine.save_checkpoint); it self-gates to rank 0 for LoRA.
+            save_ds_dpo_checkpoint(
+                engine, args.out_dir, step, config,
+                vars(args), recipe, is_lora,
+            )
             if master:
-                save_ds_dpo_checkpoint(
-                    engine, args.out_dir, step, config,
-                    vars(args), recipe, is_lora,
-                )
                 prune_checkpoints_ds(args.out_dir, keep=args.keep_ckpts, is_lora=is_lora)
 
     # ---- final
+    # On graceful shutdown `step` is exactly the next optimizer step to run
+    # (we broke at the top of iteration `step`), so saving it makes resume
+    # continue where we stopped. save_ds_dpo_checkpoint is collective for
+    # full-FT (all ranks join), so every rank must call it either way.
+    final_step = step if interrupted else args.max_steps
+    save_ds_dpo_checkpoint(
+        engine, args.out_dir, final_step, config,
+        vars(args), recipe, is_lora,
+    )
     if master:
-        save_ds_dpo_checkpoint(
-            engine, args.out_dir, args.max_steps, config,
-            vars(args), recipe, is_lora,
-        )
-        print(f"\nDPO complete. Final loss: {loss.detach().item():.4f}")
-        if is_lora:
-            print(f"\nTo merge LoRA into base weights for deployment:")
-            print(f"  python train_dpo.py --merge_lora "
-                  f"--checkpoint {args.out_dir}/latest.pt --out_dir ./dpo_merged")
+        if interrupted:
+            print(f"\n[Shutdown] checkpoint saved at step {final_step}. "
+                  f"Resume with --resume {os.path.join(args.out_dir, 'latest_ds')}")
+            log_event(log, "shutdown_checkpoint_saved", step=final_step)
+        else:
+            print(f"\nDPO complete. Final loss: {loss.detach().item():.4f}")
+            log_event(log, "training_complete", step=final_step,
+                      final_loss=loss.detach().item())
+            if is_lora:
+                print(f"\nTo merge LoRA into base weights for deployment:")
+                print(f"  python train_dpo.py --merge_lora "
+                      f"--checkpoint {args.out_dir}/latest.pt --out_dir ./dpo_merged")
 
 
 # ---------------------------------------------------------------------------
@@ -967,6 +1023,14 @@ def parse_args():
                    help="Enable LoRA adapters")
     p.add_argument("--lora-rank", type=int, default=64)
     p.add_argument("--lora-alpha", type=float, default=128.0)
+    p.add_argument("--lora-target-modules", nargs="+",
+                   default=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+                   help="Target module names for LoRA/DoRA injection")
+    p.add_argument("--lora-type", default="lora",
+                   choices=["lora", "dora"],
+                   help="Type of low-rank adaptation: LoRA or DoRA "
+                        "(Weight-Decomposed Low-Rank Adaptation)")
 
     # Reference policy
     p.add_argument("--ref-policy", default="single", choices=["single", "two"],
@@ -1024,7 +1088,11 @@ def parse_args():
     p.add_argument("--smoke-test", action="store_true",
                    help="Run the DDP variant's smoke test and exit")
 
-    return p.parse_args()
+    args = p.parse_args()
+    # Namespace of pure argparse defaults, used to detect which architecture
+    # flags the user explicitly set (see apply_architecture_args).
+    args.arch_defaults = p.parse_args([])
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -1032,6 +1100,17 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Parse args first to check for smoke-test before requiring deepspeed/GPU
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="Run self-contained smoke test (no GPU/DeepSpeed needed)")
+    parser.add_argument("--checkpoint", type=str, default=None)
+    known_args, _ = parser.parse_known_args()
+
+    if known_args.smoke_test:
+        smoke_test()
+        sys.exit(0)
+
     if not torch.cuda.is_available():
         print("ERROR: train_dpo_deepspeed.py requires at least one CUDA GPU.")
         sys.exit(1)

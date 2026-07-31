@@ -14,9 +14,10 @@ answer (analogous to the GRPO/thinking format). If present, they are formatted
 as <think>...</think> blocks inside the assistant turn.
 
 Output files in --cache-dir:
-    dpo_prompts.bin     — uint16 flat array of prompt token IDs (length-prefixed)
-    dpo_chosen.bin      — uint16 flat array of chosen completion tokens (length-prefixed)
-    dpo_rejected.bin    — uint16 flat array of rejected completion tokens (length-prefixed)
+    dpo_prompts.bin     — length-prefixed uint32 array of prompt token IDs
+    dpo_chosen.bin      — length-prefixed uint32 array of chosen completion tokens
+    dpo_rejected.bin    — length-prefixed uint32 array of rejected completion tokens
+    dpo_prompt_lens*.json — per-record prompt token lengths (for completion masking)
     dpo_manifest.json   — metadata
 
 Usage:
@@ -153,8 +154,15 @@ def tokenize_preference_triple(
     Tokenize a single preference triple into (prompt_ids, chosen_ids, rejected_ids).
 
     The prompt is formatted as:  user_turn + assistant_prefix + EOS
-    The chosen/rejected are formatted as: user_turn + assistant_prefix + body + EOS
-    where body includes optional <think>...</think> tags.
+    The chosen/rejected are the completion BODY ONLY (no prompt, no assistant
+    prefix — the prompt is stored separately and concatenated at load time by
+    PackedDPODataLoader as ``cat([prompt_ids, completion_ids])``).
+
+    IMPORTANT: previously the packer wrote the FULL sequence (prompt + body)
+    into the chosen/rejected fields while the loader ALSO concatenated the
+    prompt — producing a duplicated prompt and a completion mask that covered
+    prompt tokens. The body is now written alone so the loader's
+    ``cat([pids, cids])`` yields exactly one prompt + one completion.
 
     Returns:
         (prompt_token_ids, chosen_completion_token_ids, rejected_completion_token_ids)
@@ -168,23 +176,18 @@ def tokenize_preference_triple(
     # --- prompt tokens (for reference / concatenation in training) ---
     prompt_text = recipe.format_user_turn(prompt) + recipe.turn_prefix_assistant
     prompt_ids = tokenizer.encode(prompt_text).ids
-    prompt_ids = [min(tid, 65535) for tid in prompt_ids]
 
-    # --- chosen completion ---
+    # --- chosen completion (body only, EOS-terminated) ---
     chosen_body = _format_completion(chosen, chosen_thinking, recipe)
-    chosen_text = prompt_text + chosen_body
-    chosen_all_ids = tokenizer.encode(chosen_text).ids
-    chosen_all_ids = [min(tid, 65535) for tid in chosen_all_ids]
-    chosen_all_ids.append(eos_id)
+    chosen_ids = tokenizer.encode(chosen_body).ids
+    chosen_ids.append(eos_id)
 
-    # --- rejected completion ---
+    # --- rejected completion (body only, EOS-terminated) ---
     rejected_body = _format_completion(rejected, rejected_thinking, recipe)
-    rejected_text = prompt_text + rejected_body
-    rejected_all_ids = tokenizer.encode(rejected_text).ids
-    rejected_all_ids = [min(tid, 65535) for tid in rejected_all_ids]
-    rejected_all_ids.append(eos_id)
+    rejected_ids = tokenizer.encode(rejected_body).ids
+    rejected_ids.append(eos_id)
 
-    return prompt_ids, chosen_all_ids, rejected_all_ids
+    return prompt_ids, chosen_ids, rejected_ids
 
 
 def _format_completion(
@@ -257,49 +260,50 @@ def _write_field(
     record_indices: Optional[List[int]] = None,
 ) -> int:
     """
-    Write the specified field to a flat uint16 binary file.
+    Write the specified field as length-prefixed uint32 records.
 
-    Each record is length-prefixed (4-byte uint32 little-endian) followed by
-    that many uint16 token IDs.
+    Each record is a 4-byte little-endian uint32 length prefix followed by
+    that many uint32 token IDs — the exact format consumed by
+    ``PackedDPODataLoader._load_bin`` (train_dpo.py).
 
     Args:
-        field_name: one of "prompt_ids", "chosen_all_ids", "rejected_all_ids"
+        field_name: one of "prompt_ids", "chosen_ids", "rejected_ids"
                     (returned by tokenize_preference_triple)
 
     Returns:
         Number of records written.
     """
-    mmap_arr = np.memmap(output_path, dtype=np.uint16, mode="w+", shape=(total_tokens,))
     want = set(record_indices) if record_indices is not None else None
-    offset = 0
     records_written = 0
     record_counter = 0
+    tokens_written = 0
 
-    for _fp, _ln, rec in _read_records(files):
-        if want is not None and record_counter not in want:
+    with open(output_path, "wb") as f:
+        for _fp, _ln, rec in _read_records(files):
+            if want is not None and record_counter not in want:
+                record_counter += 1
+                continue
+
+            p_ids, c_ids, r_ids = tokenize_preference_triple(rec, recipe, tokenizer, eos_id)
+            if field_name == "prompt_ids":
+                ids = p_ids
+            elif field_name in ("chosen_ids", "chosen_all_ids"):
+                ids = c_ids
+            elif field_name in ("rejected_ids", "rejected_all_ids"):
+                ids = r_ids
+            else:
+                raise ValueError(f"Unknown field name: {field_name}")
+
+            f.write(len(ids).to_bytes(4, "little"))
+            f.write(np.asarray(ids, dtype=np.uint32).tobytes())
+            tokens_written += len(ids)
+            records_written += 1
             record_counter += 1
-            continue
 
-        p_ids, c_ids, r_ids = tokenize_preference_triple(rec, recipe, tokenizer, eos_id)
-        if field_name == "prompt_ids":
-            ids = p_ids
-        elif field_name == "chosen_all_ids":
-            ids = c_ids
-        elif field_name == "rejected_all_ids":
-            ids = r_ids
-        else:
-            raise ValueError(f"Unknown field name: {field_name}")
-
-        n = len(ids)
-        mmap_arr[offset: offset + n] = np.array(ids, dtype=np.uint16)
-        offset += n
-        records_written += 1
-        record_counter += 1
-
-    assert offset == total_tokens, (
-        f"Token count mismatch for {field_name}: expected {total_tokens}, wrote {offset}"
+    assert tokens_written == total_tokens, (
+        f"Token count mismatch for {field_name}: expected {total_tokens}, "
+        f"wrote {tokens_written}"
     )
-    mmap_arr.flush()
     return records_written
 
 
@@ -473,7 +477,8 @@ def pack_dpo(args: argparse.Namespace) -> None:
             "total_rejected_tokens": int(r_tok),
             "vocab_size": vocab_size,
             "eos_token_id": eos_id,
-            "dtype": "uint16",
+            "dtype": "uint32",
+            "format": "length-prefixed-uint32",
             "mode": recipe.mode,
             "worker": args.worker,
             "num_workers": args.num_workers,

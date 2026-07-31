@@ -158,8 +158,9 @@ def tokenize_prompt(
     if max_len > 0:
         token_ids = token_ids[:max_len]
 
-    # Clamp to uint16
-    token_ids = [min(tid, 65535) for tid in token_ids]
+    # NOTE: no uint16 clamping here — tokens are written as uint32 so the
+    # full vocab is representable (silently clipping token IDs >= 65536 would
+    # corrupt data for any tokenizer with a vocab larger than 65k).
 
     # Append EOS separator
     token_ids.append(eos_id)
@@ -198,39 +199,49 @@ def write_shard(
     max_len: int = 0,
 ) -> Tuple[int, int]:
     """
-    Pass 2: write prompt tokens into a pre-allocated memmap and
+    Pass 2: write prompt tokens in the length-prefixed uint32 format and
     save answer strings to a JSON list.
+
+    Each record is a 4-byte little-endian uint32 length prefix followed by
+    that many uint32 token IDs — the exact format consumed by
+    ``PackedGRPODataLoader._load_bin`` (train_grpo.py). This matches the
+    reference writer in train_grpo's smoke test.
 
     If *record_indices* is provided, only those records are written.
 
     Returns:
         (records_written, total_answers_written)
     """
-    mmap_tok = np.memmap(tokens_path, dtype=np.uint16, mode="w+", shape=(total_tokens,))
     answers: List[str] = []
 
     want = set(record_indices) if record_indices is not None else None
-    offset = 0
     records_written = 0
     record_counter = 0
+    tokens_written = 0
 
-    for _fp, _ln, rec in _read_records(files):
-        if want is not None and record_counter not in want:
+    with open(tokens_path, "wb") as f:
+        for _fp, _ln, rec in _read_records(files):
+            if want is not None and record_counter not in want:
+                record_counter += 1
+                continue
+
+            token_ids = tokenize_prompt(rec, recipe, tokenizer, eos_id, max_len)
+            f.write(len(token_ids).to_bytes(4, "little"))
+            f.write(np.asarray(token_ids, dtype=np.uint32).tobytes())
+            tokens_written += len(token_ids)
+            # The loader (PackedGRPODataLoader._load_json) expects a list of
+            # dicts with "answer" + "want_thinking" keys — NOT a bare string
+            # list. Writing dicts keeps records aligned 1:1 with the .bin.
+            answers.append({
+                "answer": rec.get("answer", ""),
+                "want_thinking": rec.get("want_thinking", True),
+            })
+            records_written += 1
             record_counter += 1
-            continue
 
-        token_ids = tokenize_prompt(rec, recipe, tokenizer, eos_id, max_len)
-        n = len(token_ids)
-        mmap_tok[offset: offset + n] = np.array(token_ids, dtype=np.uint16)
-        offset += n
-        answers.append(rec.get("answer", ""))
-        records_written += 1
-        record_counter += 1
-
-    assert offset == total_tokens, (
-        f"Token count mismatch: expected {total_tokens}, wrote {offset}"
+    assert tokens_written == total_tokens, (
+        f"Token count mismatch: expected {total_tokens}, wrote {tokens_written}"
     )
-    mmap_tok.flush()
 
     # Write answer strings
     with open(answers_path, "w", encoding="utf-8") as f:
@@ -354,7 +365,8 @@ def pack_grpo(args: argparse.Namespace) -> None:
         "num_answers": n_answers,
         "vocab_size": vocab_size,
         "eos_token_id": eos_id,
-        "dtype": "uint16",
+        "dtype": "uint32",
+        "format": "length-prefixed-uint32",
         "mode": recipe.mode,
         "worker": args.worker,
         "num_workers": args.num_workers,

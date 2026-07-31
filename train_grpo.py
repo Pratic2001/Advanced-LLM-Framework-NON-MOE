@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import glob
 import json
 import math
@@ -44,12 +45,15 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tokenizers import Tokenizer
 
 from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, count_parameters
 from recipe import TrainingRecipe, get_recipe, add_recipe_args, recipe_from_args
+
+from atomic_io import atomic_symlink, atomic_torch_save, load_torch_checkpoint
+from shutdown import install_signal_handlers, should_stop
+from logging_utils import setup_logging, get_logger, log_event
 from train_sft import SFTDataset
 
 # ---------------------------------------------------------------------------
@@ -284,10 +288,15 @@ class GRPOPromptDataset:
         tokenizer: Tokenizer,
         max_prompt_len: int,
         eos_id: int,
+        recipe: Optional[TrainingRecipe] = None,
     ):
         self.tokenizer      = tokenizer
         self.max_prompt_len = max_prompt_len
         self.eos_id         = eos_id
+        # Chat template used to format prompts (matches data/pack_grpo.py and
+        # data/pack_sft.py). Defaults to the standard ChatML recipe so the
+        # --prompts_file path formats prompts identically to the packed path.
+        self.recipe = recipe if recipe is not None else TrainingRecipe()
 
         if prompts_file:
             self._init_from_jsonl(prompts_file)
@@ -344,7 +353,7 @@ class GRPOPromptDataset:
         # below can index straight into that shard's own memmap.
         boundaries: List[Tuple[int, int, int]] = []
         for shard_idx, (tok_arr, mask_arr) in enumerate(zip(tok_shards, mask_shards)):
-            for s, e in self._scan_boundaries(mask_arr, tok_arr):
+            for s, e in self._scan_boundaries(mask_arr, tok_arr, eos_id=self.eos_id):
                 boundaries.append((shard_idx, s, e))
 
         # ---- recover the original `answer` strings from the JSONL pool
@@ -395,13 +404,15 @@ class GRPOPromptDataset:
 
     # ----------------------------------------------------------------------
     @staticmethod
-    def _scan_boundaries(mask_arr: np.ndarray, tok_arr: np.ndarray) -> List[Tuple[int, int]]:
+    def _scan_boundaries(mask_arr: np.ndarray, tok_arr: np.ndarray, eos_id: int = 0) -> List[Tuple[int, int]]:
         """
         Walk the mask array and return sample boundaries.
 
         A boundary ends at a position where mask is 0 *and* the
         corresponding token is the EOS special id (the separator
-        written between records).
+        written between records). ``eos_id`` is parameterised so this
+        works with any recipe — earlier it was hard-coded to 0 which
+        silently broke any tokenizer whose EOS wasn't at id 0.
 
         Returns: list of (start, end_exclusive) tuples.
 
@@ -412,8 +423,8 @@ class GRPOPromptDataset:
         if n == 0:
             return []
 
-        # Candidate separator positions: mask==0 and token==EOS(0).
-        candidates = np.flatnonzero((mask_arr == 0) & (tok_arr == 0))
+        # Candidate separator positions: mask==0 and token==EOS.
+        candidates = np.flatnonzero((mask_arr == 0) & (tok_arr == eos_id))
 
         # Positions where mask==1, needed to confirm "in_record" was
         # true since the last boundary.
@@ -448,6 +459,13 @@ class GRPOPromptDataset:
         """
         Stream JSONL shards under data_dir and collect each record's
         ``answer`` field, in the same order ``data/pack_sft.py`` saw them.
+
+        If ``data_dir`` is provided but no JSONL shards exist there,
+        raise — this used to silently produce empty answers, which
+        every reward then treated as "format only" → rewards all
+        capped at the format weight and the policy never learned
+        anything. ``data_dir=None`` (the --prompts_file path) is
+        allowed to skip JSONL matching.
         """
         if not data_dir:
             return [""] * n_expected
@@ -455,9 +473,12 @@ class GRPOPromptDataset:
         if not paths:
             paths = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
         if not paths:
-            print(f"[PackedDataset] no JSONL found under {data_dir}; "
-                  f"every prompt will get an empty ground truth.")
-            return [""] * n_expected
+            raise FileNotFoundError(
+                f"[PackedDataset] no JSONL found under {data_dir} "
+                f"(expected one *.jsonl per shard, or one top-level .jsonl). "
+                f"Run data/pack_sft.py first or pass --prompts_file to skip "
+                f"the packed path."
+            )
 
         answers: List[str] = []
         for p in paths:
@@ -511,8 +532,9 @@ class GRPOPromptDataset:
 
     # ----------------------------------------------------------------------
     def _format_prompt(self, prompt: str) -> Optional[List[int]]:
-        """ChatML user-turn prefix, matches data/pack_sft.py formatting."""
-        text = f"user\n{prompt}\nassistant\n"
+        """User-turn prefix via the recipe's chat template, matches
+        ``data/pack_grpo.py`` (user turn + assistant turn prefix)."""
+        text = self.recipe.format_user_turn(prompt) + self.recipe.turn_prefix_assistant
         ids = self.tokenizer.encode(text, add_special_tokens=False).ids
         if len(ids) >= self.max_prompt_len:
             return None
@@ -633,21 +655,15 @@ class PackedGRPODataLoader:
     @staticmethod
     def _load_bin(path: str) -> List[List[int]]:
         """Load length-prefixed uint32 records from a .bin file."""
-        with open(path, "rb") as f:
-            data = f.read()
+        arr = np.fromfile(path, dtype=np.uint32)
         records: List[List[int]] = []
         offset = 0
-        while offset < len(data):
-            n_tokens = int.from_bytes(data[offset:offset + 4], "little")
-            offset += 4
-            tokens = []
-            for i in range(n_tokens):
-                tok = int.from_bytes(
-                    data[offset + i * 4:offset + (i + 1) * 4], "little"
-                )
-                tokens.append(tok)
-            offset += n_tokens * 4
-            records.append(tokens)
+        total = arr.shape[0]
+        while offset < total:
+            n_tokens = int(arr[offset])
+            offset += 1
+            records.append(arr[offset:offset + n_tokens].tolist())
+            offset += n_tokens
         return records
 
     @staticmethod
@@ -666,7 +682,10 @@ class PackedGRPODataLoader:
 
         for i in range(0, len(indices), self.batch_size):
             batch_idx = indices[i:i + self.batch_size]
-            prompt_ids = torch.stack([self._prompt_ids[j] for j in batch_idx])
+            # Yield a LIST of per-prompt tensors (not a stacked tensor) —
+            # prompts have variable length and callers left-pad via
+            # generate_rollouts(). torch.stack would crash on mixed lengths.
+            prompt_ids = [self._prompt_ids[j] for j in batch_idx]
             answers = [self._answers[j] for j in batch_idx]
             want_thinking = [self._want_thinking[j] for j in batch_idx]
             yield prompt_ids, answers, want_thinking
@@ -787,7 +806,10 @@ def generate_rollouts(
             cumsp = sp.cumsum(dim=-1)
             keep = cumsp <= top_p
             keep[..., 0] = True
-            mask = torch.full_like(logits, False)
+            # full_like(logits, False) would inherit logits' float dtype and
+            # scatter_() would raise a dtype mismatch — build an explicit bool
+            # mask instead.
+            mask = torch.zeros_like(logits, dtype=torch.bool)
             mask.scatter_(-1, sorted_idx, keep)
             logits = torch.where(mask, logits, torch.full_like(logits, float("-inf")))
 
@@ -953,7 +975,7 @@ def build_reference(
                 "--ref_policy two requires --checkpoint pointing at the SFT checkpoint."
             )
         ref_model = TransformerForCausalLM(config).to(device)
-        ckpt = torch.load(sft_ckpt_path, map_location=device, weights_only=False)
+        ckpt = load_torch_checkpoint(sft_ckpt_path, map_location=device)
         ref_model.load_state_dict(ckpt["model_state"])
         if hasattr(ref_model, "tie_weights"):
             ref_model.tie_weights()
@@ -1002,20 +1024,17 @@ def save_grpo_checkpoint(
     }
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"grpo_step{step:07d}.pt")
-    torch.save(ckpt, path)
+    atomic_torch_save(ckpt, path)
     latest = os.path.join(out_dir, "latest.pt")
-    if os.path.islink(latest):
-        os.remove(latest)
-    try:
-        os.symlink(os.path.abspath(path), latest)
-    except OSError:
-        pass
+    atomic_symlink(path, latest)
 
     # Save recipe alongside checkpoint
     recipe_path = os.path.join(out_dir, "recipe.json")
     recipe.to_json(recipe_path)
 
     print(f"[Checkpoint] saved {path}")
+    log_event(get_logger(), "checkpoint_saved", step=step, path=path,
+              is_lora=is_lora)
     return path
 
 
@@ -1027,7 +1046,7 @@ def load_grpo_checkpoint(
     is_lora: bool,
 ) -> int:
     """Load GRPO checkpoint and return step."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = load_torch_checkpoint(path, map_location=device)
     raw = _raw(model)
     state = ckpt["model_state"]
     if is_lora:
@@ -1055,11 +1074,14 @@ def load_grpo_checkpoint(
 def validate(
     model: TransformerForCausalLM,
     val_dataset: PackedGRPODataLoader,
+    tokenizer,
     recipe: TrainingRecipe,
     max_new_tokens: int,
     eos_id: int,
     pad_id: int,
     num_generations: int,
+    reward_correct: float = 1.0,
+    reward_format: float = 0.3,
     temperature: float = 0.7,
     top_p: float = 0.95,
     device: Optional[torch.device] = None,
@@ -1067,7 +1089,8 @@ def validate(
     """
     Run generation-based validation over a subset of prompts.
 
-    Returns metrics dict with accuracy, avg reward, think rate.
+    Returns metrics dict with accuracy (mean of `correct` flag across
+    completions), avg reward, and think rate (mean of `has_think` flag).
     """
     if device is None:
         device = next(model.parameters()).device
@@ -1085,16 +1108,16 @@ def validate(
             break
 
         prompt_ids_list = [p.tolist() for p in prompt_ids]
-        expanded_p = []
-        expanded_a = []
-        expanded_wt = []
+        expanded_p: List[List[int]] = []
+        expanded_a: List[str] = []
+        expanded_wt: List[Optional[bool]] = []
         for p, a, wt in zip(prompt_ids_list, answers, want_thinking):
             for _ in range(num_generations):
                 expanded_p.append(p)
                 expanded_a.append(a)
                 expanded_wt.append(wt)
 
-        full_ids, gen_mask, _prompt_pad_mask = generate_rollouts(
+        full_ids, gen_mask, _sampled_lp, _prompt_pad_mask = generate_rollouts(
             model, expanded_p, recipe,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -1105,19 +1128,31 @@ def validate(
         )
 
         P_max = max(len(p) for p in expanded_p)
-        for i, (pids, answer, wt) in enumerate(zip(expanded_p, expanded_a, expanded_wt)):
+        completions_text: List[str] = []
+        for i, pids in enumerate(expanded_p):
             start = P_max - len(pids)
             active = int(gen_mask[i].sum().item())
-            gen_ids = full_ids[i, start + len(pids):start + len(pids) + active].tolist()
-            completion_text = val_dataset._prompt_ids[0].new_zeros(1).tolist()  # placeholder
-            # Decode via tokenizer (must be available externally)
-            # In practice, we need the tokenizer. For simplicity, decode in the caller.
-            all_correct.append(0)  # placeholder
+            gen_ids = full_ids[i, start + len(pids):
+                               start + len(pids) + active].tolist()
+            completions_text.append(tokenizer.decode(gen_ids, skip_special_tokens=False))
+
+        # Score each completion with the same reward_fn the trainer uses,
+        # so val metrics are directly comparable to training rewards.
+        for completion, answer, wt in zip(completions_text, expanded_a, expanded_wt):
+            r, info = reward_fn(
+                completion, answer, wt, recipe,
+                max_new_tokens=max_new_tokens,
+                correct_weight=reward_correct,
+                format_weight=reward_format,
+            )
+            all_rewards.append(r)
+            all_correct.append(info.get("correct", 0))
+            all_think.append(info.get("has_think", 0))
 
     model.train()
     return {
         "avg_reward": float(np.mean(all_rewards)) if all_rewards else 0.0,
-        "accuracy": float(np.mean(all_correct)) if all_correct else 0.0,
+        "accuracy":   float(np.mean(all_correct)) if all_correct else 0.0,
         "think_rate": float(np.mean(all_think)) if all_think else 0.0,
     }
 
@@ -1206,7 +1241,7 @@ def smoke_test():
 
     # Save fake SFT checkpoint
     sft_ckpt_path = os.path.join(ckpt_dir, "sft.pt")
-    torch.save({"model_state": model.state_dict(), "config": vars(config)}, sft_ckpt_path)
+    atomic_torch_save({"model_state": model.state_dict(), "config": vars(config)}, sft_ckpt_path)
 
     # ---- inject LoRA for lower memory
     from peft.lora import inject_lora, lora_state_dict
@@ -1232,7 +1267,7 @@ def smoke_test():
         expanded_a = [a for a in batch_answers for _ in range(2)]
         expanded_wt = [wt for wt in batch_wt for _ in range(2)]
 
-        full_ids, gen_mask, _prompt_pad_mask = generate_rollouts(
+        full_ids, gen_mask, _sampled_lp, _prompt_pad_mask = generate_rollouts(
             model, expanded_p, recipe,
             max_new_tokens=32,
             temperature=1.0, top_p=0.95,
@@ -1315,6 +1350,17 @@ def train(args: argparse.Namespace):
     rank, local_rank, world_size, device = setup_distributed()
     master = is_master(rank)
 
+    # Ensure the process group is torn down even if an exception unwinds train().
+    # Idempotent: destroy checks dist.is_initialized().
+    atexit.register(lambda: dist.destroy_process_group() if dist.is_initialized() else None)
+
+    # Graceful shutdown on SIGINT/SIGTERM (scheduler preemption, Ctrl+C).
+    install_signal_handlers()
+    log = setup_logging()
+    log_event(log, "grpo_start",
+              model_size=args.model_size, num_steps=args.max_steps,
+              num_generations=args.num_generations, resume=args.resume)
+
     torch.manual_seed(args.seed + rank)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -1329,11 +1375,14 @@ def train(args: argparse.Namespace):
     if not args.checkpoint:
         raise FileNotFoundError("--checkpoint is required (SFT checkpoint).")
 
-    ckpt_data = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ckpt_data = load_torch_checkpoint(args.checkpoint, map_location="cpu")
     config = ModelConfig(**{k: v for k, v in ckpt_data["config"].items()
                             if k in ModelConfig.__init__.__code__.co_varnames})
 
-    apply_architecture_args(config, args)
+    # Apply architecture flags BEFORE building the model, but only the ones
+    # the user explicitly set — preserve the checkpoint's architecture
+    # (e.g. jamba / MTP heads) unless deliberately overridden.
+    apply_architecture_args(config, args, defaults=args.arch_defaults)
 
     model = TransformerForCausalLM(config).to(device)
     model.load_state_dict(ckpt_data["model_state"])
@@ -1456,7 +1505,17 @@ def train(args: argparse.Namespace):
     step = start_step
     data_iter = iter(train_ds)
 
+    interrupted = False
     while step < args.max_steps:
+        # --- graceful shutdown (collective-safe: all ranks agree to stop)
+        if should_stop(device, world_size):
+            interrupted = True
+            if master:
+                print(f"\n[Shutdown] requested at step {step} — "
+                      f"saving final checkpoint …")
+                log_event(log, "shutdown_requested", step=step)
+            break
+
         lr = scheduler(step)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
@@ -1583,11 +1642,22 @@ def train(args: argparse.Namespace):
 
     # final
     if master:
+        # On graceful shutdown `step` is exactly the next optimizer step to
+        # run (we broke at the top of iteration `step`), so saving it makes
+        # resume continue where we stopped — no lost progress.
+        final_step = step if interrupted else args.max_steps
         save_grpo_checkpoint(
-            args.out_dir, step, model, optimizer, config,
+            args.out_dir, final_step, model, optimizer, config,
             vars(args), is_lora, recipe,
         )
-        print(f"\nGRPO complete. Final loss: {loss.item():.4f}")
+        if interrupted:
+            print(f"\n[Shutdown] checkpoint saved at step {final_step}. "
+                  f"Resume with --resume {os.path.join(args.out_dir, 'latest.pt')}")
+            log_event(log, "shutdown_checkpoint_saved", step=final_step)
+        else:
+            print(f"\nGRPO complete. Final loss: {loss.item():.4f}")
+            log_event(log, "training_complete", step=final_step,
+                      final_loss=loss.item())
 
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -1640,7 +1710,8 @@ def parse_args():
 
     # GRPO loss
     p.add_argument("--kl-coef", type=float, default=0.02)
-    p.add_argument("--clip-range", type=float, default=0.2)
+    p.add_argument("--clip-ratio", type=float, default=0.2,
+                   help="PPO clipping range (epsilon) for the policy ratio.")
     p.add_argument("--entropy-coeff", type=float, default=0.0,
                    help="Entropy bonus coefficient (0 = disabled)")
 
@@ -1682,7 +1753,11 @@ def parse_args():
     p.add_argument("--smoke-test", action="store_true",
                    help="Run a self-contained smoke test and exit")
 
-    return p.parse_args()
+    args = p.parse_args()
+    # Namespace of pure argparse defaults, used to detect which architecture
+    # flags the user explicitly set (see apply_architecture_args).
+    args.arch_defaults = p.parse_args([])
+    return args
 
 
 if __name__ == "__main__":

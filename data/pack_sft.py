@@ -175,9 +175,10 @@ def tokenize_record(
     user_ids = tokenizer.encode(user_text).ids
     assistant_ids = tokenizer.encode(assistant_text).ids
 
-    # Clamp to uint16
-    user_ids = [min(tid, 65535) for tid in user_ids]
-    assistant_ids = [min(tid, 65535) for tid in assistant_ids]
+    # NOTE: no uint16 clamp here. The on-disk dtype is chosen from
+    # ``vocab_size`` (uint16 when vocab <= 65536, else uint32), so clamping
+    # to 65535 would silently corrupt token ids above that range for large
+    # vocabs. Writing the full ids relies on the caller's dtype selection.
 
     # Truncate if necessary, preserving at least a few answer tokens
     if max_len > 0:

@@ -154,6 +154,20 @@ class TrainingRecipe:
             body = answer
         return f"{self.turn_prefix_assistant}{body}{self.turn_suffix_assistant}"
 
+    def format_system_turn(self, system: str) -> str:
+        """Format a system message with the same prefix/suffix pair as a user
+        turn but with the role tag rewritten. Default ChatML layout uses
+        ``system\\n{system}\\n``. Subclasses / custom templates should
+        override this rather than relying on string substitution.
+        """
+        if not system:
+            return ""
+        # Explicit rewrite — do NOT use ``replace('user', 'system')`` because
+        # if the prefix ever contains the substring ``user`` inside the
+        # content (e.g. content references "user") it would corrupt output.
+        prefix = self.turn_prefix_user.replace("user", "system")
+        return f"{prefix}{system}{self.turn_suffix_user}"
+
     def format_full_conversation(
         self,
         prompt: str,
@@ -166,8 +180,7 @@ class TrainingRecipe:
         assistant turn. This is the string that gets tokenised and packed."""
         parts: List[str] = []
         if system:
-            parts.append(f"{self.turn_prefix_user.replace('user', 'system')}"
-                         f"{system}{self.turn_suffix_user}")
+            parts.append(self.format_system_turn(system))
         parts.append(self.format_user_turn(prompt))
         parts.append(self.format_assistant_turn(
             thinking=thinking, answer=answer, want_thinking=want_thinking,

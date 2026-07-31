@@ -56,6 +56,10 @@ from model import ModelConfig, TransformerForCausalLM, add_architecture_args, ap
 from optim.build_optimizer import build_optimizer
 from optim.lr_schedule import build_scheduler
 
+from atomic_io import atomic_symlink, atomic_torch_save, atomic_write_json, load_torch_checkpoint
+from shutdown import install_signal_handlers, should_stop
+from logging_utils import setup_logging, get_logger, log_event
+
 
 # ---------------------------------------------------------------------------
 # ── LOSS (pre-shifted targets) ───────────────────────────────────────────────
@@ -267,13 +271,28 @@ class PackedDataLoader:
                 f"{split}.bin, or pretrain_tokens*.bin in {data_dir}"
             )
 
+        # ---- resolve token dtype from meta files ----------------------------
+        # pack_pretrain.py stores uint32 when vocab_size > 65536; the .bin
+        # dtype must match or ids > 65535 get corrupted on load.
+        dtype_t = np.dtype("uint16")
+        for mf in sorted(glob.glob(os.path.join(data_dir, "meta*.json"))):
+            try:
+                with open(mf, "r") as f:
+                    m = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if m.get("split", "all") in (split, "all"):
+                dtype_t = np.dtype(m.get("dtype", "uint16"))
+                break
+        self.dtype_t = dtype_t
+
         # ---- memmap all files, build cumulative offset table  ---------------
         self.file_paths = patterns
         self.memmaps: List[np.memmap] = []
         self.cumulative_offsets: List[int] = []
         total_tokens = 0
         for p in patterns:
-            mm = np.memmap(p, dtype=np.uint16, mode="r")
+            mm = np.memmap(p, dtype=self.dtype_t, mode="r")
             self.memmaps.append(mm)
             self.cumulative_offsets.append(total_tokens)
             total_tokens += len(mm)
@@ -317,7 +336,7 @@ class PackedDataLoader:
         Read ``length`` tokens starting at ``global_start``, handling
         cross-file boundaries.  Short windows are padded with ``pad_id``.
         """
-        result = np.empty(length, dtype=np.uint16)
+        result = np.empty(length, dtype=self.dtype_t)
         written = 0
         pos = global_start
 
@@ -379,7 +398,13 @@ class PackedDataLoader:
         x_np = np.stack(x_list).astype(np.int64)
         y_np = np.stack(y_list).astype(np.int64)
 
-        device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK', '0')}")
+        # Match the model's device selection: CUDA when available, CPU
+        # otherwise (CPU fallback matters for smoke tests and CPU-only hosts —
+        # a hardcoded cuda:0 crashes even when is_available() is False).
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK', '0')}")
+        else:
+            device = torch.device("cpu")
         x_gpu = torch.from_numpy(x_np).to(device, non_blocking=True)
         y_gpu = torch.from_numpy(y_np).to(device, non_blocking=True)
 
@@ -446,9 +471,12 @@ class PackedDataLoaderSequential:
         y_np = np.stack(y_list).astype(np.int64)
 
         if self._device is None:
-            self._device = torch.device(
-                f"cuda:{os.environ.get('LOCAL_RANK', '0')}"
-            )
+            if torch.cuda.is_available():
+                self._device = torch.device(
+                    f"cuda:{os.environ.get('LOCAL_RANK', '0')}"
+                )
+            else:
+                self._device = torch.device("cpu")
         x_gpu = torch.from_numpy(x_np).to(self._device, non_blocking=True)
         y_gpu = torch.from_numpy(y_np).to(self._device, non_blocking=True)
         return x_gpu, y_gpu
@@ -645,41 +673,36 @@ def save_checkpoint(
         ckpt["optimizer_state"] = [opt.state_dict() for opt in optimizers]
 
     step_path = os.path.join(checkpoint_dir, f"step_{step:05d}.pt")
-    torch.save(ckpt, step_path)
+    # Atomic write: tmp file + fsync + rename, so a crash mid-save never
+    # leaves a torn .pt that `latest_checkpoint` points at.
+    atomic_torch_save(ckpt, step_path)
+    log_event(get_logger(), "checkpoint_saved", step=step, path=step_path)
 
     # ---- config.json  -------------------------------------------------------
     config_path = os.path.join(checkpoint_dir, "config.json")
-    with open(config_path, "w") as f:
-        json.dump(vars(config), f, indent=2, default=str)
+    atomic_write_json(vars(config), config_path)
 
     # ---- meta.json  --------------------------------------------------------
     meta_path = os.path.join(checkpoint_dir, "meta.json")
-    with open(meta_path, "w") as f:
-        json.dump(
-            {
-                "step": step,
-                "total_tokens": total_tokens,
-                "best_val_loss": best_val_loss,
-            },
-            f,
-            indent=2,
-        )
+    atomic_write_json(
+        {
+            "step": step,
+            "total_tokens": total_tokens,
+            "best_val_loss": best_val_loss,
+        },
+        meta_path,
+    )
 
     # ---- recipe.json  ------------------------------------------------------
     if recipe is not None:
         recipe_path = os.path.join(checkpoint_dir, "recipe.json")
-        with open(recipe_path, "w") as f:
-            json.dump(recipe, f, indent=2, default=str)
+        atomic_write_json(recipe, recipe_path)
 
     # ---- latest_checkpoint symlink  -----------------------------------------
+    # atomic_symlink replaces any existing file/symlink in place — no window
+    # where `latest_checkpoint` is missing between remove() and symlink().
     latest = os.path.join(checkpoint_dir, "latest_checkpoint")
-    if os.path.islink(latest) or os.path.exists(latest):
-        if os.path.islink(latest):
-            os.remove(latest)
-        else:
-            # Regular file or directory — remove it so the symlink can be placed
-            os.remove(latest)
-    os.symlink(os.path.abspath(step_path), latest)
+    atomic_symlink(step_path, latest)
 
     print(f"[Checkpoint] saved {step_path}")
     return step_path
@@ -716,7 +739,7 @@ def load_checkpoint(
     else:
         raise FileNotFoundError(f"Checkpoint path not found: {path}")
 
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    ckpt = load_torch_checkpoint(ckpt_path, map_location=device)
 
     raw_model = model.module if isinstance(model, DDP) else model
     state_model = getattr(raw_model, "_orig_mod", raw_model)
@@ -1009,6 +1032,16 @@ def _train(
 ) -> None:
     """Inner training routine (called by ``main_ddp`` per process)."""
     master = is_master(rank)
+    log = setup_logging()
+
+    # Graceful shutdown on SIGINT/SIGTERM (scheduler preemption, Ctrl+C):
+    # finish the current step, save a final checkpoint, exit cleanly.
+    install_signal_handlers()
+    if master:
+        log_event(log, "pretrain_start",
+                  model_size=args.model_size, num_steps=args.num_steps,
+                  seq_len=args.seq_len, batch_size=args.batch_size,
+                  grad_accum=args.grad_accum, resume=args.resume)
 
     torch.manual_seed(args.seed + rank)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -1038,9 +1071,7 @@ def _train(
                 config = _build_config(args, vocab_size)
         elif os.path.isfile(args.resume) or os.path.islink(args.resume):
             # Try loading directly from checkpoint file
-            ckpt_raw = torch.load(
-                args.resume, map_location="cpu", weights_only=False,
-            )
+            ckpt_raw = load_torch_checkpoint(args.resume, map_location="cpu")
             if "config" in ckpt_raw:
                 config = ModelConfig(**ckpt_raw["config"])
                 if master:
@@ -1195,7 +1226,17 @@ def _train(
     grad_norm_accum = torch.zeros((), device=device)
     tokens_accum = 0
 
+    interrupted = False
     for step in range(start_step, args.num_steps):
+
+        # ---- graceful shutdown (collective-safe: all ranks agree to stop)
+        if should_stop(device, world_size):
+            interrupted = True
+            if master:
+                print(f"\n[Shutdown] requested at step {step} — "
+                      f"saving final checkpoint …")
+                log_event(log, "shutdown_requested", step=step)
+            break
 
         # ---- LR
         lr = scheduler(step)
@@ -1233,7 +1274,11 @@ def _train(
             opt.step()
             opt.zero_grad(set_to_none=True)
 
-        total_tokens += tokens_per_step * world_size
+        # tokens_per_step already accounts for world_size (it is the global
+        # token count per optimizer step across all ranks), so do NOT
+        # multiply by world_size again — that over-counts cumulative tokens
+        # stored in checkpoints by a factor of world_size.
+        total_tokens += tokens_per_step
 
         # ---- CUDA sync for accurate timing
         if device.type == "cuda":
@@ -1273,7 +1318,12 @@ def _train(
             t0 = t1
 
         # ---- validation
-        if master and step % args.val_every == 0 and step > start_step + 1:
+        # All ranks must run validate() and join the all_reduce below —
+        # guarding them with `if master:` made non-master ranks skip the
+        # collective and deadlock the whole job at the first eval step.
+        if step % args.val_every == 0 and step > start_step + 1:
+            # Each rank validates its own shard of the val set; the
+            # all_reduce(AVG) then reports the loss over the full val set.
             val_random, val_seq = validate(
                 model, val_loader, pad_id=0,
                 max_batches=args.eval_steps, ctx=amp_ctx,
@@ -1292,21 +1342,22 @@ def _train(
                 val_seq = vs.item()
                 val_loss = val_seq
 
-            print(
-                f"  [eval] step {step:7d} | val_random {val_random:.4f} | "
-                f"val_seq {val_seq:.4f}"
-            )
-            if use_wandb:
-                log_wandb(
-                    {
-                        "val/loss": val_loss,
-                        "val/loss_random": val_random,
-                        "val/loss_seq": val_seq,
-                    },
-                    step=step,
+            if master:
+                print(
+                    f"  [eval] step {step:7d} | val_random {val_random:.4f} | "
+                    f"val_seq {val_seq:.4f}"
                 )
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+                if use_wandb:
+                    log_wandb(
+                        {
+                            "val/loss": val_loss,
+                            "val/loss_random": val_random,
+                            "val/loss_seq": val_seq,
+                        },
+                        step=step,
+                    )
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
 
         # ---- checkpoint
         if master and step % args.save_every == 0 and step > start_step + 1:
@@ -1327,9 +1378,14 @@ def _train(
     # ---- final checkpoint
     if master:
         recipe = _build_recipe(args, config)
+        # On graceful shutdown we broke at the top of iteration `step`
+        # without executing it, so `step` is exactly the next optimizer step
+        # to run — saving it makes resume continue where we stopped, with no
+        # lost progress and no re-run of a completed step.
+        final_step = step if interrupted else args.num_steps
         save_checkpoint(
             checkpoint_dir=args.checkpoint_dir,
-            step=args.num_steps,
+            step=final_step,
             model=model,
             optimizers=optimizers,
             config=config,
@@ -1338,7 +1394,14 @@ def _train(
             recipe=recipe,
             train_args=vars(args),
         )
-        print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
+        if interrupted:
+            print(f"\n[Shutdown] checkpoint saved at step {final_step}. "
+                  f"Resume with --resume {os.path.join(args.checkpoint_dir, 'latest_checkpoint')}")
+            log_event(log, "shutdown_checkpoint_saved", step=final_step)
+        else:
+            print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
+            log_event(log, "training_complete", step=final_step,
+                      best_val_loss=best_val_loss)
 
 
 def _build_config(args: argparse.Namespace, vocab_size: int) -> ModelConfig:

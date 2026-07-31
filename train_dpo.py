@@ -38,6 +38,7 @@ Reference:
 from __future__ import annotations
 
 import argparse
+import atexit
 import glob
 import json
 import math
@@ -58,6 +59,10 @@ from tokenizers import Tokenizer
 
 from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, count_parameters
 from recipe import TrainingRecipe, get_recipe, add_recipe_args, recipe_from_args
+
+from atomic_io import atomic_symlink, atomic_torch_save, load_torch_checkpoint
+from shutdown import install_signal_handlers, should_stop
+from logging_utils import setup_logging, get_logger, log_event
 
 # ---------------------------------------------------------------------------
 # Hardware TFLOPS table (for throughput estimation)
@@ -146,13 +151,15 @@ def get_special_token_id(tokenizer: Tokenizer, token: str) -> int:
 # ---------------------------------------------------------------------------
 #
 # Data layout:
-#   dpo_prompts.bin     — flat uint16 array, length-prefixed records
-#   dpo_chosen.bin      — flat uint16 array, (prompt + chosen completion) length-prefixed
-#   dpo_rejected.bin    — flat uint16 array, (prompt + rejected completion) length-prefixed
+#   dpo_prompts.bin     — length-prefixed uint32 records of prompt token IDs
+#   dpo_chosen.bin      — length-prefixed uint32 records of chosen completion token IDs
+#   dpo_rejected.bin    — length-prefixed uint32 records of rejected completion token IDs
 #   dpo_prompt_lens.json — JSON array of prompt token lengths (for masking)
 #
 # Each .bin record has a 4-byte uint32 length prefix followed by that many
-# uint16 token IDs. Records align 1:1 across the three .bin files.
+# uint32 token IDs. Records align 1:1 across the three .bin files. The
+# chosen/rejected fields are completion-body tokens ONLY — the prompt is
+# stored separately and concatenated in __iter__ as cat([prompt, completion]).
 
 
 class PackedDPODataLoader:
@@ -242,22 +249,16 @@ class PackedDPODataLoader:
     # ------------------------------------------------------------------
     @staticmethod
     def _load_bin(path: str) -> List[List[int]]:
-        """Load length-prefixed uint16 records from a .bin file."""
-        with open(path, "rb") as f:
-            data = f.read()
+        """Load length-prefixed uint32 records from a .bin file."""
+        arr = np.fromfile(path, dtype=np.uint32)
         records: List[List[int]] = []
         offset = 0
-        while offset < len(data):
-            n_tokens = int.from_bytes(data[offset: offset + 4], "little")
-            offset += 4
-            tokens = []
-            for i in range(n_tokens):
-                tok = int.from_bytes(
-                    data[offset + i * 2: offset + (i + 1) * 2], "little"
-                )
-                tokens.append(tok)
-            offset += n_tokens * 2
-            records.append(tokens)
+        total = arr.shape[0]
+        while offset < total:
+            n_tokens = int(arr[offset])
+            offset += 1
+            records.append(arr[offset:offset + n_tokens].tolist())
+            offset += n_tokens
         return records
 
     @staticmethod
@@ -495,7 +496,7 @@ def build_reference(
                 "--ref_policy two requires --checkpoint pointing at the SFT checkpoint."
             )
         ref_model = TransformerForCausalLM(config).to(device)
-        ckpt = torch.load(sft_ckpt_path, map_location=device, weights_only=False)
+        ckpt = load_torch_checkpoint(sft_ckpt_path, map_location=device)
         ref_model.load_state_dict(ckpt["model_state"])
         if hasattr(ref_model, "tie_weights"):
             ref_model.tie_weights()
@@ -545,19 +546,16 @@ def save_dpo_checkpoint(
     }
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"dpo_step{step:07d}.pt")
-    torch.save(ckpt, path)
+    atomic_torch_save(ckpt, path)
     latest = os.path.join(out_dir, "latest.pt")
-    if os.path.islink(latest):
-        os.remove(latest)
-    try:
-        os.symlink(os.path.abspath(path), latest)
-    except OSError:
-        pass
+    atomic_symlink(path, latest)
 
     # Save recipe alongside checkpoint
     recipe.to_json(os.path.join(out_dir, "recipe.json"))
 
     print(f"[Checkpoint] saved {path}")
+    log_event(get_logger(), "checkpoint_saved", step=step, path=path,
+              is_lora=is_lora)
     return path
 
 
@@ -569,7 +567,7 @@ def load_dpo_checkpoint(
     is_lora: bool,
 ) -> int:
     """Load DPO checkpoint and return step."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = load_torch_checkpoint(path, map_location=device)
     raw = _raw(model)
     state = ckpt["model_state"]
     if is_lora:
@@ -733,27 +731,24 @@ def smoke_test():
         chosen_thinking = rec.get("chosen_thinking", "")
         rejected_thinking = rec.get("rejected_thinking", "")
 
-        # Tokenize (same logic as pack_dpo)
+        # Tokenize (same logic as pack_dpo: prompt stored separately, the
+        # chosen/rejected fields carry completion-body tokens only so that the
+        # loader's cat([pids, cids]) does NOT duplicate the prompt).
         prompt_text = (
             recipe.format_user_turn(prompt) + recipe.turn_prefix_assistant
         )
         p_ids = tok.encode(prompt_text).ids
-        p_ids = [min(tid, 65535) for tid in p_ids]
 
         chosen_body = recipe.format_assistant_turn(
             thinking=chosen_thinking, answer=chosen, want_thinking=True,
         )
-        chosen_text = prompt_text + chosen_body
-        c_ids = tok.encode(chosen_text).ids
-        c_ids = [min(tid, 65535) for tid in c_ids]
+        c_ids = tok.encode(chosen_body).ids
         c_ids.append(eos_id)
 
         rejected_body = recipe.format_assistant_turn(
             thinking=rejected_thinking, answer=rejected, want_thinking=True,
         )
-        rejected_text = prompt_text + rejected_body
-        r_ids = tok.encode(rejected_text).ids
-        r_ids = [min(tid, 65535) for tid in r_ids]
+        r_ids = tok.encode(rejected_body).ids
         r_ids.append(eos_id)
 
         prompt_ids_list.append(p_ids)
@@ -761,13 +756,12 @@ def smoke_test():
         rejected_ids_list.append(r_ids)
         prompt_lens_list.append(len(p_ids))
 
-    # Write bin files (length-prefixed uint16)
+    # Write bin files (length-prefixed uint32, matching PackedDPODataLoader)
     def _write_bin(path, records_list):
         with open(path, "wb") as f:
             for ids in records_list:
                 f.write(len(ids).to_bytes(4, "little"))
-                for tid in ids:
-                    f.write(min(tid, 65535).to_bytes(2, "little"))
+                f.write(np.asarray(ids, dtype=np.uint32).tobytes())
 
     _write_bin(os.path.join(data_dir, "dpo_prompts_train.bin"), prompt_ids_list)
     _write_bin(os.path.join(data_dir, "dpo_chosen_train.bin"), chosen_ids_list)
@@ -786,7 +780,7 @@ def smoke_test():
 
     # Save fake SFT checkpoint
     sft_ckpt_path = os.path.join(ckpt_dir, "sft.pt")
-    torch.save({"model_state": model.state_dict(), "config": vars(config)}, sft_ckpt_path)
+    atomic_torch_save({"model_state": model.state_dict(), "config": vars(config)}, sft_ckpt_path)
 
     # ---- inject LoRA for lower memory ----
     from peft.lora import inject_lora
@@ -876,7 +870,19 @@ def smoke_test():
 
 def train(args: argparse.Namespace):
     rank, local_rank, world_size, device = setup_distributed()
+
+    # Ensure the process group is torn down even if an exception unwinds train().
+    # Idempotent: destroy checks dist.is_initialized().
+    atexit.register(lambda: dist.destroy_process_group() if dist.is_initialized() else None)
+
+    # Graceful shutdown on SIGINT/SIGTERM (scheduler preemption, Ctrl+C).
+    install_signal_handlers()
     master = is_master(rank)
+    log = setup_logging()
+    if master:
+        log_event(log, "dpo_start",
+                  num_steps=args.max_steps, beta=args.beta,
+                  ref_policy=args.ref_policy, resume=args.resume)
 
     torch.manual_seed(args.seed + rank)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -892,11 +898,14 @@ def train(args: argparse.Namespace):
     if not args.checkpoint:
         raise FileNotFoundError("--checkpoint is required (SFT checkpoint).")
 
-    ckpt_data = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ckpt_data = load_torch_checkpoint(args.checkpoint, map_location="cpu")
     config = ModelConfig(**{k: v for k, v in ckpt_data["config"].items()
                             if k in ModelConfig.__init__.__code__.co_varnames})
 
-    apply_architecture_args(config, args)
+    # Apply architecture flags BEFORE building the model, but only the ones
+    # the user explicitly set — preserve the checkpoint's architecture
+    # (e.g. jamba / MTP heads) unless deliberately overridden.
+    apply_architecture_args(config, args, defaults=args.arch_defaults)
 
     model = TransformerForCausalLM(config).to(device)
     model.load_state_dict(ckpt_data["model_state"])
@@ -1018,7 +1027,17 @@ def train(args: argparse.Namespace):
     step = start_step
     data_iter = iter(train_ds)
 
+    interrupted = False
     while step < args.max_steps:
+        # --- graceful shutdown (collective-safe: all ranks agree to stop)
+        if should_stop(device, world_size):
+            interrupted = True
+            if master:
+                print(f"\n[Shutdown] requested at step {step} — "
+                      f"saving final checkpoint …")
+                log_event(log, "shutdown_requested", step=step)
+            break
+
         lr = scheduler(step)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
@@ -1103,11 +1122,22 @@ def train(args: argparse.Namespace):
 
     # final
     if master:
+        # On graceful shutdown `step` is exactly the next optimizer step to
+        # run (we broke at the top of iteration `step`), so saving it makes
+        # resume continue where we stopped — no lost progress.
+        final_step = step if interrupted else args.max_steps
         save_dpo_checkpoint(
-            args.out_dir, step, model, optimizer, config,
+            args.out_dir, final_step, model, optimizer, config,
             vars(args), is_lora, recipe,
         )
-        print(f"\nDPO complete. Final loss: {loss.detach().item():.4f}")
+        if interrupted:
+            print(f"\n[Shutdown] checkpoint saved at step {final_step}. "
+                  f"Resume with --resume {os.path.join(args.out_dir, 'latest.pt')}")
+            log_event(log, "shutdown_checkpoint_saved", step=final_step)
+        else:
+            print(f"\nDPO complete. Final loss: {loss.detach().item():.4f}")
+            log_event(log, "training_complete", step=final_step,
+                      final_loss=loss.detach().item())
 
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -1192,7 +1222,11 @@ def parse_args():
     p.add_argument("--smoke-test", action="store_true",
                    help="Run a self-contained smoke test and exit")
 
-    return p.parse_args()
+    args = p.parse_args()
+    # Namespace of pure argparse defaults, used to detect which architecture
+    # flags the user explicitly set (see apply_architecture_args).
+    args.arch_defaults = p.parse_args([])
+    return args
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ Launch:
 """
 
 import argparse
+import atexit
 import json
 import math
 import os
@@ -52,6 +53,7 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -60,9 +62,11 @@ import torch
 import torch.distributed as dist
 from tokenizers import Tokenizer
 
-import deepspeed
-
 from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, count_parameters
+
+from atomic_io import atomic_symlink, atomic_torch_save, atomic_write_json, load_torch_checkpoint
+from shutdown import install_signal_handlers, should_stop
+from logging_utils import setup_logging, get_logger, log_event
 
 # Re-use the GRPO machinery so this script stays focused on the engine swap.
 from train_grpo import (
@@ -75,14 +79,13 @@ from train_grpo import (
     build_reference,
     save_grpo_checkpoint,
     load_grpo_checkpoint,
-    merge_and_save,
     smoke_test,
     GPU_PEAK_TFLOPS,
     _build_attn_mask,
 )
 
 # Re-use the LoRA machinery from peft.
-from peft.lora import inject_lora, count_lora_parameters
+from peft.lora import inject_lora, count_lora_parameters, merge_lora
 
 # Re-use tokenizer loader.
 from tokenizer_train import load_tokenizer
@@ -468,7 +471,11 @@ def save_ds_grpo_checkpoint(
     """Save a DeepSpeed checkpoint (full model) at `step` with recipe.json."""
     tag  = f"step_{step:07d}"
     path = os.path.join(out_dir, tag)
+    # engine.save_checkpoint is a COLLECTIVE under ZeRO — every rank must
+    # call it, or non-master ranks hang waiting for the collective.
     engine.save_checkpoint(out_dir, tag=tag)
+    if getattr(engine, "global_rank", 0) != 0:
+        return None
 
     # Sidecar metadata so we can resume / inspect.
     meta = {
@@ -477,18 +484,16 @@ def save_ds_grpo_checkpoint(
         "args":   args_dict,
         "ds_tag": tag,
     }
-    with open(os.path.join(path, "meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
+    atomic_write_json(meta, os.path.join(path, "meta.json"))
 
     # Save recipe alongside checkpoint
     recipe.to_json(os.path.join(path, "recipe.json"))
 
     latest = os.path.join(out_dir, "latest_ds")
-    if os.path.islink(latest):
-        os.remove(latest)
-    os.symlink(os.path.abspath(path), latest)
-    if dist.get_rank() == 0:
+    atomic_symlink(path, latest)
+    if getattr(engine, "global_rank", 0) == 0:
         print(f"[Checkpoint] saved {path}")
+        log_event(get_logger(), "checkpoint_saved", step=step, path=path)
     return path
 
 
@@ -510,7 +515,7 @@ def load_ds_grpo_checkpoint(
     if os.path.isfile(recipe_path):
         recipe = TrainingRecipe.from_json(recipe_path)
 
-    if dist.get_rank() == 0:
+    if getattr(engine, "global_rank", 0) == 0:
         print(f"[Checkpoint] resumed from {resume_path} at step {step}")
     return step, recipe
 
@@ -575,6 +580,68 @@ def get_special_token_id_safe(tokenizer: Tokenizer, name: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Merge-only mode (--merge_lora)
+# ---------------------------------------------------------------------------
+
+def merge_and_save(args):
+    """
+    CPU-only path. Loads the GRPO LoRA checkpoint from --checkpoint
+    (a .pt produced by the LoRA branch of this script's training loop),
+    folds the adapter into the base weights, and saves the merged result
+    to --out_dir/merged_model.pt.
+    """
+    device = torch.device("cpu")
+    if not args.checkpoint:
+        raise ValueError("--checkpoint is required for --merge_lora")
+    print(f"[Merge] loading GRPO checkpoint {args.checkpoint} ...")
+    blob = load_torch_checkpoint(args.checkpoint, map_location=device)
+    config = ModelConfig(**blob["config"])
+    model = TransformerForCausalLM(config)
+    if "model_state" in blob:
+        model.load_state_dict(blob["model_state"], strict=False)
+    model.tie_weights()
+
+    # The GRPO checkpoint stores full model_state with lora_A/lora_B params.
+    # Extract the LoRA state dict from the loaded model.
+    from peft.lora import lora_state_dict
+    lora_sd = lora_state_dict(model)
+
+    rank  = blob.get("args", {}).get("lora_rank", 64)
+    alpha = blob.get("args", {}).get("lora_alpha", 128.0)
+    lora_type = blob.get("args", {}).get("lora_type", "lora")
+    target_modules = blob.get("args", {}).get(
+        "lora_target_modules",
+        ("q_proj", "k_proj", "v_proj", "o_proj",
+         "gate_proj", "up_proj", "down_proj"),
+    )
+
+    n_lora = inject_lora(
+        model, rank=rank, alpha=alpha,
+        target_modules=target_modules,
+        lora_type=lora_type,
+    )
+    print(f"[Merge] injected {n_lora} adapters "
+          f"(rank={rank}, alpha={alpha}, type={lora_type})")
+
+    missing, unexpected = model.load_state_dict(lora_sd, strict=False)
+    if unexpected:
+        print(f"[Merge] WARNING: {len(unexpected)} unexpected keys when "
+              f"loading LoRA state; ignoring")
+    if missing:
+        print(f"[Merge] WARNING: {len(missing)} missing keys when loading "
+              f"LoRA state (should be empty)")
+
+    model = merge_lora(model)
+    model.tie_weights()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    out_path = os.path.join(args.out_dir, "merged_model.pt")
+    atomic_torch_save({"model_state": model.state_dict(),
+                       "config":      vars(config)}, out_path)
+    print(f"[Merge] saved merged model to {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
 
@@ -587,6 +654,17 @@ def train(args):
 
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
+
+    # Ensure the process group is torn down even if an exception unwinds train().
+    atexit.register(lambda: dist.destroy_process_group() if dist.is_initialized() else None)
+
+    # Graceful shutdown on SIGINT/SIGTERM (scheduler preemption, Ctrl+C).
+    install_signal_handlers()
+    log = setup_logging()
+    if master:
+        log_event(log, "grpo_start",
+                  num_steps=args.max_steps, num_generations=args.num_generations,
+                  lora=args.lora, resume=args.resume)
 
     torch.manual_seed(args.seed + global_rank)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -604,11 +682,12 @@ def train(args):
             "--checkpoint is required. Point it at the SFT checkpoint "
             "produced by train_sft.py."
         )
-    ckpt_data = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ckpt_data = load_torch_checkpoint(args.checkpoint, map_location="cpu")
     config    = ModelConfig(**ckpt_data["config"])
 
-    # ---- architecture variant passthrough
-    apply_architecture_args(config, args)
+    # ---- architecture variant passthrough (only flags the user explicitly
+    # ---- set, so the checkpoint's arch like jamba / MTP heads is preserved)
+    apply_architecture_args(config, args, defaults=args.arch_defaults)
 
     # ---------------------------------------------------------------- auto LR scaling
     if not args.no_lr_scale:
@@ -636,10 +715,17 @@ def train(args):
     # ----------------------------------------------------------------- LoRA
     is_lora = args.lora
     if is_lora:
-        n_replaced = inject_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
+        target_modules = tuple(args.lora_target_modules)
+        lora_type = args.lora_type
+        n_replaced = inject_lora(
+            model, rank=args.lora_rank, alpha=args.lora_alpha,
+            target_modules=target_modules, lora_type=lora_type
+        )
         n_trainable = count_lora_parameters(model)
         if master:
             print(f"[LoRA] injected {n_replaced} adapters | "
+                  f"target={target_modules}  rank={args.lora_rank}  "
+                  f"alpha={args.lora_alpha}  type={lora_type} | "
                   f"trainable={n_trainable:,} / total={count_parameters(model):,}")
     else:
         if master:
@@ -736,6 +822,7 @@ def train(args):
                 tokenizer=tokenizer,
                 max_prompt_len=args.max_prompt_len,
                 eos_id=eos_id,
+                recipe=recipe,
             )
             payload = [train_ds._prompts, train_ds._answers, train_ds._prompt_text]
         else:
@@ -758,7 +845,16 @@ def train(args):
             tokenizer=tokenizer,
             max_prompt_len=args.max_prompt_len,
             eos_id=eos_id,
+            recipe=recipe,
         )
+    # Shard per-rank: each rank samples disjoint prompts so the global
+    # batch = args.batch_size * world_size distinct prompts.
+    # Index by [rank::world_size] so shards cycle through the data.
+    if world_size > 1 and len(train_ds) > 0:
+        shard_idx = list(range(dist.get_rank(), len(train_ds), world_size))
+        train_ds._prompts     = [train_ds._prompts[i]     for i in shard_idx]
+        train_ds._answers     = [train_ds._answers[i]     for i in shard_idx]
+        train_ds._prompt_text = [train_ds._prompt_text[i] for i in shard_idx]
     if master:
         n_shards = len(getattr(train_ds, "_tokens_memmap", None).arrays) \
             if hasattr(train_ds, "_tokens_memmap") else 0
@@ -802,7 +898,15 @@ def train(args):
 
     last_loss = torch.tensor(0.0)
 
+    interrupted = False
     for step in range(start_step, args.max_steps):
+        if should_stop(device, world_size):
+            interrupted = True
+            if master:
+                print(f"\n[Shutdown] requested at step {step} — saving final checkpoint …")
+                log_event(log, "shutdown_requested", step=step)
+            break
+
         # ---- LR (DeepSpeed scheduler is just a placeholder; we move LR
         #      on every step to match train_grpo.py's cosine schedule)
         lr = _cosine_lr(step, args.warmup_steps, args.max_steps,
@@ -816,12 +920,10 @@ def train(args):
         # 2. expand to G replicas
         expanded_p: List[List[int]] = []
         expanded_a: List[str]       = []
-        expanded_pt: List[str]      = []
         for _g in range(args.num_generations):
-            for p, a, t in zip(prompts, answers, prompt_texts):
+            for p, a in zip(prompts, answers):
                 expanded_p.append(p)
                 expanded_a.append(a)
-                expanded_pt.append(t)
 
         # 3. rollout (uses the underlying unwrapped model)
         rollout_model = _underlying()
@@ -851,9 +953,15 @@ def train(args):
 
         rewards_list: List[float] = []
         per_info: List[Dict[str, int]] = []
-        for prompt_text, completion, answer in zip(expanded_pt, completions_text, expanded_a):
+        for completion, answer in zip(completions_text, expanded_a):
+            # reward_fn signature (train_grpo.py):
+            #   reward_fn(completion, expected_answer, want_thinking, recipe,
+            #             max_new_tokens=..., correct_weight=..., format_weight=...)
+            # want_thinking is per-prompt in train_grpo.py but the deepspeed
+            # path doesn't currently carry it; pass None and let recipe.mode
+            # decide (reasoning=True, non_reasoning=False, hybrid=bool(wt)).
             r, info = reward_fn(
-                prompt_text, completion, answer,
+                completion, answer, None, recipe,
                 max_new_tokens=args.max_new_tokens,
                 correct_weight=args.reward_correct,
                 format_weight=args.reward_format,
@@ -933,24 +1041,37 @@ def train(args):
         # the existing merge_lora path works unchanged.
         # Full-FT checkpoints: write a DeepSpeed directory.
         if step > start_step and step % args.ckpt_interval == 0:
-            if master:
-                if is_lora:
+            if is_lora:
+                # LoRA .pt save is a plain file write (not collective) — master only.
+                if master:
                     save_grpo_checkpoint(args.out_dir, step, engine, engine.optimizer,
                                          config, vars(args), True, recipe)
-                else:
-                    save_ds_grpo_checkpoint(engine, args.out_dir, step, config,
-                                            vars(args), recipe)
+            else:
+                # engine.save_checkpoint is collective — ALL ranks must call it.
+                save_ds_grpo_checkpoint(engine, args.out_dir, step, config,
+                                        vars(args), recipe)
+            if master:
                 prune_checkpoints_ds(args.out_dir, keep=args.keep_ckpts, is_lora=is_lora)
 
     # ---- final checkpoint
-    if master:
-        if is_lora:
-            save_grpo_checkpoint(args.out_dir, args.max_steps, engine, engine.optimizer,
+    final_step = step if interrupted else args.max_steps
+    if is_lora:
+        if master:
+            save_grpo_checkpoint(args.out_dir, final_step, engine, engine.optimizer,
                                  config, vars(args), True, recipe)
+    else:
+        # engine.save_checkpoint is collective — ALL ranks must call it even on interrupt.
+        save_ds_grpo_checkpoint(engine, args.out_dir, final_step, config,
+                                vars(args), recipe)
+    if master:
+        if interrupted:
+            print(f"[Shutdown] checkpoint saved at step {final_step}. "
+                  f"Resume with --resume {os.path.join(args.out_dir, 'latest_ds')}")
+            log_event(log, "shutdown_checkpoint_saved", step=final_step)
         else:
-            save_ds_grpo_checkpoint(engine, args.out_dir, args.max_steps, config,
-                                    vars(args), recipe)
-        print(f"\nGRPO complete. Final loss: {last_loss.item():.4f}")
+            print(f"\nGRPO complete. Final loss: {last_loss.item():.4f}")
+            log_event(log, "training_complete", step=final_step,
+                      final_loss=last_loss.item())
         if is_lora:
             print(f"\nTo merge LoRA into base weights:")
             print(f"  python train_grpo.py --merge_lora "
@@ -988,6 +1109,14 @@ def parse_args():
     p.add_argument("--lora",       action="store_true")
     p.add_argument("--lora_rank",  type=int,   default=64)
     p.add_argument("--lora_alpha", type=float, default=128.0)
+    p.add_argument("--lora-target-modules", nargs="+",
+                   default=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+                   help="Target module names for LoRA/DoRA injection")
+    p.add_argument("--lora-type", default="lora",
+                   choices=["lora", "dora"],
+                   help="Type of low-rank adaptation: LoRA or DoRA "
+                        "(Weight-Decomposed Low-Rank Adaptation)")
 
     # Reference policy
     p.add_argument("--ref_policy", default="single", choices=["single", "two"])
@@ -1045,7 +1174,11 @@ def parse_args():
     # Recipe
     add_recipe_args(p)
 
-    return p.parse_args()
+    args = p.parse_args()
+    # Namespace of pure argparse defaults, used to detect which architecture
+    # flags the user explicitly set (see apply_architecture_args).
+    args.arch_defaults = p.parse_args([])
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -1053,6 +1186,19 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Parse args first to check for smoke-test before requiring deepspeed/GPU
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="Run self-contained smoke test (no GPU/DeepSpeed needed)")
+    parser.add_argument("--merge_lora", action="store_true",
+                        help="Merge LoRA adapter into base weights and exit")
+    parser.add_argument("--checkpoint", type=str, default=None)
+    known_args, _ = parser.parse_known_args()
+
+    if known_args.smoke_test:
+        smoke_test()
+        sys.exit(0)
+
     if not torch.cuda.is_available():
         print("ERROR: train_grpo_deepspeed.py requires at least one CUDA GPU.")
         sys.exit(1)

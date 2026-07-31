@@ -61,6 +61,8 @@ _PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
+from atomic_io import load_torch_checkpoint
+
 # ── Core DPO logic imported from parent ──────────────────────────────────
 from train_dpo import (                          # type: ignore[import-unchecked]
     dpo_loss,
@@ -174,7 +176,7 @@ def load_dpo_hivemind_checkpoint(
 
     Returns the step number.
     """
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = load_torch_checkpoint(path, map_location=device)
     raw = _raw(model)
     state = ckpt["model_state"]
     if is_lora:
@@ -302,7 +304,7 @@ def _train(
     if not args.checkpoint:
         raise FileNotFoundError("--checkpoint is required (SFT checkpoint).")
 
-    ckpt_data = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ckpt_data = load_torch_checkpoint(args.checkpoint, map_location="cpu")
     config = ModelConfig(**{k: v for k, v in ckpt_data["config"].items()
                             if k in ModelConfig.__init__.__code__.co_varnames})
     apply_architecture_args(config, args)

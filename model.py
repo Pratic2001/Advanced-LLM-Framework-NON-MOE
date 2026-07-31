@@ -1716,24 +1716,45 @@ def add_architecture_args(parser: object) -> None:
                    help="Place attention layer every N layers in Jamba (default 4).")
 
 
-def apply_architecture_args(config: ModelConfig, args: object) -> ModelConfig:
+def apply_architecture_args(config: ModelConfig, args: object,
+                            defaults: object = None) -> ModelConfig:
     """
     Copy architecture-variant fields from parsed args onto a ModelConfig.
+
+    When ``defaults`` is None, every field is copied unconditionally (use for
+    models built from scratch, where the CLI is the only source of truth).
+
+    When ``defaults`` is a Namespace produced by ``parser.parse_args([])``,
+    only fields whose value differs from the argparse default are copied —
+    i.e. flags the user *explicitly* set. This lets checkpoint-loading paths
+    (DPO / GRPO / SFT) preserve the architecture stored in the checkpoint
+    (e.g. ``arch_type="jamba"``) unless the user deliberately overrides it,
+    instead of clobbering it with the dense defaults.
 
     Returns the config for chaining.
     """
     a = args  # type: ignore[attr-defined]
-    config.arch_type = a.arch
-    config.layer_type = a.layer_type
-    config.sliding_window_size = a.sliding_window_size
-    config.num_mtp_heads = a.num_mtp_heads
-    config.mtp_discount = a.mtp_discount
-    config.mod_alpha = a.mod_alpha
-    config.mod_loss_weight = getattr(a, "mod_loss_weight", 0.01)
-    config.use_mla = a.use_mla
+
+    def _copy(src: str, dst: str, value: object) -> None:
+        if defaults is not None:
+            # ``src`` is the argparse attribute name (e.g. "arch"); skip if the
+            # value equals the argparse default, i.e. the user did not set it.
+            dflt = getattr(defaults, src, None)
+            if getattr(a, src) == dflt:
+                return
+        setattr(config, dst, value)
+
+    _copy("arch", "arch_type", a.arch)
+    _copy("layer_type", "layer_type", a.layer_type)
+    _copy("sliding_window_size", "sliding_window_size", a.sliding_window_size)
+    _copy("num_mtp_heads", "num_mtp_heads", a.num_mtp_heads)
+    _copy("mtp_discount", "mtp_discount", a.mtp_discount)
+    _copy("mod_alpha", "mod_alpha", a.mod_alpha)
+    _copy("mod_loss_weight", "mod_loss_weight", getattr(a, "mod_loss_weight", 0.01))
+    _copy("use_mla", "use_mla", a.use_mla)
     if getattr(a, "kv_lora_rank", None) is not None:
         config.kv_lora_rank = a.kv_lora_rank
-    config.jamba_hybrid_layer_interval = a.jamba_interval
+    _copy("jamba_interval", "jamba_hybrid_layer_interval", a.jamba_interval)
     return config
 
 

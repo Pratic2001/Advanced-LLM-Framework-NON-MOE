@@ -129,13 +129,19 @@ def write_tokens(
     total_tokens: int,
     per_record_lengths: List[int],
     max_seq_len: int = 0,
+    dtype_t: np.dtype = np.uint16,
 ) -> None:
     """
-    Pass 2: write token ids into a pre-allocated uint16 memmap.
+    Pass 2: write token ids into a pre-allocated memmap.
+
+    ``dtype_t`` is ``np.uint32`` for vocabs > 65536 (set by the caller from
+    ``vocab_size``); token ids are never clamped, so ids above 65535 survive.
     """
-    log.info("Allocating memmap %s (%d tokens, %.1f MiB)",
-             memmap_path, total_tokens, total_tokens * 2 / (1024 ** 2))
-    mmap = np.memmap(memmap_path, dtype=np.uint16, mode="w+", shape=(total_tokens,))
+    log.info("Allocating memmap %s (%d tokens, %.1f MiB, %s)",
+             memmap_path, total_tokens,
+             total_tokens * dtype_t.itemsize / (1024 ** 2),
+             np.dtype(dtype_t).name)
+    mmap = np.memmap(memmap_path, dtype=dtype_t, mode="w+", shape=(total_tokens,))
 
     offset = 0
     records_written = 0
@@ -144,12 +150,10 @@ def write_tokens(
         ids = tokenizer.encode(text).ids
         if max_seq_len > 0:
             ids = ids[:max_seq_len]
-        # Clamp to uint16 range — tokens > 65535 are truncated (safe for most vocab sizes)
-        safe_ids = [min(tid, 65535) for tid in ids]
-        # Append EOS separator
-        safe_ids.append(eos_id)
-        n = len(safe_ids)
-        mmap[offset: offset + n] = np.array(safe_ids, dtype=np.uint16)
+        # Append EOS separator (no uint16 clamp — see dtype_t above)
+        ids = ids + [eos_id]
+        n = len(ids)
+        mmap[offset: offset + n] = np.array(ids, dtype=dtype_t)
         offset += n
         records_written += 1
 
@@ -199,6 +203,10 @@ def pack_pretrain(args: argparse.Namespace) -> None:
     # --- Tokenizer ---
     tokenizer = load_tokenizer(args.tokenizer)
     vocab_size = tokenizer.get_vocab_size()
+    # Token ids are stored uint16 for vocabs <= 65536, else uint32 so ids
+    # above 65535 are never truncated (the loader reads this from meta).
+    dtype_t = np.uint16 if vocab_size <= 65536 else np.uint32
+    dtype_name = np.dtype(dtype_t).name  # "uint16" | "uint32"
     # EOS token id: try recipe special tokens first, fallback to tokenizer's eos
     eos_id = vocab_size - 1  # convention: last token is EOS for BBPE
     # Try to get it from the tokenizer's special tokens map if available
@@ -263,12 +271,12 @@ def pack_pretrain(args: argparse.Namespace) -> None:
         # Write train shard
         log.info("Pass 2: writing training tokens ...")
         train_bin = os.path.join(args.cache_dir, f"pretrain_tokens.{suffix}_train.bin")
-        write_tokens_train(files, tokenizer, eos_id, train_bin, train_tokens, train_idx, per_record_lengths, max_seq_len)
+        write_tokens_train(files, tokenizer, eos_id, train_bin, train_tokens, train_idx, per_record_lengths, max_seq_len, dtype_t)
 
         # Write val shard
         log.info("Pass 2: writing validation tokens ...")
         val_bin = os.path.join(args.cache_dir, f"pretrain_tokens.{suffix}_val.bin")
-        write_tokens_val(files, tokenizer, eos_id, val_bin, val_tokens, val_idx, per_record_lengths, max_seq_len)
+        write_tokens_val(files, tokenizer, eos_id, val_bin, val_tokens, val_idx, per_record_lengths, max_seq_len, dtype_t)
 
         # Meta for train
         meta_train = {
@@ -276,7 +284,7 @@ def pack_pretrain(args: argparse.Namespace) -> None:
             "num_records": len(train_idx),
             "vocab_size": vocab_size,
             "eos_token_id": eos_id,
-            "dtype": "uint16",
+            "dtype": dtype_name,
             "worker": args.worker,
             "num_workers": args.num_workers,
             "split": "train",
@@ -292,7 +300,7 @@ def pack_pretrain(args: argparse.Namespace) -> None:
             "num_records": len(val_idx),
             "vocab_size": vocab_size,
             "eos_token_id": eos_id,
-            "dtype": "uint16",
+            "dtype": dtype_name,
             "worker": args.worker,
             "num_workers": args.num_workers,
             "split": "val",
@@ -305,14 +313,14 @@ def pack_pretrain(args: argparse.Namespace) -> None:
         # No split — write single shard
         log.info("Pass 2: writing tokens ...")
         bin_path = os.path.join(args.cache_dir, f"pretrain_tokens.{suffix}.bin")
-        write_tokens(files, tokenizer, eos_id, bin_path, total_tokens, per_record_lengths, max_seq_len)
+        write_tokens(files, tokenizer, eos_id, bin_path, total_tokens, per_record_lengths, max_seq_len, dtype_t)
 
         meta = {
             "total_tokens": total_tokens,
             "num_records": len(per_record_lengths),
             "vocab_size": vocab_size,
             "eos_token_id": eos_id,
-            "dtype": "uint16",
+            "dtype": dtype_name,
             "worker": args.worker,
             "num_workers": args.num_workers,
             "split": "all",
@@ -339,9 +347,13 @@ def write_tokens_train(
     train_idx: List[int],
     per_record_lengths: List[int],
     max_seq_len: int = 0,
+    dtype_t: np.dtype = np.uint16,
 ) -> None:
-    """Write only training-split records into a pre-allocated memmap."""
-    mmap = np.memmap(memmap_path, dtype=np.uint16, mode="w+", shape=(total_tokens,))
+    """Write only training-split records into a pre-allocated memmap.
+
+    ``dtype_t`` is ``np.uint32`` for vocabs > 65536; ids are never clamped.
+    """
+    mmap = np.memmap(memmap_path, dtype=dtype_t, mode="w+", shape=(total_tokens,))
     train_set = set(train_idx)
     offset = 0
     record_counter = 0
@@ -351,10 +363,9 @@ def write_tokens_train(
             ids = tokenizer.encode(text).ids
             if max_seq_len > 0:
                 ids = ids[:max_seq_len]
-            safe_ids = [min(tid, 65535) for tid in ids]
-            safe_ids.append(eos_id)
-            n = len(safe_ids)
-            mmap[offset: offset + n] = np.array(safe_ids, dtype=np.uint16)
+            ids = ids + [eos_id]
+            n = len(ids)
+            mmap[offset: offset + n] = np.array(ids, dtype=dtype_t)
             offset += n
         record_counter += 1
 
@@ -374,9 +385,13 @@ def write_tokens_val(
     val_idx: List[int],
     per_record_lengths: List[int],
     max_seq_len: int = 0,
+    dtype_t: np.dtype = np.uint16,
 ) -> None:
-    """Write only validation-split records into a pre-allocated memmap."""
-    mmap = np.memmap(memmap_path, dtype=np.uint16, mode="w+", shape=(total_tokens,))
+    """Write only validation-split records into a pre-allocated memmap.
+
+    ``dtype_t`` is ``np.uint32`` for vocabs > 65536; ids are never clamped.
+    """
+    mmap = np.memmap(memmap_path, dtype=dtype_t, mode="w+", shape=(total_tokens,))
     val_set = set(val_idx)
     offset = 0
     record_counter = 0
@@ -386,10 +401,9 @@ def write_tokens_val(
             ids = tokenizer.encode(text).ids
             if max_seq_len > 0:
                 ids = ids[:max_seq_len]
-            safe_ids = [min(tid, 65535) for tid in ids]
-            safe_ids.append(eos_id)
-            n = len(safe_ids)
-            mmap[offset: offset + n] = np.array(safe_ids, dtype=np.uint16)
+            ids = ids + [eos_id]
+            n = len(ids)
+            mmap[offset: offset + n] = np.array(ids, dtype=dtype_t)
             offset += n
         record_counter += 1
 

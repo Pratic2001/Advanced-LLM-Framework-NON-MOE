@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-syntax:
+    name: Syntax + lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Syntax gate: every .py file in the repo must parse under each
+      # supported Python. This catches stray syntax from the code review
+      # churn (mixed tabs, unbalanced parens) before it ever reaches a GPU.
+      - name: Compile all Python files
+        run: |
+          # Exclude vendored/generated dirs: npm-installed Python helpers and
+          # bytecode cache. Everything else must parse under every supported
+          # Python (see the AST scan below for the rationale).
+          python -m compileall -q -f . \
+            -x '/(node_modules|__pycache__|webscrapped_dataset_curator_AI_MCP)/'
+          echo "All Python files compile cleanly."
+
+      # Pyflakes-style undefined-name / unused-import scan without a hard
+      # dependency on a linter: use Python's built-in py_compile for syntax
+      # (above) and a minimal grep-based sanity check here.
+      - name: Check for common defects
+        run: |
+          python - <<'EOF'
+          import ast, pathlib, sys
+
+          errors = []
+          for p in pathlib.Path(".").rglob("*.py"):
+              # Skip vendored / generated code: bytecode cache, the UI's
+              # npm-installed Python helpers (flatted.py etc.), and the
+              # webscraper subproject which has its own CI.
+              if any(part in {"__pycache__", ".git", "node_modules",
+                              "webscrapped_dataset_curator_AI_MCP"} for part in p.parts):
+                  continue
+              try:
+                  tree = ast.parse(p.read_text())
+              except SyntaxError as e:
+                  errors.append(f"{p}:{e.lineno}: syntax error: {e.msg}")
+                  continue
+              # Flag accidental bare except / pass-only handlers
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.ExceptHandler) and node.type is None:
+                      errors.append(f"{p}:{node.lineno}: bare 'except:' swallows all errors")
+          if errors:
+              print("\n".join(errors))
+              sys.exit(1)
+          print("No bare excepts; all files parse.")
+          EOF
+
+  unit-tests:
+    name: Unit tests (CPU)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # CPU-only torch to keep the job fast and reliable (no CUDA needed for
+      # the unit tests — they exercise model forward, atomic I/O, shutdown and
+      # structured logging).
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest numpy
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/ -v
+
+  smoke-tests:
+    name: Smoke tests (training scripts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest numpy tokenizers safetensors
+
+      # Fast, self-contained end-to-end checks: the tiny-model smoke tests
+      # built into the training scripts. These run on CPU and finish in
+      # seconds; they prove the script's CLI + data path + checkpoint round
+      # trip work, not just that the module imports.
+      - name: Pretrain smoke test
+        run: |
+          python -c "import train_pretrain; train_pretrain.smoke_test()"
+
+      - name: SFT smoke test
+        run: |
+          python train_sft.py --smoke-test
+
+      - name: GRPO smoke test
+        run: |
+          python train_grpo.py --smoke-test
+
+      - name: DPO smoke test
+        run: |
+          python train_dpo.py --smoke-test
+
+      - name: Inference smoke test
+        run: |
+          python infer.py --smoke-test
+
+  docker-build:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    # Docker layers are cached per-branch; a broken Dockerfile fails fast.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: advanced-llm-framework:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # GitHub runners have no GPU, and the CUDA torch build can report
+      # cuda.is_available()==True on driverless hosts — pin to CPU so the
+      # smoke test is deterministic.
+      - name: Run pretrain smoke test in container
+        run: |
+          docker run --rm -e CUDA_VISIBLE_DEVICES="" advanced-llm-framework:ci

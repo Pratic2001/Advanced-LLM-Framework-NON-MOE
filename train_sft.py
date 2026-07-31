@@ -65,6 +65,7 @@ Usage:
 """
 
 import argparse
+import atexit
 import glob
 import json
 import math
@@ -85,6 +86,10 @@ from model import ModelConfig, TransformerForCausalLM, add_architecture_args, ap
 from optim.build_optimizer import build_optimizer
 from optim.lr_schedule import build_scheduler
 from recipe import TrainingRecipe, get_recipe, add_recipe_args, recipe_from_args
+
+from atomic_io import atomic_symlink, atomic_torch_save, load_torch_checkpoint
+from shutdown import install_signal_handlers, should_stop
+from logging_utils import setup_logging, get_logger, log_event
 from peft.lora import (
     inject_lora, merge_lora, lora_state_dict,
     freeze_base, build_lora_optimizer, neftune_noise, register_neftune_hook,
@@ -278,18 +283,34 @@ class SFTDataset:
                 f"Run data/pack_sft.py first."
             )
 
-        dtype_t = np.dtype(manifests[0].get("dtype_tokens", "uint16"))
-        dtype_m = np.dtype(manifests[0].get("dtype_mask", "uint8"))
+        # pack_sft_data.py writes one manifest per worker with both train and
+        # val file names, and picks the on-disk token dtype from vocab size
+        # (uint16 when vocab <= 65536, else uint32). Read both from the
+        # manifest instead of assuming uint16.
+        dtype_t = np.dtype(manifests[0].get("dtype_t", "uint16"))
+        dtype_m = np.dtype(manifests[0].get("dtype_m", "uint8"))
 
+        tok_key  = f"{split}_tokens_file"   # e.g. train_tokens_file
+        mask_key = f"{split}_mask_file"
         token_arrays = []
         mask_arrays  = []
         total_records = 0
         for m in manifests:
-            tok_path  = os.path.join(cache_dir, m["token_file"])
-            mask_path = os.path.join(cache_dir, m["mask_file"])
+            tok_name  = m.get(tok_key)
+            mask_name = m.get(mask_key)
+            if not tok_name or not mask_name:
+                continue  # this worker wrote no {split} records
+            tok_path  = os.path.join(cache_dir, tok_name)
+            mask_path = os.path.join(cache_dir, mask_name)
             token_arrays.append(np.memmap(tok_path,  dtype=dtype_t, mode="r"))
             mask_arrays.append(np.memmap(mask_path, dtype=dtype_m, mode="r"))
-            total_records += m.get("num_records", 0)
+            total_records += m.get("n_records", 0)
+
+        if not token_arrays:
+            raise FileNotFoundError(
+                f"No {split} shards found in the pack manifests under "
+                f"{cache_dir}. Run data/pack_sft.py first."
+            )
 
         self.tokens = _ConcatMemmap(token_arrays)
         self.mask   = _ConcatMemmap(mask_arrays)
@@ -314,16 +335,20 @@ class SFTDataset:
     # ------------------------------------------------------------------
     @staticmethod
     def _discover_manifests(cache_dir: str, split: str):
-        """Find every sft_{split}_manifest*.json in cache_dir, sorted by worker."""
-        pattern = os.path.join(cache_dir, f"sft_{split}_manifest*.json")
+        """Find every sft_manifest*.json in cache_dir, sorted by worker.
+
+        pack_sft_data.py writes one manifest per worker (``sft_manifest
+        .w{i}-of-{n}.json``) containing both train and val file names, so
+        no split filtering happens here — the caller picks the
+        ``{split}_tokens_file`` / ``{split}_mask_file`` keys. ``split`` is
+        kept as an argument for call-site clarity.
+        """
+        pattern = os.path.join(cache_dir, "sft_manifest*.json")
         manifest_paths = sorted(glob.glob(pattern))
         manifests = []
         for p in manifest_paths:
             with open(p, "r") as f:
-                m = json.load(f)
-            if m.get("split") != split:
-                continue
-            manifests.append(m)
+                manifests.append(json.load(f))
         manifests.sort(key=lambda m: m.get("worker", 0))
         return manifests
 
@@ -403,7 +428,15 @@ class PackedSFTDataLoader:
                 f"Run pack_sft_data.py first."
             )
 
-        token_arrs = [np.memmap(f, dtype=np.uint16, mode="r") for f in token_files]
+        # pack_sft_data.py stores uint32 token ids when vocab_size > 65536;
+        # read the dtype from the manifest instead of assuming uint16.
+        dtype_t = np.dtype("uint16")
+        manifests = sorted(glob.glob(os.path.join(data_dir, "sft_manifest*.json")))
+        if manifests:
+            with open(manifests[0], "r") as _f:
+                dtype_t = np.dtype(json.load(_f).get("dtype_t", "uint16"))
+
+        token_arrs = [np.memmap(f, dtype=dtype_t, mode="r") for f in token_files]
         mask_arrs  = [np.memmap(f, dtype=np.uint8,  mode="r") for f in mask_files]
 
         # Use _ConcatMemmap to lazily stitch memmap shards without copying
@@ -450,6 +483,9 @@ class PackedSFTDataLoader:
                 x = np.asarray(self.tokens[idx     : idx + self.seq_len]).astype(np.int64)
                 y = np.asarray(self.tokens[idx + 1 : idx + self.seq_len + 1]).astype(np.int64)
                 m = np.asarray(self.masks[idx + 1  : idx + self.seq_len + 1]).astype(np.float32)
+                xs.append(x)
+                ys.append(y)
+                ms.append(m)
                 valid_sum += int(m.sum())
 
             xs = torch.from_numpy(np.stack(xs))
@@ -524,25 +560,25 @@ def save_sft_checkpoint(
     os.makedirs(out_dir, exist_ok=True)
 
     path = os.path.join(out_dir, f"sft_step{step:07d}.pt")
-    torch.save(ckpt, path)
+    # Atomic save — a crash mid-write leaves a tmp file, never a torn .pt
+    # that latest.pt could point at.
+    atomic_torch_save(ckpt, path)
 
     # Save recipe alongside checkpoint
     recipe.to_json(os.path.join(out_dir, "recipe.json"))
 
-    # Symlink latest
+    # Symlink latest (atomic — no window where latest.pt is missing)
     latest = os.path.join(out_dir, "latest.pt")
-    if os.path.islink(latest):
-        os.remove(latest)
-    elif os.path.isfile(latest):
-        os.remove(latest)
-    os.symlink(os.path.abspath(path), latest)
+    atomic_symlink(path, latest)
 
     if is_lora:
         lora_path = os.path.join(out_dir, f"sft_step{step:07d}_lora.pt")
-        torch.save(lora_state_dict(raw), lora_path)
+        atomic_torch_save(lora_state_dict(raw), lora_path)
         print(f"[Checkpoint] saved LoRA state dict to {lora_path}")
 
     print(f"[Checkpoint] saved {path}")
+    log_event(get_logger(), "checkpoint_saved", step=step, path=path,
+              is_lora=is_lora)
     return path
 
 
@@ -559,7 +595,7 @@ def load_sft_checkpoint(
     For LoRA: base weights must already be loaded; this loads only the
     adapter weights + optimizer state.
     """
-    ckpt  = torch.load(path, map_location=device, weights_only=False)
+    ckpt  = load_torch_checkpoint(path, map_location=device)
     raw   = _raw(model)
     state = ckpt["model_state"]
 
@@ -646,13 +682,13 @@ def merge_and_save_mode(args, rank, world_size, device):
             raise FileNotFoundError(f"No checkpoints found in {ckpt_dir}")
         latest = str(candidates[-1])
 
-    ckpt = torch.load(latest, map_location="cpu", weights_only=False)
+    ckpt = load_torch_checkpoint(latest, map_location="cpu")
     is_lora = ckpt.get("is_lora", False)
     if not is_lora:
         print("[Merge] Checkpoint is not LoRA; nothing to merge. Saving as-is.")
         out_path = os.path.join(args.output_dir, "merged_model.pt")
         os.makedirs(args.output_dir, exist_ok=True)
-        torch.save({"model_state": ckpt["model_state"], "config": ckpt.get("args", {})}, out_path)
+        atomic_torch_save({"model_state": ckpt["model_state"], "config": ckpt.get("args", {})}, out_path)
         print(f"[Merge] saved to {out_path}")
         return
 
@@ -668,7 +704,7 @@ def merge_and_save_mode(args, rank, world_size, device):
     if base_ckpt_path and os.path.isdir(base_ckpt_path):
         base_latest = os.path.join(base_ckpt_path, "latest.pt")
         if os.path.exists(base_latest):
-            base_ckpt = torch.load(base_latest, map_location=device, weights_only=False)
+            base_ckpt = load_torch_checkpoint(base_latest, map_location=device)
             if "model_state" in base_ckpt:
                 model.load_state_dict(base_ckpt["model_state"])
                 if hasattr(model, "tie_weights"):
@@ -702,7 +738,7 @@ def merge_and_save_mode(args, rank, world_size, device):
 
     os.makedirs(args.output_dir, exist_ok=True)
     out_path = os.path.join(args.output_dir, "merged_model.pt")
-    torch.save({"model_state": model.state_dict(), "config": vars(config)}, out_path)
+    atomic_torch_save({"model_state": model.state_dict(), "config": vars(config)}, out_path)
     print(f"[Merge] saved merged model to {out_path}")
 
 
@@ -731,6 +767,92 @@ def _resolve_model_config(saved_args: dict) -> ModelConfig:
 # ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
+
+def smoke_test():
+    """
+    Self-contained smoke test using tiny model and synthetic packed data.
+    Exercises the real SFT path: checkpoint load, data loading, masked CE
+    loss, backward, optimizer step, and checkpoint round-trip.
+    """
+    print("\n=== SFT smoke test ===")
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp()
+    data_dir = os.path.join(tmp, "sft_data")
+    ckpt_dir = os.path.join(tmp, "ckpts")
+    out_dir  = os.path.join(tmp, "out")
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # ---- tiny model + fake pretrained checkpoint ----
+    config = ModelConfig(
+        vocab_size=512, hidden_size=128, intermediate_size=256,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=32, max_position_embeddings=256,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = TransformerForCausalLM(config).to(device)
+    sft_ckpt_path = os.path.join(ckpt_dir, "latest.pt")
+    atomic_torch_save(
+        {"model_state": model.state_dict(), "config": vars(config)},
+        sft_ckpt_path,
+    )
+
+    # ---- synthetic packed data (flat token + mask memmaps) ----
+    seq_len = 64
+    rng = np.random.default_rng(0)
+    toks = rng.integers(0, 512, size=seq_len * 8, dtype=np.uint16)
+    toks.tofile(os.path.join(data_dir, "sft_train_tokens_000.bin"))
+    np.ones(seq_len * 8, dtype=np.uint8).tofile(
+        os.path.join(data_dir, "sft_train_mask_000.bin")
+    )
+    with open(os.path.join(data_dir, "sft_manifest_000.json"), "w") as f:
+        json.dump({"dtype_t": "uint16"}, f)
+
+    # ---- dataset ----
+    ds = PackedSFTDataLoader(
+        data_dir=data_dir, seq_len=seq_len, batch_size=2,
+        pad_id=0, rank=0, world_size=1,
+    )
+    print(f"[smoke] dataset size: {len(ds)} batches")
+
+    # ---- load pretrained weights (real code path) ----
+    model2 = TransformerForCausalLM(config).to(device)
+    load_sft_checkpoint(sft_ckpt_path, model2, None, device, is_lora=False)
+    model2.train()
+
+    # ---- one real training step ----
+    opt = build_optimizer(model2, lr=1e-4, weight_decay=0.0)
+    for x, y, m, num_valid in ds:
+        x, y, m = x.to(device), y.to(device), m.to(device)
+        out = model2(x)
+        loss = masked_cross_entropy(out["logits"], y, m)
+        print(f"[smoke] loss {loss.item():.4f} | num_valid {num_valid}")
+        loss.backward()
+        nn.utils.clip_grad_norm_(model2.parameters(), 1.0)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        print("[smoke] backward + optimizer step: OK")
+        break  # one batch is enough
+
+    # ---- checkpoint round-trip ----
+    args = argparse.Namespace(output_dir=out_dir)
+    save_sft_checkpoint(
+        model2, 1, num_valid, TrainingRecipe(mode="reasoning"),
+        is_lora=False, base_weights=None, args=args,
+        best_val_loss=1.0, optimizer=opt,
+    )
+    model3 = TransformerForCausalLM(config).to(device)
+    step, total_tokens, _best = load_sft_checkpoint(
+        os.path.join(out_dir, "sft_step0000001.pt"),
+        model3, None, device, is_lora=False,
+    )
+    print(f"[smoke] checkpoint round-trip: step {step} ({total_tokens} tokens)")
+
+    shutil.rmtree(tmp)
+    print("\n=== SFT smoke test passed ===\n")
+
 
 def main():
     # ====================================================================
@@ -816,7 +938,22 @@ def main():
                    help="Fraction of training data to hold out for validation "
                         "(used when no separate val files exist)")
 
+    # --- smoke test ---
+    p.add_argument("--smoke-test", action="store_true",
+                   help="Run a self-contained smoke test and exit")
+
     args = p.parse_args()
+
+    # Namespace of pure argparse defaults, used to detect which architecture
+    # flags the user explicitly set (see apply_architecture_args).
+    arch_defaults = p.parse_args([])
+
+    # ------------------------------------------------------------------
+    # Smoke test mode
+    # ------------------------------------------------------------------
+    if args.smoke_test:
+        smoke_test()
+        return
 
     # ====================================================================
     # Merge-and-save mode
@@ -830,6 +967,17 @@ def main():
     # ====================================================================
     rank, local_rank, world_size, device = setup_distributed()
     master = is_master(rank)
+
+    # Ensure the process group is torn down even if an exception (e.g. OOM)
+    # unwinds main(). Idempotent: destroy_distributed checks is_initialized().
+    atexit.register(destroy_distributed)
+
+    # Graceful shutdown on SIGINT/SIGTERM (scheduler preemption, Ctrl+C).
+    install_signal_handlers()
+    log = setup_logging()
+    log_event(log, "sft_start",
+              model_size=args.model_size, num_steps=args.num_steps,
+              lora_rank=args.lora_rank, resume=args.resume)
 
     torch.manual_seed(args.seed + rank)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -846,16 +994,39 @@ def main():
     use_pretrained = args.checkpoint_dir is not None and not args.model_size
 
     if use_pretrained:
-        # Load from pretrained checkpoint
+        # Load config from pretrained checkpoint
         ckpt_path = os.path.join(args.checkpoint_dir, "latest.pt")
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(
                 f"Checkpoint not found: {ckpt_path}\n"
                 f"Run train.py first to produce a pretrained checkpoint."
             )
-        ckpt_data = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        ckpt_data = load_torch_checkpoint(ckpt_path, map_location="cpu")
         config    = ModelConfig(**ckpt_data["config"])
-        model     = TransformerForCausalLM(config).to(device)
+
+    elif args.model_size:
+        # Build config from scratch using target size
+        target_params = ModelConfig.parse_param_count(args.model_size)
+        max_pos = getattr(args, "max_seq_len", None) or 8192
+        config = ModelConfig.from_target_size(
+            target_params=target_params,
+            max_position_embeddings=max_pos,
+        )
+
+    else:
+        raise ValueError(
+            "Either --checkpoint-dir or --model-size must be provided."
+        )
+
+    # Apply architecture CLI flags BEFORE constructing the model so --arch,
+    # --num-mtp-heads, --use-mla etc. take effect. Only flags the user
+    # explicitly set are applied, preserving the checkpoint's architecture
+    # (e.g. jamba / MTP heads) unless deliberately overridden.
+    apply_architecture_args(config, args, defaults=arch_defaults)
+
+    model = TransformerForCausalLM(config).to(device)
+
+    if use_pretrained:
         model.load_state_dict(ckpt_data["model_state"])
         if hasattr(model, "tie_weights"):
             model.tie_weights()
@@ -865,15 +1036,6 @@ def main():
             print(f"Loaded pretrained model: {n_total:,} params ({n_total/1e9:.3f}B)")
 
     elif args.model_size:
-        # Build from scratch using target size
-        target_params = ModelConfig.parse_param_count(args.model_size)
-        max_pos = getattr(args, "max_seq_len", None) or 8192
-        config = ModelConfig.from_target_size(
-            target_params=target_params,
-            max_position_embeddings=max_pos,
-        )
-        model  = TransformerForCausalLM(config).to(device)
-
         if master:
             n_total = count_parameters(model)
             print(f"Created model from --model-size {args.model_size}: "
@@ -881,13 +1043,6 @@ def main():
             print(f"  config: H={config.hidden_size} L={config.num_hidden_layers} "
                   f"heads={config.num_attention_heads} kv={config.num_key_value_heads} "
                   f"I={config.intermediate_size}")
-
-    else:
-        raise ValueError(
-            "Either --checkpoint-dir or --model-size must be provided."
-        )
-
-    apply_architecture_args(config, args)
 
     # Store config fields in args for checkpoint round-trip
     args.vocab_size          = config.vocab_size
@@ -990,7 +1145,14 @@ def main():
         # Override to use val files
         val_token_files_sorted = sorted(val_token_files)
         val_mask_files = sorted(glob.glob(os.path.join(val_data_dir, "sft_val_mask*.bin")))
-        val_token_arrs = [np.memmap(f, dtype=np.uint16, mode="r") for f in val_token_files_sorted]
+        # Token dtype is set by pack_sft_data.py from vocab size (uint32 for
+        # vocabs > 65536) — mirror PackedSFTDataLoader's manifest lookup.
+        val_dtype_t = np.dtype("uint16")
+        val_manifests = sorted(glob.glob(os.path.join(val_data_dir, "sft_manifest*.json")))
+        if val_manifests:
+            with open(val_manifests[0], "r") as _f:
+                val_dtype_t = np.dtype(json.load(_f).get("dtype_t", "uint16"))
+        val_token_arrs = [np.memmap(f, dtype=val_dtype_t, mode="r") for f in val_token_files_sorted]
         val_mask_arrs  = [np.memmap(f, dtype=np.uint8, mode="r") for f in val_mask_files] if val_mask_files else None
         if val_token_arrs:
             val_loader.tokens = _ConcatMemmap(val_token_arrs)
@@ -1066,10 +1228,18 @@ def main():
     # ====================================================================
     # AMP
     # ====================================================================
-    use_amp = device.type == "cuda" and args.dtype == "bf16"
-    ctx     = (torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-               if use_amp else nullcontext())
-    scaler  = torch.cuda.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
+    # bf16 needs autocast but no GradScaler (bf16 has the same exponent range
+    # as fp32, so dynamic-range scaling is unnecessary). fp16 still needs
+    # GradScaler to avoid underflow. The GradScaler is therefore only
+    # enabled for fp16, and is a no-op scaler.step/update for bf16.
+    use_amp   = device.type == "cuda" and args.dtype in ("bf16", "fp16")
+    amp_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+    ctx       = (
+        torch.amp.autocast(device_type="cuda", dtype=amp_dtype) if use_amp
+        else nullcontext()
+    )
+    use_scaler = use_amp and args.dtype == "fp16"
+    scaler     = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
     # ====================================================================
     # Resume
@@ -1129,7 +1299,17 @@ def main():
 
     train_iter = iter(train_loader)
 
+    interrupted = False
     for step in range(start_step, args.num_steps):
+        # --- graceful shutdown (collective-safe: all ranks agree to stop)
+        if should_stop(device, world_size):
+            interrupted = True
+            if master:
+                print(f"\n[Shutdown] requested at step {step} — "
+                      f"saving final checkpoint …")
+                log_event(log, "shutdown_requested", step=step)
+            break
+
         # --- LR schedule
         lr = scheduler(step)
         for pg in optimizer.param_groups:
@@ -1167,19 +1347,27 @@ def main():
                     )
                     loss = loss + mtp_loss / args.grad_accum
                 # MoD loss
-                loss += out.get("mod_aux_loss", 0.0)
+                loss += out.get("mod_aux_loss", 0.0) / args.grad_accum
 
-            scaler.scale(loss).backward()
+            # Backward (GradScaler only meaningful for fp16).
+            if use_scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             loss_accum  += loss.item()
             tokens_accum += num_valid
 
         # --- optimiser step
-        scaler.unscale_(optimizer)
+        if use_scaler:
+            scaler.unscale_(optimizer)
         grad_norm = nn.utils.clip_grad_norm_(
             model.parameters(), args.grad_clip
         ).item()
-        scaler.step(optimizer)
-        scaler.update()
+        if use_scaler:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
         if device.type == "cuda":
@@ -1229,18 +1417,29 @@ def main():
     # Final checkpoint
     # ====================================================================
     if master:
+        # On graceful shutdown `step` is exactly the next optimizer step to
+        # run (we broke at the top of iteration `step`), so saving it makes
+        # resume continue where we stopped — no lost progress.
+        final_step = step if interrupted else args.num_steps
         save_sft_checkpoint(
-            model, args.num_steps, total_tokens, recipe,
+            model, final_step, total_tokens, recipe,
             has_lora, base_weights, args,
             best_val_loss=best_val_loss,
             optimizer=optimizer,
         )
-        print(f"\nSFT complete. Best val loss: {best_val_loss:.4f}")
-        if has_lora:
-            print(f"\nTo merge LoRA into base weights for deployment:")
-            print(f"  python train_sft.py --merge-and-save "
-                  f"--checkpoint-dir {args.output_dir} "
-                  f"--output-dir ./sft_merged")
+        if interrupted:
+            print(f"\n[Shutdown] checkpoint saved at step {final_step}. "
+                  f"Resume with --resume {os.path.join(args.output_dir, 'latest.pt')}")
+            log_event(log, "shutdown_checkpoint_saved", step=final_step)
+        else:
+            print(f"\nSFT complete. Best val loss: {best_val_loss:.4f}")
+            log_event(log, "training_complete", step=final_step,
+                      best_val_loss=best_val_loss)
+            if has_lora:
+                print(f"\nTo merge LoRA into base weights for deployment:")
+                print(f"  python train_sft.py --merge-and-save "
+                      f"--checkpoint-dir {args.output_dir} "
+                      f"--output-dir ./sft_merged")
 
     destroy_distributed()
 

@@ -820,7 +820,7 @@ def benchmark_grpo(
             "--lora-alpha", "64",
             "--lora",
             "--kl-coef", "0.02",
-            "--clip-range", "0.2",
+            "--clip-ratio", "0.2",
             "--log-interval", "1",
             "--save-every", "100",
             "--model-size", model_size,
@@ -1121,7 +1121,7 @@ def generate_report(
         f"--out-dir ./checkpoints/grpo --batch-size 1 --num-steps 500 "
         f"--num-generations {grpo_gens} --max-new-tokens 512 "
         f"--lora --lora-rank 32 --lora-alpha 64 "
-        f"--dtype bf16 --lr 1e-6 --kl-coef 0.02 --clip-range 0.2"
+        f"--dtype bf16 --lr 1e-6 --kl-coef 0.02 --clip-ratio 0.2"
     )
 
     lines.append("")

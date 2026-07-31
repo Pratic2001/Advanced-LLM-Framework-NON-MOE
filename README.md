@@ -257,12 +257,53 @@ python infer.py \
 
 ```bash
 # Verify every component works end-to-end:
-python train_pretrain.py --smoke-test
+python -c "import train_pretrain; train_pretrain.smoke_test()"
 python train_sft.py --smoke-test
 python train_grpo.py --smoke-test
 python train_dpo.py --smoke-test
 python infer.py --smoke-test
 ```
+
+### 🐳 Docker
+
+A `Dockerfile` builds a CUDA image with the framework and all training
+dependencies. Checkpoints and data are **not** baked in — mount them at
+runtime:
+
+```bash
+# Build
+docker build -t advanced-llm-framework .
+
+# Smoke-test the container (runs the pretrain smoke test by default)
+docker run --gpus all --rm advanced-llm-framework
+
+# Pretrain with data mounted in
+docker run --gpus all --shm-size 16g -it --rm \
+  -v $PWD/checkpoints:/workspace/checkpoints \
+  -v $PWD/packed:/workspace/packed \
+  advanced-llm-framework \
+  train_pretrain.py --model-size 0.3B --data-dir /workspace/packed \
+    --checkpoint-dir /workspace/checkpoints --seq-len 2048 \
+    --batch-size 32 --grad-accum 4
+
+# SFT / GRPO / DPO work the same way — swap the script and flags.
+```
+
+The container runs as a non-root user (`trainer`, UID 1000); write
+directories you mount must be writable by it (or use `-u 0` at your own
+risk). For a different CUDA build of torch, override the base tag or install
+torch first as shown in the `Dockerfile`.
+
+### 🔄 CI
+
+`.github/workflows/ci.yml` runs on every push/PR:
+
+- **Syntax + lint** — every `.py` file compiles and has no bare `except:`
+  (py 3.11 / 3.12 / 3.13)
+- **Unit tests** — CPU `pytest` suite (model forward, atomic I/O, shutdown,
+  structured logging)
+- **Smoke tests** — the five `--smoke-test` entry points above, on CPU
+- **Docker build** — image builds and runs the pretrain smoke test inside it
 
 ---
 

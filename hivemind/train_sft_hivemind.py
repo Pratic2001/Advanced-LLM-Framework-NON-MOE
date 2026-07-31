@@ -50,6 +50,8 @@ _PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
+from atomic_io import load_torch_checkpoint
+
 from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, compute_mtp_loss, count_parameters
 from optim.build_optimizer import build_optimizer
 from optim.lr_schedule import build_scheduler
@@ -363,7 +365,7 @@ def load_sft_checkpoint(
     else:
         ckpt_path = path
 
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    ckpt = load_torch_checkpoint(ckpt_path, map_location=device)
     raw = getattr(model, "_orig_mod", model)
     raw.load_state_dict(ckpt["model_state"])
     if hasattr(raw, "tie_weights"):

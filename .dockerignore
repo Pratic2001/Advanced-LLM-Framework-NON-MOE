@@ -1,0 +1,31 @@
+# Keep the Docker build context small: no checkpoints, data, or VCS noise.
+.git
+.gitignore
+.github
+
+# Trained artifacts — mounted in at runtime via -v, never baked into image.
+checkpoints
+*.pt
+*.safetensors
+*.bin
+
+# Data dirs (memmap packed data, raw corpus, caches).
+packed
+sft_packed
+grpo_packed
+dpo_packed
+data/*.bin
+data/*.json
+webscrapped_dataset_curator_AI_MCP
+
+# Python build/cache noise.
+__pycache__
+*.pyc
+.pytest_cache
+*.egg-info
+.venv
+venv
+
+# Logs / scratch.
+logs
+*.log

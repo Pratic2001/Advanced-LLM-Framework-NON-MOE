@@ -44,6 +44,7 @@ Launch:
 """
 
 import argparse
+import atexit
 import json
 import math
 import os
@@ -63,11 +64,12 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-import deepspeed
-from deepspeed.utils import logger as ds_logger
-
 from model import ModelConfig, TransformerForCausalLM, add_architecture_args, apply_architecture_args, compute_mtp_loss, count_parameters
 from optim.lr_schedule import build_scheduler
+
+from atomic_io import atomic_symlink, atomic_torch_save, atomic_write_json, load_torch_checkpoint
+from logging_utils import setup_logging, get_logger, log_event
+from shutdown import install_signal_handlers, should_stop
 
 
 # ---------------------------------------------------------------------------
@@ -897,7 +899,11 @@ def save_ds_checkpoint(
     """Save a DeepSpeed checkpoint with meta.json and recipe.json sidecars."""
     tag  = f"step_{step:07d}"
     path = os.path.join(out_dir, tag)
+    # engine.save_checkpoint is a COLLECTIVE under ZeRO — every rank must
+    # call it, or non-master ranks hang waiting for the collective.
     engine.save_checkpoint(out_dir, tag=tag)
+    if getattr(engine, "global_rank", 0) != 0:
+        return
 
     # Write a small JSON sidecar with config + training state so we can
     # reconstruct the model / resume without parsing DS internals.
@@ -909,8 +915,7 @@ def save_ds_checkpoint(
         "best_val_loss": best_val_loss,
         "ds_tag":        tag,
     }
-    with open(os.path.join(path, "meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
+    atomic_write_json(meta, os.path.join(path, "meta.json"))
 
     # Save recipe if provided
     if recipe is not None:
@@ -918,14 +923,13 @@ def save_ds_checkpoint(
         if hasattr(recipe, "to_json"):
             recipe.to_json(recipe_path)
         else:
-            with open(recipe_path, "w") as f:
-                json.dump(recipe, f, indent=2)
+            atomic_write_json(recipe, recipe_path)
 
-    # Update "latest" symlink
+    # Update "latest" symlink (atomic — never missing between remove+symlink)
     latest = os.path.join(out_dir, "latest_ds")
-    if os.path.islink(latest): os.remove(latest)
-    os.symlink(os.path.abspath(path), latest)
+    atomic_symlink(path, latest)
     print(f"[Checkpoint] saved {path}")
+    log_event(get_logger(), "checkpoint_saved", step=step, path=path)
 
 
 def load_ds_checkpoint(engine, resume_path: str) -> Tuple[int, float, dict]:
@@ -1101,7 +1105,7 @@ def smoke_test():
 
     # Test save/load (torch format, not DeepSpeed -- DS needs multi-GPU)
     os.makedirs(ckpt_dir, exist_ok=True)
-    torch.save({
+    atomic_torch_save({
         "step": 5,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -1130,6 +1134,17 @@ def train(args):
 
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
+
+    # Ensure the process group is torn down even if an exception unwinds train().
+    atexit.register(lambda: dist.destroy_process_group() if dist.is_initialized() else None)
+
+    # Graceful shutdown on SIGINT/SIGTERM (scheduler preemption, Ctrl+C).
+    install_signal_handlers()
+    log = setup_logging()
+    if master:
+        log_event(log, "pretrain_start",
+                  model_size=args.model_size, max_steps=args.max_steps,
+                  seq_len=args.seq_len, resume=args.resume)
 
     torch.manual_seed(args.seed + global_rank)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -1160,8 +1175,9 @@ def train(args):
             max_position_embeddings=max_pos,
         )
 
-    # ---- architecture variant passthrough
-    apply_architecture_args(config, args)
+    # ---- architecture variant passthrough (only flags the user explicitly
+    # ---- set, so a resumed checkpoint's arch like jamba / MTP heads survives)
+    apply_architecture_args(config, args, defaults=args.arch_defaults)
 
     # Whether to run the forward pass under torch.autocast(bf16) instead
     # of DeepSpeed's native bf16 path (which produced a degenerate model
@@ -1388,7 +1404,17 @@ def train(args):
     # longer need a manual context here. Cross-entropy / softmax are
     # dtype-stable and remain in fp32.
 
+    interrupted = False
     for step in range(start_step, args.max_steps):
+
+        # ---- graceful shutdown (collective-safe: all ranks agree to stop)
+        if should_stop(device, world_size):
+            interrupted = True
+            if master:
+                print(f"\n[Shutdown] requested at step {step} — "
+                      f"saving final checkpoint …")
+                log_event(log, "shutdown_requested", step=step)
+            break
 
         # ---- LR override (DeepSpeed scheduler handles LR internally,
         #      but we manually set it to match our cosine schedule which
@@ -1502,18 +1528,30 @@ def train(args):
 
         # ---- checkpoint  (all ranks must call save_checkpoint together)
         if step % args.ckpt_interval == 0 and step > start_step:
+            save_ds_checkpoint(engine, step, total_tokens, args,
+                               args.out_dir, config, best_val_loss,
+                               recipe=recipe)
             if master:
-                save_ds_checkpoint(engine, step, total_tokens, args,
-                                   args.out_dir, config, best_val_loss,
-                                   recipe=recipe)
                 prune_checkpoints(args.out_dir, keep=args.keep_ckpts)
 
     # ---- final checkpoint
+    # On graceful shutdown `step` is exactly the next optimizer step to run
+    # (we broke at the top of iteration `step`), so saving it makes resume
+    # continue where we stopped — no lost progress. save_ds_checkpoint is a
+    # COLLECTIVE under ZeRO, so every rank must call it either way.
+    final_step = step if interrupted else args.max_steps
+    save_ds_checkpoint(engine, final_step, total_tokens, args,
+                       args.out_dir, config, best_val_loss,
+                       recipe=recipe)
     if master:
-        save_ds_checkpoint(engine, args.max_steps, total_tokens, args,
-                           args.out_dir, config, best_val_loss,
-                           recipe=recipe)
-        print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
+        if interrupted:
+            print(f"\n[Shutdown] checkpoint saved at step {final_step}. "
+                  f"Resume with --resume {os.path.join(args.out_dir, 'latest_ds')}")
+            log_event(log, "shutdown_checkpoint_saved", step=final_step)
+        else:
+            print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
+            log_event(log, "training_complete", step=final_step,
+                      best_val_loss=best_val_loss)
         if use_wandb:
             import wandb; wandb.finish()
 
@@ -1614,7 +1652,11 @@ def parse_args():
     p.add_argument("--local_rank", type=int, default=-1,
                    help="Set by DeepSpeed launcher; do not set manually.")
 
-    return p.parse_args()
+    args = p.parse_args()
+    # Namespace of pure argparse defaults, used to detect which architecture
+    # flags the user explicitly set (see apply_architecture_args).
+    args.arch_defaults = p.parse_args([])
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -1634,6 +1676,17 @@ def main_ddp(local_rank, args):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Parse args first to check for smoke-test before requiring deepspeed/GPU
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="Run self-contained smoke test (no GPU/DeepSpeed needed)")
+    parser.add_argument("--data-dir", type=str, default=None)
+    known_args, _ = parser.parse_known_args()
+
+    if known_args.smoke_test:
+        smoke_test()
+        sys.exit(0)
+
     if not torch.cuda.is_available():
         print("ERROR: train_pretrain_deepspeed.py requires at least one CUDA GPU.")
         sys.exit(1)
