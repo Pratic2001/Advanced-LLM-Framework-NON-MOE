@@ -6,14 +6,17 @@
 > backends, with live monitoring and WebSocket-driven charts.
 
 > **Background:** the default `deep-space` palette renders a real-time WebGL
-> astrophysics scene — a Schwarzschild ray-traced black hole with a warm golden
-> accretion disk and photon ring, and a Sedov–Taylor supernova whose lensed
-> light-echo wave sweeps the sky, all reacting to the mouse. Force it on any
-> browser with `/?palette=deep-space` (overrides whatever palette is saved).
+> black-hole scene (a faithful port of the "Event Horizon" reference) — a black
+> event-horizon orb with a fresnel photon-ring rim and warm halo, a tilted golden
+> accretion ring disk (fbm turbulence + doppler beaming), 9000 twinkling stars,
+> colourful purple/blue/magenta/amber nebulae, click-to-ignite + ambient particle
+> supernovae, and a fake-lensing post pass (screen-space warp, chromatic
+> aberration, dual-tone grade, grain). Force it on any browser with
+> `/?palette=deep-space` (overrides whatever palette is saved).
 
 **Stack:** Next.js 16 (App Router, Turbopack) · React 19 · TypeScript 5.9 ·
 PostgreSQL 14+ via Prisma 6 · NextAuth v5 (Auth.js) · Tailwind v4 · Framer Motion 12 ·
-Three.js 0.185 + React Three Fiber 9 (WebGL background renderer)
+Three.js 0.185 (WebGL background renderer)
 
 ---
 

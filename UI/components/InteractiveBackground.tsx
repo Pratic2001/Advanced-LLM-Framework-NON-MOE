@@ -1768,10 +1768,11 @@ export function InteractiveBackground({
   return (
     <>
       {strategyKey === "cosmos" ? (
-        // WebGL2/WebGL1 renderer for the Deep Space palette: realistic
-        // accretion disk with gravitational lensing, hypernova lifecycle,
-        // and a parallax starfield. Falls back internally to a static
-        // starfield if the GPU context cannot be created.
+        // WebGL renderer for the Deep Space palette: a faithful port of the
+        // "Event Horizon" black-hole scene — event-horizon orb, tilted golden
+        // disk, fresnel rim, halo, 9000 stars, colourful nebulae, particle
+        // supernovae and a fake-lensing post pass. Falls back internally to an
+        // animated CSS starfield if a GPU context cannot be created.
         <CosmosWebGL className={`fixed inset-0 -z-10 pointer-events-none ${className}`} />
       ) : (
         <canvas
