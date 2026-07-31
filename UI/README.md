@@ -5,8 +5,15 @@
 > SFT → GRPO/DPO — across single-node, multi-node, and Hivemind (decentralized)
 > backends, with live monitoring and WebSocket-driven charts.
 
+> **Background:** the default `deep-space` palette renders a real-time WebGL
+> astrophysics scene — a Schwarzschild ray-traced black hole with a warm golden
+> accretion disk and photon ring, and a Sedov–Taylor supernova whose lensed
+> light-echo wave sweeps the sky, all reacting to the mouse. Force it on any
+> browser with `/?palette=deep-space` (overrides whatever palette is saved).
+
 **Stack:** Next.js 16 (App Router, Turbopack) · React 19 · TypeScript 5.9 ·
-PostgreSQL 14+ via Prisma 6 · NextAuth v5 (Auth.js) · Tailwind v4 · Framer Motion 12
+PostgreSQL 14+ via Prisma 6 · NextAuth v5 (Auth.js) · Tailwind v4 · Framer Motion 12 ·
+Three.js 0.185 + React Three Fiber 9 (WebGL background renderer)
 
 ---
 
@@ -460,7 +467,7 @@ also covers dev runs. For systemd, point `EnvironmentFile=` at `.env.production`
 | `SSH_KEY_ENCRYPTION_KEY` | yes | **Exactly 32 hex chars** (16 bytes) for AES-256-GCM. Generates SSH-key ciphertext at rest. Generate with `openssl rand -hex 16`. **Losing this destroys every stored SSH key.** |
 | `REPO_ROOT` | yes | Path to the framework directory containing `train_pretrain.py`, `train_sft.py`, etc. Defaults to `../`. |
 | `HOSTNAME` | optional | Bind address. Defaults to `localhost`. Use `0.0.0.0` in prod. |
-| `PORT` | optional | Defaults to `3000`. |
+| `PORT` | optional | Defaults to `3000`. ⚠️ Any `PORT` already exported in your shell **overrides** this default — if another process owns that port (e.g. a tunnel), `server.ts` dies with `EADDRINUSE`. Start it with an explicit `PORT=3000 npm run start:ws`. |
 | `NODE_ENV` | yes (prod) | `production` makes `server.ts` pass `dev: false` so the prebuilt `.next/` is used. |
 | `SMTP_*` / `NOTIFICATION_EMAIL` | optional | Email alerts on job failures. |
 
@@ -620,6 +627,19 @@ sudo grep -E "^(local|host)" $(sudo -u postgres psql -c "SHOW hba_file;" -t | tr
 rm -rf node_modules package-lock.json
 npm install --include=dev    # --include=dev forces devDeps
 npx prisma generate
+```
+
+### `Error: listen EADDRINUSE` — server starts on the wrong port
+
+`server.ts` reads `PORT` from `lib/env.ts`, which defaults to `3000` — **but an
+exported `PORT` in your shell overrides that default**. If another process already
+owns the port (e.g. a Tailscale/omniroute tunnel holding `20128`), startup aborts
+with `EADDRINUSE`.
+
+```bash
+unset PORT || export -n PORT   # clear any exported value
+PORT=3000 npm run start:ws     # explicit port always wins
+ss -ltnp | grep :3000          # confirm what's already bound
 ```
 
 ### Prisma migration fails

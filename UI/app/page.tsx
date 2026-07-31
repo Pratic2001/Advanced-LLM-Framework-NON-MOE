@@ -89,7 +89,13 @@ function CursorGlow() {
   );
 }
 
-function HeroParallax({ children }: { children: React.ReactNode }) {
+function HeroParallax({
+  textChildren,
+  buttons,
+}: {
+  textChildren: React.ReactNode;
+  buttons: React.ReactNode;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const x = useMotionValue(0);
   const y = useMotionValue(0);
@@ -99,13 +105,11 @@ function HeroParallax({ children }: { children: React.ReactNode }) {
   const sx = useSpring(x, config);
   const sy = useSpring(y, config);
 
-  // Map cursor offset to small translations per child depth
-  const tx1 = useTransform(sx, (v) => v * 0.02);
-  const ty1 = useTransform(sy, (v) => v * 0.02);
-  const tx2 = useTransform(sx, (v) => v * -0.04);
-  const ty2 = useTransform(sy, (v) => v * -0.04);
-  const tx3 = useTransform(sx, (v) => v * 0.08);
-  const ty3 = useTransform(sy, (v) => v * 0.08);
+  // Cursor offset drives the hero text parallax.
+  // Buttons are rendered OUTSIDE the parallaxing container so they stay
+  // fixed in place and only react to direct mouse interaction (rise on hover).
+  const txText = useTransform(sx, (v) => v * 0.05);
+  const tyText = useTransform(sy, (v) => v * 0.05);
 
   const handleMove = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
@@ -129,26 +133,44 @@ function HeroParallax({ children }: { children: React.ReactNode }) {
       ref={ref}
       onMouseMove={handleMove}
       onMouseLeave={handleLeave}
-      className="relative"
+      className="relative flex flex-col items-center"
     >
-      <motion.div style={{ x: tx3, y: ty3 }} className="absolute inset-0 pointer-events-none">
-        {/* Far back ambient orbs */}
-        <div className="absolute top-1/4 left-1/4 w-72 h-72 rounded-full blur-3xl opacity-20"
-             style={{ background: `hsl(var(--palette-primary))` }} />
-        <div className="absolute bottom-1/4 right-1/4 w-96 h-96 rounded-full blur-3xl opacity-15"
-             style={{ background: `hsl(var(--palette-tertiary))` }} />
+      {/* Hero text — parallaxes with the cursor */}
+      <motion.div style={{ x: txText, y: tyText }} className="max-w-4xl mx-auto">
+        {textChildren}
       </motion.div>
-      <motion.div style={{ x: tx1, y: ty1 }}>{children}</motion.div>
-      <motion.div
-        style={{ x: tx2, y: ty2 }}
-        className="absolute inset-0 pointer-events-none"
-        aria-hidden="true"
-      >
-        {/* Mid-layer floating chips */}
-        <div className="absolute top-20 right-10 w-20 h-20 glass-subtle rounded-xl rotate-12 opacity-30" />
-        <div className="absolute bottom-32 left-16 w-16 h-16 glass-subtle rounded-full opacity-25" />
-      </motion.div>
+      {/* Buttons — fixed in position, only rise on direct hover */}
+      <div className="mt-10">{buttons}</div>
     </div>
+  );
+}
+
+function HeroButton({
+  href,
+  primary,
+  children,
+}: {
+  href: string;
+  primary: boolean;
+  children: React.ReactNode;
+}) {
+  const base =
+    "group relative flex items-center gap-2 px-6 py-3 rounded-xl font-semibold transition-all duration-300 will-change-transform";
+  const variants = primary
+    ? "bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] text-white glow-primary hover:opacity-95"
+    : "glass-strong text-foreground border border-border/50 hover:bg-accent/50";
+  return (
+    <motion.div
+      // Rises on hover, settles back when pointer leaves. Buttons stay
+      // exactly where they are at rest (no parallax, no auto-motion).
+      whileHover={{ y: -6, scale: 1.03 }}
+      whileTap={{ y: -2, scale: 0.98 }}
+      transition={{ type: "spring", stiffness: 320, damping: 18 }}
+    >
+      <Link href={href} className={`${base} ${variants}`}>
+        {children}
+      </Link>
+    </motion.div>
   );
 }
 
@@ -213,61 +235,57 @@ export default function HomePage() {
 
         {/* Hero */}
         <section className="flex-1 flex flex-col items-center justify-center px-6 py-20 md:py-28 text-center relative">
-          <HeroParallax>
-            <motion.div
-              initial={{ opacity: 0, y: 24 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.7, ease: "easeOut" }}
-              className="max-w-4xl mx-auto"
-            >
-              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full glass-strong border border-border/50 text-glow-primary text-xs font-medium mb-8">
-                <motion.span
-                  animate={{ rotate: [0, 8, -8, 0] }}
-                  transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}
-                  className="inline-flex"
-                >
-                  <Network className="w-3 h-3" />
-                </motion.span>
-                Advanced LLM Training Framework
-              </div>
-
-              <h1 className="text-5xl md:text-7xl font-bold tracking-tight mb-6 leading-[1.05]">
-                Train LLMs from
-                <br />
-                <span className="relative inline-block bg-gradient-to-r from-[hsl(var(--palette-primary))] via-[hsl(var(--palette-secondary))] to-[hsl(var(--palette-tertiary))] bg-clip-text text-transparent">
-                  Browser to Cluster
+          <HeroParallax
+            textChildren={
+              <motion.div
+                initial={{ opacity: 0, y: 24 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.7, ease: "easeOut" }}
+              >
+                <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full glass-strong border border-border/50 text-glow-primary text-xs font-medium mb-8">
                   <motion.span
-                    className="absolute -bottom-2 left-0 h-1 rounded-full bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))]"
-                    initial={{ width: 0 }}
-                    animate={{ width: "100%" }}
-                    transition={{ duration: 1.2, delay: 0.6, ease: "easeOut" }}
-                  />
-                </span>
-              </h1>
+                    animate={{ rotate: [0, 8, -8, 0] }}
+                    transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}
+                    className="inline-flex"
+                  >
+                    <Network className="w-3 h-3" />
+                  </motion.span>
+                  Advanced LLM Training Framework
+                </div>
 
-              <p className="text-lg text-muted-foreground max-w-2xl mx-auto mb-10 leading-relaxed">
-                Orchestrate the full LLM training pipeline — from tokenizer training
-                through pretraining, SFT, and RL — across single or multi-node clusters
-                with real-time monitoring and one-click deployment.
-              </p>
+                <h1 className="text-5xl md:text-7xl font-bold tracking-tight mb-6 leading-[1.05]">
+                  Train LLMs from
+                  <br />
+                  <span className="relative inline-block bg-gradient-to-r from-[hsl(var(--palette-primary))] via-[hsl(var(--palette-secondary))] to-[hsl(var(--palette-tertiary))] bg-clip-text text-transparent">
+                    Browser to Cluster
+                    <motion.span
+                      className="absolute -bottom-2 left-0 h-1 rounded-full bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))]"
+                      initial={{ width: 0 }}
+                      animate={{ width: "100%" }}
+                      transition={{ duration: 1.2, delay: 0.6, ease: "easeOut" }}
+                    />
+                  </span>
+                </h1>
 
+                <p className="text-lg text-muted-foreground max-w-2xl mx-auto leading-relaxed">
+                  Orchestrate the full LLM training pipeline — from tokenizer training
+                  through pretraining, SFT, and RL — across single or multi-node clusters
+                  with real-time monitoring and one-click deployment.
+                </p>
+              </motion.div>
+            }
+            buttons={
               <div className="flex items-center justify-center gap-4 flex-wrap">
-                <Link
-                  href="/signup"
-                  className="group flex items-center gap-2 px-6 py-3 rounded-xl bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] text-white font-semibold hover:opacity-90 transition-all glow-primary"
-                >
+                <HeroButton href="/signup" primary>
                   Start Building
                   <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
-                </Link>
-                <Link
-                  href="/login"
-                  className="px-6 py-3 rounded-xl glass-strong text-foreground font-medium hover:bg-accent/50 transition-all border border-border/50"
-                >
+                </HeroButton>
+                <HeroButton href="/login" primary={false}>
                   Sign In
-                </Link>
+                </HeroButton>
               </div>
-            </motion.div>
-          </HeroParallax>
+            }
+          />
 
           {/* Floating status bar with mouse-following cursor hint */}
           <motion.div
