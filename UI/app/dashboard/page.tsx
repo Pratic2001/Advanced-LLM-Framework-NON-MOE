@@ -16,41 +16,40 @@ import {
   CheckCircle2,
   Clock,
 } from "lucide-react";
+import { usePalette } from "@/components/PaletteProvider";
 
 const quickLinks = [
   {
     label: "Torch / DDP",
     href: "/dashboard/torchtab",
     icon: Cpu,
-    color: "#00f0ff",
-    gradient: "from-neon-cyan to-cyan-500",
+    gradient: "from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))]",
   },
   {
     label: "DeepSpeed",
     href: "/dashboard/deepspeed",
     icon: Waves,
-    color: "#0088ff",
-    gradient: "from-neon-blue to-blue-500",
+    gradient: "from-[hsl(var(--palette-secondary))] to-[hsl(var(--palette-tertiary))]",
   },
   {
     label: "Hivemind",
     href: "/dashboard/hivemind",
     icon: Globe,
-    color: "#7c3aed",
-    gradient: "from-neon-purple to-purple-500",
+    gradient: "from-[hsl(var(--palette-tertiary))] to-[hsl(var(--palette-accent))]",
   },
 ];
 
 const statsCards = [
-  { label: "Total Jobs", value: "0", icon: Activity, color: "text-neon-cyan" },
+  { label: "Total Jobs", value: "0", icon: Activity, color: "text-[hsl(var(--palette-primary))]" },
   { label: "Active Runs", value: "0", icon: PlayCircle, color: "text-green-400" },
-  { label: "Connected Nodes", value: "0", icon: Server, color: "text-neon-blue" },
-  { label: "Config Presets", value: "0", icon: BarChart3, color: "text-neon-purple" },
+  { label: "Connected Nodes", value: "0", icon: Server, color: "text-[hsl(var(--palette-secondary))]" },
+  { label: "Config Presets", value: "0", icon: BarChart3, color: "text-[hsl(var(--palette-tertiary))]" },
 ];
 
 export default function DashboardHome() {
   const { data: session } = useSession();
   const [gpuInfo, setGpuInfo] = useState<string | null>(null);
+  const { currentPalette } = usePalette();
 
   useEffect(() => {
     fetch("/api/system/audit")
@@ -65,7 +64,7 @@ export default function DashboardHome() {
       <motion.div
         initial={{ opacity: 0, y: 10 }}
         animate={{ opacity: 1, y: 0 }}
-        className="glass rounded-2xl p-6 md:p-8 neon-glow-cyan"
+        className="glass rounded-2xl p-6 md:p-8 glow-primary"
       >
         <h1 className="text-2xl md:text-3xl font-bold mb-2">
           Welcome{session?.user?.name ? `, ${session.user.name}` : " back"}
@@ -77,7 +76,7 @@ export default function DashboardHome() {
         <div className="flex flex-wrap gap-3 mt-6">
           <Link
             href="/dashboard/torchtab/config"
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-neon-cyan to-neon-blue text-black font-semibold text-sm hover:opacity-90 transition-all"
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] text-white font-semibold text-sm hover:opacity-90 transition-all glow-primary"
           >
             <PlayCircle className="w-4 h-4" />
             Launch Training
@@ -136,7 +135,7 @@ export default function DashboardHome() {
                     >
                       <Icon className="w-5 h-5 text-white" />
                     </div>
-                    <h3 className="font-semibold mb-1 group-hover:text-neon-cyan transition-colors">
+                    <h3 className="font-semibold mb-1 group-hover:text-[hsl(var(--palette-primary))] transition-colors">
                       {link.label}
                     </h3>
                     <p className="text-sm text-muted-foreground">
@@ -159,7 +158,7 @@ export default function DashboardHome() {
           className="glass rounded-xl p-5 border border-border/50"
         >
           <h3 className="font-semibold mb-3 flex items-center gap-2">
-            <Cpu className="w-4 h-4 text-neon-cyan" />
+            <Cpu className="w-4 h-4 text-[hsl(var(--palette-primary))]" />
             Local GPU
           </h3>
           <pre className="text-xs text-muted-foreground font-mono">{gpuInfo}</pre>

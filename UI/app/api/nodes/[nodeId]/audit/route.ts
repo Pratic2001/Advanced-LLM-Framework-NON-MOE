@@ -4,15 +4,17 @@ import prisma from "@/lib/db";
 
 export async function POST(
   req: Request,
-  { params }: { params: { nodeId: string } }
+  { params }: { params: Promise<{ nodeId: string }> }
 ) {
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const { nodeId } = await params;
+
   const node = await prisma.node.findFirst({
-    where: { id: params.nodeId, userId: session.user.id },
+    where: { id: nodeId, userId: session.user.id },
     include: { sshKey: true },
   });
 
@@ -22,7 +24,7 @@ export async function POST(
 
   // Mark as auditing
   await prisma.node.update({
-    where: { id: params.nodeId },
+    where: { id: nodeId },
     data: { status: "AUDITING", errorMessage: null },
   });
 
@@ -41,7 +43,7 @@ export async function POST(
 
     // Update node with audit results
     const updatedNode = await prisma.node.update({
-      where: { id: params.nodeId },
+      where: { id: nodeId },
       data: {
         status: "AUDITED",
         gpuName: auditResult.gpuName,
@@ -56,7 +58,7 @@ export async function POST(
     return NextResponse.json(updatedNode);
   } catch (error: any) {
     await prisma.node.update({
-      where: { id: params.nodeId },
+      where: { id: nodeId },
       data: {
         status: "ERROR",
         errorMessage: error.message || "Audit failed",

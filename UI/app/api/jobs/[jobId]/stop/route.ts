@@ -5,15 +5,17 @@ import { JobManager } from "@/lib/job-manager";
 
 export async function POST(
   req: Request,
-  { params }: { params: { jobId: string } }
+  { params }: { params: Promise<{ jobId: string }> }
 ) {
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const { jobId } = await params;
+
   const job = await prisma.job.findFirst({
-    where: { id: params.jobId, userId: session.user.id },
+    where: { id: jobId, userId: session.user.id },
   });
 
   if (!job) {
@@ -28,7 +30,7 @@ export async function POST(
   }
 
   try {
-    const killed = await JobManager.getInstance().stop(params.jobId);
+    const killed = await JobManager.getInstance().stop(jobId);
     if (!killed) {
       return NextResponse.json(
         { error: "Process not found or already terminated" },
@@ -37,7 +39,7 @@ export async function POST(
     }
 
     const updatedJob = await prisma.job.findUnique({
-      where: { id: params.jobId },
+      where: { id: jobId },
     });
 
     return NextResponse.json(updatedJob);

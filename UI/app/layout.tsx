@@ -41,11 +41,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className="dark">
-      <body
-        className={`${fontVariables} min-h-screen bg-background antialiased`}
-      >
-        <div className="grid-overlay" />
-        <canvas id="particle-canvas" className="particle-network" />
+      <body className={`${fontVariables} min-h-screen bg-background antialiased`}>
         <Providers>{children}</Providers>
       </body>
     </html>

@@ -53,7 +53,7 @@ export async function POST(req: Request) {
     const nodeRecords = await prisma.node.findMany({
       where: { id: { in: nodeIds }, userId: session.user.id },
     });
-    nodes = nodeRecords.map((n) => ({
+    nodes = nodeRecords.map((n: { host: string; gpuCount: number | null }) => ({
       host: n.host,
       gpuCount: n.gpuCount || 1,
     }));

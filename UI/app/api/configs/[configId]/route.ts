@@ -5,15 +5,17 @@ import { updateConfigSchema, formatZodErrors } from "@/lib/validations";
 
 export async function GET(
   req: Request,
-  { params }: { params: { configId: string } }
+  { params }: { params: Promise<{ configId: string }> }
 ) {
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const { configId } = await params;
+
   const preset = await prisma.configPreset.findFirst({
-    where: { id: params.configId, userId: session.user.id },
+    where: { id: configId, userId: session.user.id },
   });
 
   if (!preset) {
@@ -25,7 +27,7 @@ export async function GET(
 
 export async function PUT(
   req: Request,
-  { params }: { params: { configId: string } }
+  { params }: { params: Promise<{ configId: string }> }
 ) {
   const session = await auth();
   if (!session?.user?.id) {
@@ -41,8 +43,10 @@ export async function PUT(
     );
   }
 
+  const { configId } = await params;
+
   const preset = await prisma.configPreset.findFirst({
-    where: { id: params.configId, userId: session.user.id },
+    where: { id: configId, userId: session.user.id },
   });
 
   if (!preset) {
@@ -50,7 +54,7 @@ export async function PUT(
   }
 
   const updated = await prisma.configPreset.update({
-    where: { id: params.configId },
+    where: { id: configId },
     data: {
       name: parsed.data.name ?? preset.name,
       description: parsed.data.description ?? preset.description,
@@ -63,22 +67,24 @@ export async function PUT(
 
 export async function DELETE(
   req: Request,
-  { params }: { params: { configId: string } }
+  { params }: { params: Promise<{ configId: string }> }
 ) {
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const { configId } = await params;
+
   const preset = await prisma.configPreset.findFirst({
-    where: { id: params.configId, userId: session.user.id },
+    where: { id: configId, userId: session.user.id },
   });
 
   if (!preset) {
     return NextResponse.json({ error: "Config not found" }, { status: 404 });
   }
 
-  await prisma.configPreset.delete({ where: { id: params.configId } });
+  await prisma.configPreset.delete({ where: { id: configId } });
 
   return NextResponse.json({ success: true });
 }

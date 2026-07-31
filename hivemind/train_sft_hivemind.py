@@ -60,9 +60,19 @@ from hivemind.hivemind_utils import (
     setup_hivemind_peer,
     build_hivemind_optimizer,
     average_checkpoints_via_hivemind,
+    average_checkpoint_during_training,
     get_initial_peers_from_args,
+    get_peer_seed,
+    get_swarm_info,
+    wrap_optimizers_for_hivemind,
+    save_hivemind_checkpoint,
+    load_hivemind_checkpoint,
+    maybe_average_final_checkpoint,
     add_hivemind_args,
     check_hivemind_args,
+    measure_peer_throughputs,
+    compute_adaptive_target_batch_size,
+    get_fast_peer_subset,
     try_init_wandb,
     log_wandb,
     _HIVEMIND_AVAILABLE,
@@ -350,7 +360,7 @@ def save_sft_checkpoint(
 
 def load_sft_checkpoint(
     path: str,
-    model: nn.Module,
+    model: Optional[nn.Module] = None,
     optimizers: Optional[List] = None,
     device: Optional[torch.device] = None,
 ) -> Tuple[int, int]:
@@ -366,10 +376,12 @@ def load_sft_checkpoint(
         ckpt_path = path
 
     ckpt = load_torch_checkpoint(ckpt_path, map_location=device)
-    raw = getattr(model, "_orig_mod", model)
-    raw.load_state_dict(ckpt["model_state"])
-    if hasattr(raw, "tie_weights"):
-        raw.tie_weights()
+
+    if model is not None:
+        raw = getattr(model, "_orig_mod", model)
+        raw.load_state_dict(ckpt["model_state"])
+        if hasattr(raw, "tie_weights"):
+            raw.tie_weights()
 
     if optimizers is not None and "optimizer_state" in ckpt:
         opt_state = ckpt["optimizer_state"]
@@ -403,7 +415,7 @@ def _train(
         device = torch.device("cpu")
 
     if hivemind_info is not None:
-        peer_seed = args.seed + hash(hivemind_info.endpoint) % 65536
+        peer_seed = get_peer_seed(args, hivemind_info.endpoint)
     else:
         peer_seed = args.seed
 
@@ -463,12 +475,9 @@ def _train(
 
     # ---- data ---------------------------------------------------------------
     if hivemind_info is not None:
-        try:
-            visible = len(hivemind_info.peer.get_visible_peers())
-            swarm_size = max(visible, args.target_group_size)
-        except Exception:
-            swarm_size = args.target_group_size
-        peer_idx = hash(hivemind_info.endpoint) % swarm_size
+        swarm_size, peer_idx = get_swarm_info(
+            hivemind_info.peer, args.target_group_size, hivemind_info.endpoint
+        )
     else:
         swarm_size = 1
         peer_idx = 0
@@ -494,6 +503,11 @@ def _train(
         args.min_lr = args.min_lr * scale
         print(f"[LR] Auto-scaled to {args.lr:.2e} (x{scale:.3f})")
 
+    # ---- resume -------------------------------------------------------------
+    start_step = 0
+    if args.resume:
+        start_step, _ = load_sft_checkpoint(args.resume, model, None, device)
+
     # ---- optimizer ----------------------------------------------------------
     local_opts = build_optimizer(
         model,
@@ -509,20 +523,22 @@ def _train(
     if args.hivemind:
         if hivemind_info is None:
             raise RuntimeError("Hivemind flag set but no peer info.")
-        hivemind_opts = []
-        for i, opt in enumerate(local_opts):
-            hopt = build_hivemind_optimizer(
-                model=model, base_optimizer=opt,
-                peer=hivemind_info.peer,
-                target_group_size=args.target_group_size,
-                averaging_period=args.averaging_period,
-                average_parameters=args.average_parameters,
-                prefix=f"sft_hivemind_{i}", verbose=True,
-            )
-            hivemind_opts.append(hopt)
-        optimizers = hivemind_opts
+        initial_sync = (start_step == 0)
+        optimizers = wrap_optimizers_for_hivemind(
+            model=model,
+            local_optimizers=local_opts,
+            peer=hivemind_info.peer,
+            args=args,
+            prefix="sft_hivemind",
+            verbose=True,
+            initial_sync=initial_sync,
+        )
     else:
         optimizers = local_opts
+
+    # ---- load optimizer state after Hivemind wrapping (if resuming) ---------
+    if args.resume:
+        _, _ = load_sft_checkpoint(args.resume, None, optimizers, device)
 
     # ---- LR schedule --------------------------------------------------------
     scheduler = build_scheduler(
@@ -538,11 +554,6 @@ def _train(
     use_amp = device.type == "cuda" and args.dtype == "bf16"
     amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
 
-    # ---- resume -------------------------------------------------------------
-    start_step = 0
-    if args.resume:
-        start_step, _ = load_sft_checkpoint(args.resume, model, optimizers, device)
-
     # ---- W&B ----------------------------------------------------------------
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     use_wandb = args.wandb_project and try_init_wandb(
@@ -553,6 +564,10 @@ def _train(
     tokens_per_step = args.batch_size * args.seq_len * args.grad_accum
     print(f"\nTokens / local step : {tokens_per_step:,}")
     print(f"Total steps : {args.num_steps:,}")
+    if args.hivemind:
+        print(f"Swarm               : {args.target_group_size}+ peers (async)")
+        print(f"Hivemind accum steps: {args.hivemind_accumulation_steps}")
+        print(f"Adaptive batch      : {args.hivemind_adaptive_batch}")
     print()
 
     # ================================================================== LOOP
@@ -563,6 +578,14 @@ def _train(
     t0 = time.perf_counter()
     loss_accum = 0.0
     step_local = start_step
+
+    # Hivemind async averaging state
+    avg_future = None
+    local_accum_counter = 0
+
+    # Bandwidth-aware peer weighting state
+    peer_throughputs = {}  # peer_id -> tokens/sec
+    last_throughput_update = 0
 
     try:
         while step_local < args.num_steps:
@@ -589,6 +612,71 @@ def _train(
                 opt.zero_grad(set_to_none=True)
 
             step_local += 1
+            local_accum_counter += 1
+
+            # ---- Hivemind: adaptive target_batch_size based on swarm size ----
+            if args.hivemind and args.hivemind_adaptive_batch and local_accum_counter == 1:
+                # Update target_batch_size on first step and periodically
+                try:
+                    visible_peers = len(hivemind_info.peer.get_visible_peers())
+                    swarm_size = max(visible_peers, args.target_group_size)
+                    new_target = compute_adaptive_target_batch_size(
+                        args.batch_size,
+                        swarm_size,
+                        min_peers=args.hivemind_min_peers,
+                        max_scale=args.hivemind_max_scale,
+                    )
+                    if new_target != args.batch_size:
+                        for opt in optimizers:
+                            if hasattr(opt, 'target_batch_size'):
+                                opt.target_batch_size = new_target
+                        print(f"[Hivemind] Adaptive target_batch_size: {new_target} (swarm={swarm_size})")
+                except Exception as e:
+                    print(f"[Hivemind] Adaptive batch sizing skipped: {e}")
+
+            # ---- Hivemind: bandwidth-aware peer throughput measurement ------
+            if args.hivemind and args.hivemind_bandwidth_aware and step_local % args.hivemind_throughput_window == 0:
+                try:
+                    # Measure local throughput
+                    local_tok_per_sec = tokens_per_step * args.log_interval / max(time.perf_counter() - t0, 1e-9)
+                    peer_throughputs = measure_peer_throughputs(
+                        hivemind_info.peer,
+                        local_tok_per_sec,
+                        window=args.hivemind_throughput_window,
+                    )
+                    # Get fast peer subset for potential weighted averaging
+                    fast_peers = get_fast_peer_subset(
+                        peer_throughputs,
+                        min_throughput=1000.0,
+                        max_peers=32,
+                    )
+                    print(f"[Hivemind] Local throughput: {local_tok_per_sec/1e3:.1f}k tok/s, fast peers: {len(fast_peers)}")
+                except Exception as e:
+                    print(f"[Hivemind] Throughput measurement skipped: {e}")
+
+            # ---- Hivemind: async averaging with compute/comm overlap ---------
+            if args.hivemind and local_accum_counter >= args.hivemind_accumulation_steps:
+                # Wait for previous async average to complete (non-blocking check)
+                if avg_future is not None:
+                    if hasattr(avg_future, 'ready') and avg_future.ready():
+                        try:
+                            avg_future.result()  # raises if error
+                        except Exception as e:
+                            print(f"[Hivemind] Async average error: {e}")
+                        avg_future = None
+                    # If not ready, skip this round - don't queue up
+
+                # Launch new async average
+                if avg_future is None:
+                    try:
+                        for opt in optimizers:
+                            if hasattr(opt, 'average_parameters'):
+                                avg_future = opt.average_parameters(async_op=True)
+                                break
+                    except Exception as e:
+                        print(f"[Hivemind] Failed to launch async average: {e}")
+
+                local_accum_counter = 0
 
             # logging
             if step_local % args.log_interval == 0 or step_local == 1:
@@ -626,6 +714,20 @@ def _train(
 
     except KeyboardInterrupt:
         print(f"\n[SFT] Interrupted at step {step_local}.")
+
+    # If Hivemind enabled, trigger cross-swarm averaging BEFORE saving final checkpoint
+    if args.hivemind and hivemind_info is not None:
+        print(f"\n[Hivemind] Running cross-swarm averaging before final checkpoint...")
+        try:
+            # Trigger averaging with current model state
+            for opt in optimizers:
+                if hasattr(opt, 'average_parameters'):
+                    # Blocking wait for convergence
+                    opt.average_parameters(async_op=False)
+                    time.sleep(2.0)  # allow propagation
+                    break
+        except Exception as e:
+            print(f"[Hivemind] Cross-swarm averaging error: {e}")
 
     save_sft_checkpoint(
         args.checkpoint_dir, step_local, model, optimizers,
@@ -711,7 +813,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--jit", action="store_true")
     p.add_argument("--compile-mode", default="default")
     p.add_argument("--gradient-checkpointing", action="store_true")
-    p.add_argument("--checkpoint-dir", "--output-dir", default="./sft_ckpts_hivemind")
+    # Checkpoint directory already defined as --checkpoint/--checkpoint-dir alias above
     p.add_argument("--resume", default=None)
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--keep-ckpts", type=int, default=3)
@@ -732,7 +834,23 @@ def parse_args() -> argparse.Namespace:
 
     # Hivemind
     add_hivemind_args(p)
-    p.add_argument("--average-checkpoints", action="store_true", default=False)
+    p.add_argument("--average-checkpoints", action="store_true", default=False,
+                   help="After training, average parameters across the swarm "
+                        "to produce a merged evaluation checkpoint.")
+    # Async averaging overlap
+    p.add_argument("--hivemind-accumulation-steps", type=int, default=8,
+                   help="Local gradient accumulation steps before triggering "
+                        "all-reduce (reduces communication frequency).")
+    p.add_argument("--hivemind-adaptive-batch", action="store_true", default=True,
+                   help="Adapt target_batch_size based on swarm size.")
+    p.add_argument("--hivemind-min-peers", type=int, default=4,
+                   help="Minimum peers for adaptive batch scaling.")
+    p.add_argument("--hivemind-max-scale", type=float, default=4.0,
+                   help="Maximum batch size scaling factor.")
+    p.add_argument("--hivemind-bandwidth-aware", action="store_true", default=False,
+                   help="Weight peer contributions by measured throughput (experimental).")
+    p.add_argument("--hivemind-throughput-window", type=int, default=100,
+                   help="Window size for peer throughput measurement.")
 
     return p.parse_args()
 

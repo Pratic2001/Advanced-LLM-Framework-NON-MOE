@@ -5,12 +5,14 @@ import { createMetricSchema, formatZodErrors } from "@/lib/validations";
 
 export async function GET(
   req: Request,
-  { params }: { params: { jobId: string } }
+  { params }: { params: Promise<{ jobId: string }> }
 ) {
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+
+  const { jobId } = await params;
 
   const { searchParams } = new URL(req.url);
   const limit = Math.min(parseInt(searchParams.get("limit") || "500"), 5000);
@@ -20,7 +22,7 @@ export async function GET(
 
   const metrics = await prisma.jobMetric.findMany({
     where: {
-      jobId: params.jobId,
+      jobId,
       ...(after ? { step: { gt: after } } : {}),
     },
     orderBy: { step: "asc" },
@@ -32,12 +34,14 @@ export async function GET(
 
 export async function POST(
   req: Request,
-  { params }: { params: { jobId: string } }
+  { params }: { params: Promise<{ jobId: string }> }
 ) {
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+
+  const { jobId } = await params;
 
   const body = await req.json();
   const parsed = createMetricSchema.safeParse(body);
@@ -52,7 +56,7 @@ export async function POST(
 
   const metric = await prisma.jobMetric.create({
     data: {
-      jobId: params.jobId,
+      jobId,
       step,
       loss,
       vramUsed,

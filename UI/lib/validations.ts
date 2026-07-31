@@ -32,7 +32,7 @@ const scriptNameEnum = z.enum([
 export const createJobSchema = z.object({
   type: scriptNameEnum,
   backend: backendEnum,
-  config: z.record(z.unknown()),
+  config: z.record(z.string(), z.unknown()),
   nodeIds: z.array(z.string().min(1)).optional(),
   extraArgs: z.string().optional(),
 });
@@ -51,7 +51,7 @@ export const createMetricSchema = z.object({
 const stageSchema = z.object({
   type: z.string().min(1),
   label: z.string().min(1),
-  config: z.record(z.unknown()).default({}),
+  config: z.record(z.string(), z.unknown()).default({}),
   dependsOn: z.array(z.string()).optional(),
   extraArgs: z.string().optional(),
 });
@@ -80,7 +80,7 @@ export const createConfigSchema = z.object({
   name: z.string().min(1, "Config name is required").max(255),
   description: z.string().optional(),
   backend: backendEnum,
-  config: z.record(z.unknown()),
+  config: z.record(z.string(), z.unknown()),
 });
 
 export const updateConfigSchema = createConfigSchema.partial();

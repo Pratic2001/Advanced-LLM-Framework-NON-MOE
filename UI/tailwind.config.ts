@@ -5,6 +5,7 @@ const config: Config = {
     "./app/**/*.{js,ts,jsx,tsx,mdx}",
     "./hooks/**/*.{js,ts,jsx,tsx,mdx}",
     "./lib/**/*.{js,ts,jsx,tsx,mdx}",
+    "./components/**/*.{js,ts,jsx,tsx,mdx}",
   ],
   theme: {
     extend: {
@@ -42,11 +43,16 @@ const config: Config = {
           DEFAULT: "hsl(var(--popover))",
           foreground: "hsl(var(--popover-foreground))",
         },
-        neon: {
-          cyan: "#00f0ff",
-          blue: "#0088ff",
-          purple: "#7c3aed",
-          pink: "#ec4899",
+        // Palette colors - controlled by CSS variables
+        palette: {
+          primary: "hsl(var(--palette-primary))",
+          "primary-glow": "hsl(var(--palette-primary-glow))",
+          secondary: "hsl(var(--palette-secondary))",
+          "secondary-glow": "hsl(var(--palette-secondary-glow))",
+          tertiary: "hsl(var(--palette-tertiary))",
+          "tertiary-glow": "hsl(var(--palette-tertiary-glow))",
+          accent: "hsl(var(--palette-accent))",
+          "accent-glow": "hsl(var(--palette-accent-glow))",
         },
       },
       borderRadius: {
@@ -62,6 +68,8 @@ const config: Config = {
         "pulse-glow": "pulse-glow 2s ease-in-out infinite",
         "float": "float 6s ease-in-out infinite",
         "grid-scroll": "grid-scroll 20s linear infinite",
+        "shimmer": "shimmer 2s ease-in-out infinite",
+        "particle-drift": "particle-drift 20s ease-in-out infinite",
       },
       keyframes: {
         "pulse-glow": {
@@ -76,11 +84,32 @@ const config: Config = {
           "0%": { transform: "translateY(0)" },
           "100%": { transform: "translateY(-50%)" },
         },
+        shimmer: {
+          "0%": { backgroundPosition: "200% 0" },
+          "100%": { backgroundPosition: "-200% 0" },
+        },
+        "particle-drift": {
+          "0%, 100%": { transform: "translate(0, 0) rotate(0deg)" },
+          "25%": { transform: "translate(30px, -30px) rotate(90deg)" },
+          "50%": { transform: "translate(-20px, 40px) rotate(180deg)" },
+          "75%": { transform: "translate(40px, 20px) rotate(270deg)" },
+        },
       },
       backgroundImage: {
         "gradient-radial": "radial-gradient(var(--tw-gradient-stops))",
-        "glow-cyan": "radial-gradient(ellipse at center, rgba(0,240,255,0.15), transparent 70%)",
-        "glow-blue": "radial-gradient(ellipse at center, rgba(0,136,255,0.15), transparent 70%)",
+        "gradient-conic": "conic-gradient(from 180deg at 50% 50%, var(--tw-gradient-stops))",
+      },
+      boxShadow: {
+        "glow-primary": "0 0 20px hsl(var(--palette-primary) / 0.3), 0 0 40px hsl(var(--palette-primary) / 0.1), inset 0 0 20px hsl(var(--palette-primary) / 0.05)",
+        "glow-secondary": "0 0 20px hsl(var(--palette-secondary) / 0.3), 0 0 40px hsl(var(--palette-secondary) / 0.1), inset 0 0 20px hsl(var(--palette-secondary) / 0.05)",
+        "glow-tertiary": "0 0 20px hsl(var(--palette-tertiary) / 0.3), 0 0 40px hsl(var(--palette-tertiary) / 0.1), inset 0 0 20px hsl(var(--palette-tertiary) / 0.05)",
+        "glow-accent": "0 0 20px hsl(var(--palette-accent) / 0.3), 0 0 40px hsl(var(--palette-accent) / 0.1), inset 0 0 20px hsl(var(--palette-accent) / 0.05)",
+        "glass": "0 8px 32px 0 rgba(0, 0, 0, 0.37), inset 0 1px 0 rgba(255, 255, 255, 0.1)",
+        "glass-strong": "0 12px 40px 0 rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.15)",
+      },
+      backdropBlur: {
+        xs: "2px",
+        "4xl": "72px",
       },
     },
   },

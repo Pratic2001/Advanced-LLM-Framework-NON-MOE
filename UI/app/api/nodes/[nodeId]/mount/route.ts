@@ -5,7 +5,7 @@ import { mountNfsSchema, formatZodErrors } from "@/lib/validations";
 
 export async function POST(
   req: Request,
-  { params }: { params: { nodeId: string } }
+  { params }: { params: Promise<{ nodeId: string }> }
 ) {
   const session = await auth();
   if (!session?.user?.id) {
@@ -21,10 +21,11 @@ export async function POST(
     );
   }
 
+  const { nodeId } = await params;
   const { nfsServer, exportPath, mountPoint } = parsed.data;
 
   const node = await prisma.node.findFirst({
-    where: { id: params.nodeId, userId: session.user.id },
+    where: { id: nodeId, userId: session.user.id },
   });
 
   if (!node) {
@@ -39,7 +40,7 @@ export async function POST(
 
     // Mark NFS as mounted
     const updatedNode = await prisma.node.update({
-      where: { id: params.nodeId },
+      where: { id: nodeId },
       data: {
         nfsMounted: true,
         nfsMountPath: mountPoint || "/mnt/training",
@@ -57,15 +58,17 @@ export async function POST(
 
 export async function DELETE(
   req: Request,
-  { params }: { params: { nodeId: string } }
+  { params }: { params: Promise<{ nodeId: string }> }
 ) {
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const { nodeId } = await params;
+
   const node = await prisma.node.findFirst({
-    where: { id: params.nodeId, userId: session.user.id },
+    where: { id: nodeId, userId: session.user.id },
   });
 
   if (!node) {
@@ -77,7 +80,7 @@ export async function DELETE(
     // await ssh.exec(`sudo umount ${node.nfsMountPath}`);
 
     const updatedNode = await prisma.node.update({
-      where: { id: params.nodeId },
+      where: { id: nodeId },
       data: {
         nfsMounted: false,
         nfsMountPath: null,

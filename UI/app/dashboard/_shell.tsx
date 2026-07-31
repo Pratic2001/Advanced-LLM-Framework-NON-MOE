@@ -19,9 +19,11 @@ import {
   Server,
   PlayCircle,
   BarChart3,
+  Palette,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { ReactNode } from "react";
+import { usePalette, PaletteSelector } from "@/components/PaletteProvider";
 
 const tabs = [
   {
@@ -29,24 +31,21 @@ const tabs = [
     label: "Torch / DDP",
     icon: Cpu,
     href: "/dashboard/torchtab",
-    color: "neon-cyan",
-    glow: "shadow-[0_0_15px_rgba(0,240,255,0.15)]",
+    glow: "glow-primary",
   },
   {
     id: "deepspeed",
     label: "DeepSpeed",
     icon: Waves,
     href: "/dashboard/deepspeed",
-    color: "neon-blue",
-    glow: "shadow-[0_0_15px_rgba(0,136,255,0.15)]",
+    glow: "glow-secondary",
   },
   {
     id: "hivemind",
     label: "Hivemind",
     icon: Globe,
     href: "/dashboard/hivemind",
-    color: "neon-purple",
-    glow: "shadow-[0_0_15px_rgba(124,58,237,0.15)]",
+    glow: "glow-tertiary",
   },
 ];
 
@@ -62,6 +61,7 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
   const { data: session } = useSession();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const { currentPalette } = usePalette();
 
   // Auth is already enforced by the server-side parent layout. We render a
   // brief loading state only if the client SessionProvider hasn't hydrated
@@ -80,12 +80,12 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
       >
         {/* Logo */}
         <div className="h-16 flex items-center gap-3 px-4 border-b border-border/50">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-neon-cyan to-neon-blue flex items-center justify-center shrink-0">
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] flex items-center justify-center shrink-0">
             <Zap className="w-4 h-4 text-white" />
           </div>
           {sidebarOpen && (
-            <span className="font-semibold text-base tracking-tight whitespace-nowrap">
-              LLM<span className="text-neon-cyan">Forge</span>
+            <span className="font-semibold text-base tracking-tight">
+              LLM<span className="text-glow-primary">Forge</span>
             </span>
           )}
         </div>
@@ -97,7 +97,7 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
             href="/dashboard"
             className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-all ${
               pathname === "/dashboard"
-                ? "bg-neon-cyan/10 text-neon-cyan border border-neon-cyan/20"
+                ? "bg-[hsl(var(--palette-primary))]/10 text-[hsl(var(--palette-primary))] border border-[hsl(var(--palette-primary))]/20"
                 : "text-muted-foreground hover:text-foreground hover:bg-accent/50"
             }`}
           >
@@ -129,9 +129,9 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
                 style={
                   isActive
                     ? {
-                        background: `rgba(0, 240, 255, 0.05)`,
-                        borderColor: `rgba(0, 240, 255, 0.15)`,
-                        color: tab.id === "torchtab" ? "#00f0ff" : tab.id === "deepspeed" ? "#0088ff" : "#7c3aed",
+                        background: `hsla(var(--palette-primary) / 0.05)`,
+                        borderColor: `hsla(var(--palette-primary) / 0.15)`,
+                        color: `hsl(var(--palette-primary))`,
                       }
                     : undefined
                 }
@@ -192,7 +192,7 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
             {/* Active tab + subnav */}
             <div className="flex items-center gap-4 overflow-x-auto">
               {/* Tab buttons */}
-              <div className="flex items-center gap-1 bg-background rounded-lg p-1 border border-border/50">
+              <div className="flex items-center gap-1 glass rounded-lg p-1 border border-border/50">
                 {tabs.map((tab) => {
                   const Icon = tab.icon;
                   const isActive = pathname.startsWith(tab.href);
@@ -202,7 +202,7 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
                       href={tab.href}
                       className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium transition-all whitespace-nowrap ${
                         isActive
-                          ? "bg-accent text-foreground"
+                          ? "bg-[hsl(var(--palette-primary))]/20 text-[hsl(var(--palette-primary))]"
                           : "text-muted-foreground hover:text-foreground"
                       }`}
                     >
@@ -219,17 +219,19 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
                   {tabSubNav.map((sub) => {
                     const subHref = `${activeTab.href}/${sub.id}`;
                     const isSubActive = pathname === subHref || (sub.id === "setup" && pathname === activeTab.href);
+                    const SubIcon = sub.icon;
                     return (
                       <Link
                         key={sub.id}
                         href={subHref}
-                        className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all whitespace-nowrap ${
+                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all whitespace-nowrap ${
                           isSubActive
-                            ? "text-foreground bg-accent/50"
+                            ? "text-foreground bg-[hsl(var(--palette-primary))]/30"
                             : "text-muted-foreground hover:text-foreground"
                         }`}
                       >
-                        {sub.label}
+                        <SubIcon className="w-3.5 h-3.5" />
+                        <span className="hidden sm:inline">{sub.label}</span>
                       </Link>
                     );
                   })}
@@ -243,6 +245,7 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
                 <div className="w-2 h-2 rounded-full bg-green-500" />
                 <span className="hidden sm:inline">Connected</span>
               </div>
+              <PaletteSelector />
             </div>
           </div>
         </header>

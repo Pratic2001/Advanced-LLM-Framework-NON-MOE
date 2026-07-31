@@ -84,9 +84,19 @@ from hivemind.hivemind_utils import (
     setup_hivemind_peer,
     build_hivemind_optimizer,
     average_checkpoints_via_hivemind,
+    average_checkpoint_during_training,
     get_initial_peers_from_args,
+    get_peer_seed,
+    get_swarm_info,
+    wrap_optimizers_for_hivemind,
+    save_hivemind_checkpoint,
+    load_hivemind_checkpoint,
+    maybe_average_final_checkpoint,
     add_hivemind_args,
     check_hivemind_args,
+    measure_peer_throughputs,
+    compute_adaptive_target_batch_size,
+    get_fast_peer_subset,
     _HIVEMIND_AVAILABLE,
 )
 
@@ -133,36 +143,18 @@ def save_dpo_hivemind_checkpoint(
     recipe: TrainingRecipe,
 ) -> str:
     """Save DPO checkpoint, unwrapping Hivemind DecentralizedOptimizer if needed."""
-    raw = _raw(model)
-    inner_opt = optimizer.opt if hasattr(optimizer, "opt") else optimizer
-
-    ckpt = {
-        "step": step,
-        "model_state": raw.state_dict(),
-        "optimizer_state": inner_opt.state_dict(),
-        "config": vars(config),
-        "args": args_dict,
-        "is_lora": is_lora,
-    }
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"dpo_step{step:07d}.pt")
-    torch.save(ckpt, path)
-
-    latest = os.path.join(out_dir, "latest.pt")
-    if os.path.islink(latest) or os.path.exists(latest):
-        if os.path.islink(latest):
-            os.remove(latest)
-        else:
-            os.remove(latest)
-    try:
-        os.symlink(os.path.abspath(path), latest)
-    except OSError:
-        pass
-
-    recipe.to_json(os.path.join(out_dir, "recipe.json"))
-
-    print(f"[Checkpoint] saved {path}")
-    return path
+    # Use shared utility for Hivemind checkpoint saving
+    save_hivemind_checkpoint(
+        checkpoint_dir=out_dir,
+        step=step,
+        model=model,
+        optimizers=[optimizer],
+        config=config,
+        train_args=args_dict,
+        prefix="dpo_step",
+        extra={"is_lora": is_lora, "recipe": recipe.to_dict()},
+    )
+    return os.path.join(out_dir, f"dpo_step{step:07d}.pt")
 
 
 def load_dpo_hivemind_checkpoint(
@@ -286,7 +278,7 @@ def _train(
         device = torch.device("cpu")
 
     if hivemind_info is not None:
-        peer_seed = args.seed + hash(hivemind_info.endpoint) % 65536
+        peer_seed = get_peer_seed(args, hivemind_info.endpoint)
     else:
         peer_seed = args.seed
 
@@ -340,14 +332,11 @@ def _train(
     pad_id = get_special_token_id(tokenizer, recipe.pad_token)
     print(f"{peer_tag}[Tokenizer] eos_id={eos_id}, pad_id={pad_id}")
 
-    # ── data sharding ─────────────────────────────────────────────────────
+    # ── peer/shard info ───────────────────────────────────────────────────
     if hivemind_info is not None:
-        try:
-            visible = len(hivemind_info.peer.get_visible_peers())
-            swarm_size = max(visible, args.target_group_size)
-        except Exception:
-            swarm_size = args.target_group_size
-        peer_idx = hash(hivemind_info.endpoint) % swarm_size
+        swarm_size, peer_idx = get_swarm_info(
+            hivemind_info.peer, args.target_group_size, hivemind_info.endpoint
+        )
     else:
         swarm_size = 1
         peer_idx = 0
@@ -399,40 +388,31 @@ def _train(
         weight_decay=args.weight_decay,
     )
 
-    if args.hivemind and hivemind_info is not None:
-        optimizer = build_hivemind_optimizer(
-            model=model,
-            base_optimizer=local_opt,
-            peer=hivemind_info.peer,
-            target_group_size=args.target_group_size,
-            averaging_period=args.averaging_period,
-            average_parameters=args.average_parameters,
-            prefix="dpo_hivemind",
-            verbose=True,
-        )
-    else:
-        optimizer = local_opt
-
-    # ── LR schedule ───────────────────────────────────────────────────────
-    from optim.lr_schedule import build_scheduler
-    scheduler = build_scheduler(
-        schedule="cosine",
-        warmup_steps=args.warmup_steps,
-        max_steps=args.max_steps,
-        peak_lr=args.lr,
-        min_lr=args.min_lr,
-    )
-
-    # ── AMP ───────────────────────────────────────────────────────────────
-    use_amp = device.type == "cuda" and args.dtype == "bf16"
-    ctx = (torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-           if use_amp else nullcontext())
-
-    # ── resume ────────────────────────────────────────────────────────────
+    # ── resume (must happen before Hivemind wrapping to get start_step) ────
     start_step = 0
     if args.resume:
         start_step = load_dpo_hivemind_checkpoint(
-            args.resume, model, optimizer, device, is_lora,
+            args.resume, model, None, device, is_lora,
+        )
+
+    if args.hivemind and hivemind_info is not None:
+        initial_sync = (start_step == 0)
+        optimizer = wrap_optimizers_for_hivemind(
+            model=model,
+            local_optimizers=[local_opt],
+            peer=hivemind_info.peer,
+            args=args,
+            prefix="dpo_hivemind",
+            verbose=True,
+            initial_sync=initial_sync,
+        )[0]
+    else:
+        optimizer = local_opt
+
+    # ── load optimizer state after Hivemind wrapping (if resuming) ---------
+    if args.resume:
+        load_dpo_hivemind_checkpoint(
+            args.resume, None, optimizer, device, is_lora,
         )
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -440,6 +420,10 @@ def _train(
     print(f"{peer_tag}Max steps: {args.max_steps:,}")
     print(f"{peer_tag}DPO beta: {args.beta}")
     print(f"{peer_tag}Reference policy: {args.ref_policy}")
+    if args.hivemind:
+        print(f"{peer_tag}Swarm               : {args.target_group_size}+ peers (async)")
+        print(f"{peer_tag}Hivemind accum steps: {args.hivemind_accumulation_steps}")
+        print(f"{peer_tag}Adaptive batch      : {args.hivemind_adaptive_batch}")
 
     # ═════════════════════════════════════════════════════════════════ LOOP
     model.train()
@@ -451,6 +435,14 @@ def _train(
     step = start_step
     data_iter = iter(train_ds)
 
+    # Hivemind async averaging state
+    avg_future = None
+    local_accum_counter = 0
+
+    # Bandwidth-aware peer weighting state
+    peer_throughputs = {}  # peer_id -> tokens/sec
+    last_throughput_update = 0
+
     try:
         while step < args.max_steps:
             # ── learning rate ─────────────────────────────────────────────
@@ -459,53 +451,61 @@ def _train(
             for pg in inner_opt.param_groups:
                 pg["lr"] = lr
 
-            # 1. sample a batch of preference triples ──────────────────────
-            try:
-                chosen_ids, chosen_mask, rejected_ids, rejected_mask = next(data_iter)
-            except StopIteration:
-                data_iter = iter(train_ds)
-                chosen_ids, chosen_mask, rejected_ids, rejected_mask = next(data_iter)
+            # Gradient accumulation loop
+            loss_accum = 0.0
+            grad_norm = 0.0
+            for micro_step in range(args.grad_accum):
+                # 1. sample a batch of preference triples ──────────────────────
+                try:
+                    chosen_ids, chosen_mask, rejected_ids, rejected_mask = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(train_ds)
+                    chosen_ids, chosen_mask, rejected_ids, rejected_mask = next(data_iter)
 
-            chosen_ids = chosen_ids.to(device)
-            chosen_mask = chosen_mask.to(device)
-            rejected_ids = rejected_ids.to(device)
-            rejected_mask = rejected_mask.to(device)
+                chosen_ids = chosen_ids.to(device)
+                chosen_mask = chosen_mask.to(device)
+                rejected_ids = rejected_ids.to(device)
+                rejected_mask = rejected_mask.to(device)
 
-            # 2. reference log-probs (no_grad) ─────────────────────────────
-            with torch.no_grad():
-                ref_c_logp, _ = compute_sequence_logprobs(ref_for_logprob, chosen_ids)
-                ref_r_logp, _ = compute_sequence_logprobs(ref_for_logprob, rejected_ids)
+                # 2. reference log-probs (no_grad) ─────────────────────────────
+                with torch.no_grad():
+                    ref_c_logp, _ = compute_sequence_logprobs(ref_for_logprob, chosen_ids)
+                    ref_r_logp, _ = compute_sequence_logprobs(ref_for_logprob, rejected_ids)
 
-            # 3. policy log-probs (with grad) ──────────────────────────────
-            with ctx:
-                if _use_cudagraphs:
-                    torch.compiler.cudagraph_mark_step_begin()
-                policy_c_logp, c_mod_aux = compute_sequence_logprobs(model, chosen_ids)
-                policy_r_logp, r_mod_aux = compute_sequence_logprobs(model, rejected_ids)
-                mod_aux_loss = c_mod_aux + r_mod_aux
+                # 3. policy log-probs (with grad) ──────────────────────────────
+                with ctx:
+                    if _use_cudagraphs:
+                        torch.compiler.cudagraph_mark_step_begin()
+                    policy_c_logp, c_mod_aux = compute_sequence_logprobs(model, chosen_ids)
+                    policy_r_logp, r_mod_aux = compute_sequence_logprobs(model, rejected_ids)
+                    mod_aux_loss = c_mod_aux + r_mod_aux
 
-            # 4. DPO loss ─────────────────────────────────────────────────
-            loss, metrics = dpo_loss(
-                policy_c_logp, policy_r_logp,
-                ref_c_logp, ref_r_logp,
-                chosen_mask, rejected_mask,
-                beta=args.beta,
-                label_smoothing=args.label_smoothing,
-                clip_ratio=args.clip_ratio if args.clip_ratio > 0 else None,
-            )
-            # MoD auxiliary loss
-            loss += mod_aux_loss
+                # 4. DPO loss ─────────────────────────────────────────────────
+                loss, metrics = dpo_loss(
+                    policy_c_logp, policy_r_logp,
+                    ref_c_logp, ref_r_logp,
+                    chosen_mask, rejected_mask,
+                    beta=args.beta,
+                    label_smoothing=args.label_smoothing,
+                    clip_ratio=args.clip_ratio if args.clip_ratio > 0 else None,
+                )
+                # MoD auxiliary loss
+                loss += mod_aux_loss
+                loss = loss / args.grad_accum
 
-            # 5. backward + step ──────────────────────────────────────────
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+                # 5. backward ────────────────────────────────────────────────
+                loss.backward()
+                loss_accum += loss.item() * args.grad_accum
+
+            # 6. gradient clipping + optimizer step ───────────────────────────
             grad_norm = nn.utils.clip_grad_norm_(
                 model.parameters(), args.grad_clip,
             ).item()
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-            # 6. logging ──────────────────────────────────────────────────
-            loss_window.append(float(loss.detach().item()))
+            # 7. logging ──────────────────────────────────────────────────
+            loss_window.append(loss_accum)
             acc_window.append(metrics["accuracy"])
             window = max(1, len(loss_window))
 
@@ -525,7 +525,7 @@ def _train(
                     f"{sps:.2f} step/s"
                 )
 
-            # 7. validation ────────────────────────────────────────────────
+            # 8. validation ────────────────────────────────────────────────
             if val_ds is not None and step > start_step and step % args.val_every == 0:
                 val_metrics = validate(
                     _raw(model), val_ds, ref_model, args.beta, device,
@@ -533,7 +533,7 @@ def _train(
                 print(f"{peer_tag}  [val] acc {val_metrics['accuracy']:.2%} | "
                       f"r_margin {val_metrics['reward_margin']:.4f}")
 
-            # 8. checkpoint ────────────────────────────────────────────────
+            # 9. checkpoint ────────────────────────────────────────────────
             if step > start_step and step % args.save_every == 0:
                 save_dpo_hivemind_checkpoint(
                     args.out_dir, step, model, optimizer,
@@ -542,9 +542,84 @@ def _train(
                 prune_checkpoints(args.out_dir, keep=args.keep_ckpts)
 
             step += 1
+            local_accum_counter += 1
+
+            # ---- Hivemind: adaptive target_batch_size based on swarm size ----
+            if args.hivemind and args.hivemind_adaptive_batch and local_accum_counter == 1:
+                # Update target_batch_size on first step and periodically
+                try:
+                    visible_peers = len(hivemind_info.peer.get_visible_peers())
+                    swarm_size = max(visible_peers, args.target_group_size)
+                    new_target = compute_adaptive_target_batch_size(
+                        args.batch_size,
+                        swarm_size,
+                        min_peers=args.hivemind_min_peers,
+                        max_scale=args.hivemind_max_scale,
+                    )
+                    if new_target != args.batch_size:
+                        if hasattr(optimizer, 'target_batch_size'):
+                            optimizer.target_batch_size = new_target
+                        print(f"{peer_tag}[Hivemind] Adaptive target_batch_size: {new_target} (swarm={swarm_size})")
+                except Exception as e:
+                    print(f"{peer_tag}[Hivemind] Adaptive batch sizing skipped: {e}")
+
+            # ---- Hivemind: bandwidth-aware peer throughput measurement ------
+            if args.hivemind and args.hivemind_bandwidth_aware and step % args.hivemind_throughput_window == 0:
+                try:
+                    # Measure local throughput
+                    tokens_per_step = args.batch_size * args.grad_accum
+                    local_tok_per_sec = tokens_per_step * args.log_interval / max(time.perf_counter() - t0, 1e-9)
+                    peer_throughputs = measure_peer_throughputs(
+                        hivemind_info.peer,
+                        local_tok_per_sec,
+                        window=args.hivemind_throughput_window,
+                    )
+                    # Get fast peer subset for potential weighted averaging
+                    fast_peers = get_fast_peer_subset(
+                        peer_throughputs,
+                        min_throughput=1000.0,
+                        max_peers=32,
+                    )
+                    print(f"{peer_tag}[Hivemind] Local throughput: {local_tok_per_sec/1e3:.1f}k tok/s, fast peers: {len(fast_peers)}")
+                except Exception as e:
+                    print(f"{peer_tag}[Hivemind] Throughput measurement skipped: {e}")
+
+            # ---- Hivemind: async averaging with compute/comm overlap ---------
+            if args.hivemind and local_accum_counter >= args.hivemind_accumulation_steps:
+                # Wait for previous async average to complete (non-blocking check)
+                if avg_future is not None:
+                    if hasattr(avg_future, 'ready') and avg_future.ready():
+                        try:
+                            avg_future.result()  # raises if error
+                        except Exception as e:
+                            print(f"{peer_tag}[Hivemind] Async average error: {e}")
+                        avg_future = None
+                    # If not ready, skip this round - don't queue up
+
+                # Launch new async average
+                if avg_future is None:
+                    try:
+                        if hasattr(optimizer, 'average_parameters'):
+                            avg_future = optimizer.average_parameters(async_op=True)
+                    except Exception as e:
+                        print(f"{peer_tag}[Hivemind] Failed to launch async average: {e}")
+
+                local_accum_counter = 0
 
     except KeyboardInterrupt:
         print(f"\n{peer_tag}[DPO] Interrupted at step {step}.")
+
+    # If Hivemind enabled, trigger cross-swarm averaging BEFORE saving final checkpoint
+    if args.hivemind and hivemind_info is not None:
+        print(f"{peer_tag}[Hivemind] Running cross-swarm averaging before final checkpoint...")
+        try:
+            # Trigger averaging with current model state
+            if hasattr(optimizer, 'average_parameters'):
+                # Blocking wait for convergence
+                optimizer.average_parameters(async_op=False)
+                time.sleep(2.0)  # allow propagation
+        except Exception as e:
+            print(f"{peer_tag}[Hivemind] Cross-swarm averaging error: {e}")
 
     # ── final save ────────────────────────────────────────────────────────
     save_dpo_hivemind_checkpoint(
@@ -610,6 +685,8 @@ def parse_args() -> argparse.Namespace:
     # Optim
     p.add_argument("--batch-size", type=int, default=4,
                    help="Preference triples per step")
+    p.add_argument("--grad-accum", type=int, default=1,
+                   help="Gradient accumulation steps")
     p.add_argument("--num-steps", type=int, default=500,
                    help="Total training steps")
     p.add_argument("--max-steps", type=int, default=None,
@@ -647,6 +724,20 @@ def parse_args() -> argparse.Namespace:
     add_hivemind_args(p)
     p.add_argument("--average-checkpoints", action="store_true", default=False,
                    help="After training, average parameters across the swarm.")
+    # Async averaging overlap
+    p.add_argument("--hivemind-accumulation-steps", type=int, default=8,
+                   help="Local gradient accumulation steps before triggering "
+                        "all-reduce (reduces communication frequency).")
+    p.add_argument("--hivemind-adaptive-batch", action="store_true", default=True,
+                   help="Adapt target_batch_size based on swarm size.")
+    p.add_argument("--hivemind-min-peers", type=int, default=4,
+                   help="Minimum peers for adaptive batch scaling.")
+    p.add_argument("--hivemind-max-scale", type=float, default=4.0,
+                   help="Maximum batch size scaling factor.")
+    p.add_argument("--hivemind-bandwidth-aware", action="store_true", default=False,
+                   help="Weight peer contributions by measured throughput (experimental).")
+    p.add_argument("--hivemind-throughput-window", type=int, default=100,
+                   help="Window size for peer throughput measurement.")
 
     return p.parse_args()
 

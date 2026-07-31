@@ -6,13 +6,18 @@ const nextConfig = {
   // Build output for Docker
   output: "standalone",
 
-  experimental: {
-    // Keep native modules out of webpack's bundle. node-pty ships a `.node`
-    // binary that webpack can't bundle — marking it external makes Next leave
-    // it as a runtime `require` so the build doesn't try to resolve
-    // `pty.node` against the host filesystem. The route handlers under
-    // `app/api/shell/*` import this transitively through `pty-manager`.
-    serverComponentsExternalPackages: ["@homebridge/node-pty-prebuilt-multiarch"],
+  // Keep native modules out of webpack's bundle. node-pty ships a `.node`
+  // binary that webpack can't bundle — marking it external makes Next leave
+  // it as a runtime `require` so the build doesn't try to resolve
+  // `pty.node` against the host filesystem. The route handlers under
+  // `app/api/shell/*` import this transitively through `pty-manager`.
+  // (Next.js 15+ moved this out of `experimental`.)
+  serverExternalPackages: ["@homebridge/node-pty-prebuilt-multiarch"],
+
+  // Pin the Turbopack workspace root so it stops picking up
+  // /home/pratic/package-lock.json as the project root.
+  turbopack: {
+    root: process.cwd(),
   },
 
   // Security headers at the config level
