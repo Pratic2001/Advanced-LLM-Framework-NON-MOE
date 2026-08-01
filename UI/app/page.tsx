@@ -10,7 +10,6 @@ import {
   BarChart3,
   Server,
   GitBranch,
-  MousePointer2,
 } from "lucide-react";
 import { motion, useMotionValue, useSpring, useTransform } from "framer-motion";
 import { usePalette, PaletteSelector } from "@/components/PaletteProvider";
@@ -245,7 +244,7 @@ export default function HomePage() {
         <section
           className={
             isDeepSpace
-              ? "flex-1 flex flex-col items-start justify-start px-6 md:px-14 lg:px-20 pt-10 md:pt-16 text-left relative"
+              ? "flex-1 flex flex-col items-start justify-start px-6 md:px-14 lg:px-20 pt-10 md:pt-16 pb-16 text-left relative"
               : "flex-1 flex flex-col items-center justify-center px-6 py-20 md:py-28 text-center relative"
           }
         >
@@ -328,7 +327,7 @@ export default function HomePage() {
             }
           />
 
-          {/* Floating status bar with mouse-following cursor hint */}
+          {/* Floating status bar */}
           <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
@@ -358,11 +357,6 @@ export default function HomePage() {
                 transition={{ duration: 2, repeat: Infinity, delay: 0.4 }}
               />
               <span className="text-muted-foreground">Multi-Node</span>
-            </div>
-            <div className="w-px h-6 bg-border/50" />
-            <div className="hidden md:flex items-center gap-2 text-glow-primary">
-              <MousePointer2 className="w-3 h-3" />
-              <span className="text-xs">Move your mouse</span>
             </div>
           </motion.div>
         </section>
