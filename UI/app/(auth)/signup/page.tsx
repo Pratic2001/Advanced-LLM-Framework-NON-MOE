@@ -60,13 +60,13 @@ export default function SignupPage() {
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.5 }}
     >
-      <div className="glass rounded-2xl p-8 neon-glow-blue">
+      <div className="glass rounded-2xl p-8 glow-primary">
         <div className="flex items-center justify-center gap-3 mb-8">
-          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-neon-cyan to-neon-blue flex items-center justify-center">
+          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] flex items-center justify-center">
             <Zap className="w-5 h-5 text-white" />
           </div>
           <span className="text-xl font-bold">
-            LLM<span className="text-neon-cyan">Forge</span>
+            LLM<span className="text-[hsl(var(--palette-primary))]">Forge</span>
           </span>
         </div>
 
@@ -89,7 +89,7 @@ export default function SignupPage() {
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Your name"
-              className="w-full px-4 py-2.5 rounded-lg bg-background border border-border focus:border-neon-cyan focus:ring-1 focus:ring-neon-cyan outline-none transition-all text-sm"
+              className="w-full px-4 py-2.5 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none transition-all text-sm"
             />
           </div>
 
@@ -101,7 +101,7 @@ export default function SignupPage() {
               onChange={(e) => setEmail(e.target.value)}
               placeholder="you@example.com"
               required
-              className="w-full px-4 py-2.5 rounded-lg bg-background border border-border focus:border-neon-cyan focus:ring-1 focus:ring-neon-cyan outline-none transition-all text-sm"
+              className="w-full px-4 py-2.5 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none transition-all text-sm"
             />
           </div>
 
@@ -114,7 +114,7 @@ export default function SignupPage() {
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••"
                 required
-                className="w-full px-4 py-2.5 rounded-lg bg-background border border-border focus:border-neon-cyan focus:ring-1 focus:ring-neon-cyan outline-none transition-all text-sm pr-10"
+                className="w-full px-4 py-2.5 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none transition-all text-sm pr-10"
               />
               <button
                 type="button"
@@ -134,14 +134,14 @@ export default function SignupPage() {
               onChange={(e) => setConfirmPassword(e.target.value)}
               placeholder="••••••••"
               required
-              className="w-full px-4 py-2.5 rounded-lg bg-background border border-border focus:border-neon-cyan focus:ring-1 focus:ring-neon-cyan outline-none transition-all text-sm"
+              className="w-full px-4 py-2.5 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none transition-all text-sm"
             />
           </div>
 
           <button
             type="submit"
             disabled={loading}
-            className="w-full py-2.5 rounded-lg bg-gradient-to-r from-neon-cyan to-neon-blue text-black font-semibold hover:opacity-90 transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+            className="w-full py-2.5 rounded-lg bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] text-white font-semibold hover:opacity-90 transition-all disabled:opacity-50 glow-primary flex items-center justify-center gap-2"
           >
             {loading && <Loader2 className="w-4 h-4 animate-spin" />}
             {loading ? "Creating account..." : "Create Account"}
@@ -150,7 +150,7 @@ export default function SignupPage() {
 
         <p className="text-center text-sm text-muted-foreground mt-6">
           Already have an account?{" "}
-          <Link href="/login" className="text-neon-cyan hover:underline">
+          <Link href="/login" className="text-[hsl(var(--palette-primary))] hover:underline">
             Sign in
           </Link>
         </p>

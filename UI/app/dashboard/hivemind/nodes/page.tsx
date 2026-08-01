@@ -120,7 +120,7 @@ export default function HivemindNodesPage() {
         </div>
         <button
           onClick={() => setShowAdd(true)}
-          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-neon-purple to-purple-600 text-white font-semibold text-sm hover:opacity-90 transition-all"
+          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] text-white font-semibold text-sm hover:opacity-90 transition-all glow-primary"
         >
           <Plus className="w-4 h-4" />
           Add Peer
@@ -142,7 +142,7 @@ export default function HivemindNodesPage() {
                 value={newPeer.name}
                 onChange={(e) => setNewPeer({ ...newPeer, name: e.target.value })}
                 placeholder="e.g. peer-1"
-                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
               />
             </div>
             <div>
@@ -152,7 +152,7 @@ export default function HivemindNodesPage() {
                 value={newPeer.host}
                 onChange={(e) => setNewPeer({ ...newPeer, host: e.target.value })}
                 placeholder="e.g. 192.168.1.100"
-                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
               />
             </div>
             <div>
@@ -161,7 +161,7 @@ export default function HivemindNodesPage() {
                 type="text"
                 value={newPeer.port}
                 onChange={(e) => setNewPeer({ ...newPeer, port: e.target.value })}
-                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
               />
             </div>
             <div>
@@ -171,7 +171,7 @@ export default function HivemindNodesPage() {
                 value={newPeer.username}
                 onChange={(e) => setNewPeer({ ...newPeer, username: e.target.value })}
                 placeholder="e.g. ubuntu"
-                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
               />
             </div>
             <div>
@@ -179,7 +179,7 @@ export default function HivemindNodesPage() {
               <select
                 value={newPeer.role}
                 onChange={(e) => setNewPeer({ ...newPeer, role: e.target.value as "BOOTSTRAP" | "PEER" })}
-                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
               >
                 <option value="PEER">Worker Peer</option>
                 <option value="BOOTSTRAP">Bootstrap Peer</option>
@@ -190,7 +190,7 @@ export default function HivemindNodesPage() {
             <button
               onClick={addPeer}
               disabled={adding || !newPeer.name || !newPeer.host}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-neon-purple to-purple-600 text-white font-semibold text-sm hover:opacity-90 transition-all disabled:opacity-50"
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] text-white font-semibold text-sm hover:opacity-90 transition-all disabled:opacity-50 glow-primary"
             >
               {adding ? (
                 <>
@@ -224,7 +224,7 @@ export default function HivemindNodesPage() {
         >
           <div className="flex items-start justify-between">
             <div className="flex items-start gap-3">
-              <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-neon-purple to-purple-600 flex items-center justify-center shrink-0">
+              <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] flex items-center justify-center shrink-0">
                 <Radio className="w-5 h-5 text-white" />
               </div>
               <div>
@@ -285,7 +285,7 @@ export default function HivemindNodesPage() {
                 >
                   <div className="flex items-start justify-between">
                     <div className="flex items-start gap-3">
-                      <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-neon-purple/60 to-purple-600/60 flex items-center justify-center shrink-0">
+                      <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-[hsl(var(--palette-primary))]/60 to-[hsl(var(--palette-secondary))]/60 flex items-center justify-center shrink-0">
                         <Monitor className="w-5 h-5 text-white" />
                       </div>
                       <div>

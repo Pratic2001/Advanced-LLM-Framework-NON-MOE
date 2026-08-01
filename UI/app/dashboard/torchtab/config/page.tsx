@@ -297,7 +297,7 @@ export default function TorchtabConfigPage() {
                           <select
                             value={config[flag.key] ?? flag.default ?? ""}
                             onChange={(e) => setFlag(flag.key, e.target.value)}
-                            className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-cyan focus:ring-1 focus:ring-neon-cyan outline-none text-sm"
+                            className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
                           >
                             {flag.options?.map((opt) => (
                               <option key={opt} value={opt}>
@@ -318,7 +318,7 @@ export default function TorchtabConfigPage() {
                               )
                             }
                             placeholder={flag.description}
-                            className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-cyan focus:ring-1 focus:ring-neon-cyan outline-none text-sm"
+                            className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
                           />
                         )}
                         <p className="text-xs text-muted-foreground mt-1">
@@ -348,7 +348,7 @@ export default function TorchtabConfigPage() {
 --use_flash_attn_2
 --optimizer adamw`}
             rows={4}
-            className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-cyan focus:ring-1 focus:ring-neon-cyan outline-none text-sm font-mono resize-y"
+            className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm font-mono resize-y"
           />
           <p className="text-xs text-muted-foreground mt-1">
             These arguments are appended verbatim to the CLI command after the generated flags.
@@ -372,7 +372,7 @@ export default function TorchtabConfigPage() {
         <button
           onClick={launchAll}
           disabled={launching}
-          className="inline-flex items-center gap-3 px-8 py-3 rounded-xl bg-gradient-to-r from-neon-cyan to-neon-blue text-black font-bold text-lg hover:opacity-90 transition-all disabled:opacity-50 shadow-[0_0_30px_rgba(0,240,255,0.2)]"
+          className="inline-flex items-center gap-3 px-8 py-3 rounded-xl bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] text-white font-bold text-lg hover:opacity-90 transition-all disabled:opacity-50 glow-primary"
         >
           {launching ? (
             <>

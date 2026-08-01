@@ -239,7 +239,7 @@ export default function HivemindConfigPage() {
                         <select
                           value={config[flag.key] ?? flag.default ?? ""}
                           onChange={(e) => setFlag(flag.key, e.target.value)}
-                          className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                          className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
                         >
                           {flag.options?.map((opt) => (
                             <option key={opt} value={opt}>
@@ -260,7 +260,7 @@ export default function HivemindConfigPage() {
                             )
                           }
                           placeholder={flag.description}
-                          className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                          className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
                         />
                       )}
                       <p className="text-xs text-muted-foreground mt-1">
@@ -290,7 +290,7 @@ export default function HivemindConfigPage() {
 --max_peers 32
 --verbose`}
             rows={3}
-            className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm font-mono resize-y"
+            className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm font-mono resize-y"
           />
           <p className="text-xs text-muted-foreground mt-1">
             These arguments are appended to every peer's CLI command.
@@ -307,7 +307,7 @@ export default function HivemindConfigPage() {
           </div>
           <button
             onClick={() => setShowAddPeer(true)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-gradient-to-r from-neon-purple to-purple-600 text-white text-xs font-medium hover:opacity-90 transition-all"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] text-white text-xs font-medium hover:opacity-90 transition-all glow-primary"
           >
             <Plus className="w-3.5 h-3.5" />
             Add Peer
@@ -325,7 +325,7 @@ export default function HivemindConfigPage() {
                   value={newPeer.name}
                   onChange={(e) => setNewPeer({ ...newPeer, name: e.target.value })}
                   placeholder="peer-1"
-                  className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                  className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
                 />
               </div>
               <div>
@@ -335,7 +335,7 @@ export default function HivemindConfigPage() {
                   value={newPeer.host}
                   onChange={(e) => setNewPeer({ ...newPeer, host: e.target.value })}
                   placeholder="192.168.1.100"
-                  className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                  className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
                 />
               </div>
               <div>
@@ -343,7 +343,7 @@ export default function HivemindConfigPage() {
                 <select
                   value={newPeer.role}
                   onChange={(e) => setNewPeer({ ...newPeer, role: e.target.value as "BOOTSTRAP" | "PEER" })}
-                  className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-sm"
+                  className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
                 >
                   <option value="PEER">Worker Peer</option>
                   <option value="BOOTSTRAP">Bootstrap Peer</option>
@@ -353,7 +353,7 @@ export default function HivemindConfigPage() {
                 <button
                   onClick={addPeer}
                   disabled={!newPeer.name || !newPeer.host}
-                  className="px-4 py-2 rounded-lg bg-gradient-to-r from-neon-purple to-purple-600 text-white text-sm font-medium hover:opacity-90 transition-all disabled:opacity-50"
+                  className="px-4 py-2 rounded-lg bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] text-white text-sm font-medium hover:opacity-90 transition-all disabled:opacity-50 glow-primary"
                 >
                   Add
                 </button>
@@ -417,7 +417,7 @@ export default function HivemindConfigPage() {
                     ? "--host_maddrs /ip4/0.0.0.0/tcp/31337"
                     : `--bootstrap_peer /ip4/${peer.host}/tcp/31337/p2p/...`}
                   rows={2}
-                  className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-purple focus:ring-1 focus:ring-neon-purple outline-none text-xs font-mono resize-y"
+                  className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-xs font-mono resize-y"
                 />
               </div>
             ))
@@ -453,8 +453,7 @@ export default function HivemindConfigPage() {
         <button
           onClick={launchAll}
           disabled={launching}
-          className="inline-flex items-center gap-3 px-8 py-3 rounded-xl bg-gradient-to-r from-neon-purple to-purple-600 text-white font-bold text-lg hover:opacity-90 transition-all disabled:opacity-50"
-          style={{ boxShadow: "0 0 30px rgba(124,58,237,0.2)" }}
+          className="inline-flex items-center gap-3 px-8 py-3 rounded-xl bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] text-white font-bold text-lg hover:opacity-90 transition-all disabled:opacity-50 glow-primary"
         >
           {launching ? (
             <>

@@ -59,7 +59,7 @@ export default function TorchtabJobsPage() {
             >
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-neon-cyan to-neon-blue flex items-center justify-center shrink-0">
+                  <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] flex items-center justify-center shrink-0">
                     <BarChart3 className="w-5 h-5 text-white" />
                   </div>
                   <div>

@@ -119,7 +119,7 @@ export default function DeepSpeedNodesPage() {
         </div>
         <button
           onClick={() => setShowAdd(true)}
-          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-neon-blue to-blue-500 text-white font-semibold text-sm hover:opacity-90 transition-all"
+          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] text-white font-semibold text-sm hover:opacity-90 transition-all glow-primary"
         >
           <Plus className="w-4 h-4" />
           Add Node
@@ -141,7 +141,7 @@ export default function DeepSpeedNodesPage() {
                 value={newNode.name}
                 onChange={(e) => setNewNode({ ...newNode, name: e.target.value })}
                 placeholder="e.g. ds-worker-1"
-                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-blue focus:ring-1 focus:ring-neon-blue outline-none text-sm"
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
               />
             </div>
             <div>
@@ -151,7 +151,7 @@ export default function DeepSpeedNodesPage() {
                 value={newNode.host}
                 onChange={(e) => setNewNode({ ...newNode, host: e.target.value })}
                 placeholder="e.g. 192.168.1.100"
-                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-blue focus:ring-1 focus:ring-neon-blue outline-none text-sm"
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
               />
             </div>
             <div>
@@ -160,7 +160,7 @@ export default function DeepSpeedNodesPage() {
                 type="text"
                 value={newNode.port}
                 onChange={(e) => setNewNode({ ...newNode, port: e.target.value })}
-                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-blue focus:ring-1 focus:ring-neon-blue outline-none text-sm"
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
               />
             </div>
             <div>
@@ -170,7 +170,7 @@ export default function DeepSpeedNodesPage() {
                 value={newNode.username}
                 onChange={(e) => setNewNode({ ...newNode, username: e.target.value })}
                 placeholder="e.g. ubuntu"
-                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-blue focus:ring-1 focus:ring-neon-blue outline-none text-sm"
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
               />
             </div>
             <div>
@@ -178,7 +178,7 @@ export default function DeepSpeedNodesPage() {
               <select
                 value={newNode.role}
                 onChange={(e) => setNewNode({ ...newNode, role: e.target.value as "HEAD" | "WORKER" })}
-                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-neon-blue focus:ring-1 focus:ring-neon-blue outline-none text-sm"
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border focus:border-[hsl(var(--palette-primary))] focus:ring-1 focus:ring-[hsl(var(--palette-primary))] outline-none text-sm"
               >
                 <option value="HEAD">Head Node</option>
                 <option value="WORKER">Worker Node</option>
@@ -189,7 +189,7 @@ export default function DeepSpeedNodesPage() {
             <button
               onClick={addNode}
               disabled={adding || !newNode.name || !newNode.host}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-neon-blue to-blue-500 text-white font-semibold text-sm hover:opacity-90 transition-all disabled:opacity-50"
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] text-white font-semibold text-sm hover:opacity-90 transition-all disabled:opacity-50 glow-primary"
             >
               {adding ? (
                 <>
@@ -246,7 +246,7 @@ export default function DeepSpeedNodesPage() {
             >
               <div className="flex items-start justify-between">
                 <div className="flex items-start gap-3">
-                  <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-neon-blue to-blue-500 flex items-center justify-center shrink-0">
+                  <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))] flex items-center justify-center shrink-0">
                     <Monitor className="w-5 h-5 text-white" />
                   </div>
                   <div>
