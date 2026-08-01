@@ -36,6 +36,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
+import { emitCosmosEvent } from "./cosmosEvents";
 
 /* ──────────────── Animated CSS fallback (no WebGL) ──────────────────── */
 
@@ -184,6 +185,10 @@ interface Supernova {
   birth: number;
   life: number;
   big: boolean;
+  // Hue the ejecta cools toward (teal/violet/magenta) — the palette pulse
+  // follows the flash with a softer afterglow of this colour.
+  eventHue: number;
+  afterglowSent: boolean;
 }
 
 export function CosmosWebGL({ className = "" }: { className?: string }) {
@@ -822,6 +827,8 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       return {
         points, geo, mat, iris, irisMat, velocities, positions,
         birth: clock.elapsedTime, life: big ? 7.5 : 4.5, big,
+        eventHue: [205, 268, 330][(Math.random() * 3) | 0],
+        afterglowSent: false,
       };
     }
 
@@ -838,6 +845,10 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         .add(raycaster.ray.direction.clone().multiplyScalar(dist));
       supernovae.push(makeSupernova(pos, false));
       flashLevel = Math.min(1.0, flashLevel + 0.35);
+      // Flood the palette with a white-gold flash pulse at the click point.
+      emitCosmosEvent({
+        type: "supernova", heat: 0.5, hue: 46, x: ndc.x, y: ndc.y,
+      });
     }
 
     function spawnAmbientSupernova() {
@@ -851,6 +862,11 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       );
       supernovae.push(makeSupernova(pos, true));
       flashLevel = Math.min(1.0, flashLevel + 0.5);
+      // Project to screen space so the UI pulse can originate near the blast.
+      const ndc = pos.clone().project(camera);
+      emitCosmosEvent({
+        type: "supernova", heat: 0.75, hue: 46, x: ndc.x, y: ndc.y,
+      });
     }
 
     function updateSupernovae(dt: number) {
@@ -888,6 +904,17 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         s.iris.quaternion.copy(camera.quaternion);
         s.irisMat.uniforms.uAge.value = age;
         s.irisMat.uniforms.uTime.value = clock.elapsedTime;
+
+        // Once the ejecta cools into its coloured phase, fire a softer
+        // afterglow pulse so the palette drifts teal/violet/magenta with it.
+        if (age > 0.5 && !s.afterglowSent) {
+          s.afterglowSent = true;
+          const ndc = s.iris.position.clone().project(camera);
+          emitCosmosEvent({
+            type: "supernova", heat: s.big ? 0.4 : 0.28,
+            hue: s.eventHue, x: ndc.x, y: ndc.y,
+          });
+        }
       }
     }
 

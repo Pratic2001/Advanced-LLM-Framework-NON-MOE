@@ -12,6 +12,7 @@ import {
 } from "react";
 import { Palette, ChevronDown, Settings, X, Sparkles, Sun, Moon, Sliders, RotateCcw } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
+import { onCosmosEvent } from "./cosmosEvents";
 
 // ── Accent palettes ────────────────────────────────────────────────────────
 //
@@ -487,7 +488,12 @@ export function PaletteProvider({ children }: { children: ReactNode }) {
     ]
   );
 
-  return <PaletteContext.Provider value={value}>{children}</PaletteContext.Provider>;
+  return (
+    <PaletteContext.Provider value={value}>
+      <DeepSpacePaletteSync />
+      {children}
+    </PaletteContext.Provider>
+  );
 }
 
 export function usePalette() {
@@ -496,6 +502,111 @@ export function usePalette() {
     throw new Error("usePalette must be used within a PaletteProvider");
   }
   return context;
+}
+
+// ── Deep Space dynamic accent sync ────────────────────────────────────────
+// When the Deep Space palette is active the WebGL cosmos background is live:
+// hypernovae flash white-gold, then their ejecta cools to teal/violet/magenta.
+// This component pulses the accent tokens in response — flooding the UI with
+// the event colour, then easing back to the palette's quiet base values. All
+// writes go straight to CSS vars (no state, no localStorage), so every element
+// that reads `hsl(var(--palette-*))` — buttons, glows, gradient text, status
+// dots, cursor glow — reacts together.
+
+type AccentKey = "primary" | "secondary" | "tertiary" | "accent";
+
+/** Shortest-arc hue interpolation so 350°→10° sweeps through 0°, not 340°. */
+function hueLerp(a: number, b: number, t: number): number {
+  const d = ((b - a + 540) % 360) - 180;
+  return (a + d * t + 360) % 360;
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+function DeepSpacePaletteSync() {
+  const { currentPalette, effectivePalette } = usePalette();
+  const heatRef = useRef(0);
+  const hueRef = useRef(46);
+  const lastRef = useRef(0);
+  const rafRef = useRef<number | null>(null);
+  const baseRef = useRef(effectivePalette);
+
+  // Keep the base palette fresh so mid-pulse override edits take effect.
+  useEffect(() => {
+    baseRef.current = effectivePalette;
+  }, [effectivePalette]);
+
+  const active = currentPalette.id === "deep-space";
+
+  // Per-frame drive loop — only runs while a pulse is alive.
+  const tick = useCallback((now: number) => {
+    const dt = Math.min(0.05, (now - lastRef.current) / 1000);
+    lastRef.current = now;
+
+    // Exponential decay — a pulse reads for ~2.5s then settles.
+    let heat = heatRef.current * Math.exp(-dt * 2.6);
+    if (heat < 0.002) heat = 0;
+    heatRef.current = heat;
+
+    const base = baseRef.current;
+    const hue = hueRef.current;
+    const root = document.documentElement;
+
+    const setAccent = (key: AccentKey, s: number, l: number) => {
+      const b = parseHSL(base[key]);
+      const h = hueLerp(b.h, hue, heat);
+      const ns = lerp(b.s, s, heat);
+      const nl = lerp(b.l, l, heat);
+      const val = formatHSL({ h, s: ns, l: nl });
+      root.style.setProperty(`--palette-${key}`, val);
+      root.style.setProperty(
+        `--palette-${key}-glow`,
+        formatHSL({ h, s: Math.min(100, ns + 18), l: Math.min(100, nl + 14) }),
+      );
+      // Tailwind's shadcn tokens follow the active accent too.
+      if (key === "primary") {
+        root.style.setProperty("--primary", val);
+        root.style.setProperty("--ring", val);
+      }
+    };
+
+    setAccent("primary", 78, 56);
+    setAccent("secondary", 55, 44);
+    setAccent("tertiary", 52, 38);
+    setAccent("accent", 72, 64);
+
+    if (heat > 0) {
+      rafRef.current = requestAnimationFrame(tick);
+    } else {
+      rafRef.current = null;
+    }
+  }, []);
+
+  // React to background events while the deep-space palette is active.
+  useEffect(() => {
+    if (!active) return;
+    return onCosmosEvent((e) => {
+      heatRef.current = Math.min(1, heatRef.current + e.heat);
+      hueRef.current = e.hue;
+      if (rafRef.current == null) {
+        lastRef.current = performance.now();
+        rafRef.current = requestAnimationFrame(tick);
+      }
+    });
+  }, [active, tick]);
+
+  // Stop pulsing when the palette goes away — apply() has already written the
+  // base vars by then, so we only cancel the loop (no writes here).
+  useEffect(() => {
+    if (!active && rafRef.current != null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+  }, [active]);
+
+  return null;
 }
 
 // ── HSL slider primitive ──────────────────────────────────────────────────

@@ -47,7 +47,6 @@ const features = [
 ];
 
 function CursorGlow() {
-  const { currentPalette } = usePalette();
   const mouseX = useMotionValue(0);
   const mouseY = useMotionValue(0);
 
@@ -71,18 +70,19 @@ function CursorGlow() {
       style={{ x: sx, y: sy }}
       aria-hidden="true"
     >
-      {/* Soft outer glow that follows the cursor */}
+      {/* Soft outer glow that follows the cursor — reads the live palette vars
+          so Deep Space supernovae tint it in real time */}
       <div
         className="absolute -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full blur-3xl opacity-40"
         style={{
-          background: `radial-gradient(circle, hsl(${currentPalette.primaryGlow} / 0.35) 0%, hsl(${currentPalette.secondary} / 0.15) 40%, transparent 70%)`,
+          background: "radial-gradient(circle, hsl(var(--palette-primary-glow) / 0.35) 0%, hsl(var(--palette-secondary) / 0.15) 40%, transparent 70%)",
         }}
       />
       {/* Tight inner highlight */}
       <div
         className="absolute -translate-x-1/2 -translate-y-1/2 w-32 h-32 rounded-full blur-2xl"
         style={{
-          background: `radial-gradient(circle, hsl(${currentPalette.primaryGlow} / 0.6) 0%, transparent 70%)`,
+          background: "radial-gradient(circle, hsl(var(--palette-primary-glow) / 0.6) 0%, transparent 70%)",
         }}
       />
     </motion.div>
@@ -92,9 +92,11 @@ function CursorGlow() {
 function HeroParallax({
   textChildren,
   buttons,
+  leftAlign = false,
 }: {
   textChildren: React.ReactNode;
   buttons: React.ReactNode;
+  leftAlign?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const x = useMotionValue(0);
@@ -133,14 +135,19 @@ function HeroParallax({
       ref={ref}
       onMouseMove={handleMove}
       onMouseLeave={handleLeave}
-      className="relative flex flex-col items-center"
+      className={`relative flex flex-col ${
+        leftAlign ? "items-start" : "items-center"
+      }`}
     >
       {/* Hero text — parallaxes with the cursor */}
-      <motion.div style={{ x: txText, y: tyText }} className="max-w-4xl mx-auto">
+      <motion.div
+        style={{ x: txText, y: tyText }}
+        className={leftAlign ? "max-w-3xl" : "max-w-4xl mx-auto"}
+      >
         {textChildren}
       </motion.div>
       {/* Buttons — fixed in position, only rise on direct hover */}
-      <div className="mt-10">{buttons}</div>
+      <div className={leftAlign ? "mt-8" : "mt-10"}>{buttons}</div>
     </div>
   );
 }
@@ -176,6 +183,7 @@ function HeroButton({
 
 export default function HomePage() {
   const { currentPalette } = usePalette();
+  const isDeepSpace = currentPalette.id === "deep-space";
   const [tilt, setTilt] = useState<Record<string, { x: number; y: number }>>({});
 
   // Track mouse position per-card for 3D tilt + spotlight effect
@@ -234,8 +242,15 @@ export default function HomePage() {
         </nav>
 
         {/* Hero */}
-        <section className="flex-1 flex flex-col items-center justify-center px-6 py-20 md:py-28 text-center relative">
+        <section
+          className={
+            isDeepSpace
+              ? "flex-1 flex flex-col items-start justify-start px-6 md:px-14 lg:px-20 pt-10 md:pt-16 text-left relative"
+              : "flex-1 flex flex-col items-center justify-center px-6 py-20 md:py-28 text-center relative"
+          }
+        >
           <HeroParallax
+            leftAlign={isDeepSpace}
             textChildren={
               <motion.div
                 initial={{ opacity: 0, y: 24 }}
@@ -253,13 +268,29 @@ export default function HomePage() {
                   Advanced LLM Training Framework
                 </div>
 
-                <h1 className="text-5xl md:text-7xl font-bold tracking-tight mb-6 leading-[1.05]">
+                <h1
+                  className={
+                    isDeepSpace
+                      ? "text-4xl md:text-6xl font-bold tracking-tight mb-6 leading-[1.08]"
+                      : "text-5xl md:text-7xl font-bold tracking-tight mb-6 leading-[1.05]"
+                  }
+                >
                   Train LLMs from
                   <br />
-                  <span className="relative inline-block bg-gradient-to-r from-[hsl(var(--palette-primary))] via-[hsl(var(--palette-secondary))] to-[hsl(var(--palette-tertiary))] bg-clip-text text-transparent">
+                  <span
+                    className={`relative inline-block bg-clip-text text-transparent ${
+                      isDeepSpace
+                        ? "bg-gradient-to-r from-[hsl(var(--palette-primary))] via-[hsl(var(--palette-tertiary))] to-[hsl(var(--palette-accent))]"
+                        : "bg-gradient-to-r from-[hsl(var(--palette-primary))] via-[hsl(var(--palette-secondary))] to-[hsl(var(--palette-tertiary))]"
+                    }`}
+                  >
                     Browser to Cluster
                     <motion.span
-                      className="absolute -bottom-2 left-0 h-1 rounded-full bg-gradient-to-r from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))]"
+                      className={`absolute -bottom-2 left-0 h-1 rounded-full bg-gradient-to-r ${
+                        isDeepSpace
+                          ? "from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-tertiary))]"
+                          : "from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))]"
+                      }`}
                       initial={{ width: 0 }}
                       animate={{ width: "100%" }}
                       transition={{ duration: 1.2, delay: 0.6, ease: "easeOut" }}
@@ -267,7 +298,13 @@ export default function HomePage() {
                   </span>
                 </h1>
 
-                <p className="text-lg text-muted-foreground max-w-2xl mx-auto leading-relaxed">
+                <p
+                  className={
+                    isDeepSpace
+                      ? "text-base md:text-lg text-muted-foreground max-w-xl leading-relaxed"
+                      : "text-lg text-muted-foreground max-w-2xl mx-auto leading-relaxed"
+                  }
+                >
                   Orchestrate the full LLM training pipeline — from tokenizer training
                   through pretraining, SFT, and RL — across single or multi-node clusters
                   with real-time monitoring and one-click deployment.
@@ -275,7 +312,11 @@ export default function HomePage() {
               </motion.div>
             }
             buttons={
-              <div className="flex items-center justify-center gap-4 flex-wrap">
+              <div
+                className={`flex items-center gap-4 flex-wrap ${
+                  isDeepSpace ? "justify-start" : "justify-center"
+                }`}
+              >
                 <HeroButton href="/signup" primary>
                   Start Building
                   <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
@@ -302,7 +343,7 @@ export default function HomePage() {
             <div className="flex items-center gap-2">
               <motion.div
                 className="w-2 h-2 rounded-full"
-                style={{ backgroundColor: `hsl(${currentPalette.primary})` }}
+                style={{ backgroundColor: "hsl(var(--palette-primary))" }}
                 animate={{ scale: [1, 1.4, 1], opacity: [1, 0.6, 1] }}
                 transition={{ duration: 2, repeat: Infinity }}
               />
@@ -312,7 +353,7 @@ export default function HomePage() {
             <div className="flex items-center gap-2">
               <motion.div
                 className="w-2 h-2 rounded-full"
-                style={{ backgroundColor: `hsl(${currentPalette.tertiary})` }}
+                style={{ backgroundColor: "hsl(var(--palette-tertiary))" }}
                 animate={{ scale: [1, 1.4, 1], opacity: [1, 0.6, 1] }}
                 transition={{ duration: 2, repeat: Infinity, delay: 0.4 }}
               />
