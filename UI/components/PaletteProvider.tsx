@@ -140,19 +140,22 @@ export const PALETTES: ColorPalette[] = [
     accentGlow: "32 100% 58%",
   },
   {
-    // Deep Space: nearly-black/grey UI; the only color comes from the cosmos
-    // background (stars, galaxies, black holes, hypernovas).
+    // Deep Space: calm steel/silver-blue with a warm-gold accent. Kept muted
+    // (low saturation) so it reads as realistic starlight rather than the vivid
+    // neon of the other palettes — deliberately NOT a neon-cyber twin — while
+    // the lightness stays high enough that chrome is visible against the
+    // cosmos. The background itself is untouched (CosmosWebGL owns its colors).
     id: "deep-space",
     name: "Deep Space",
     description: "Realistic cosmos — black holes, galaxies, hypernovas",
-    primary: "200 20% 35%",
-    primaryGlow: "200 30% 50%",
-    secondary: "0 0% 18%",
-    secondaryGlow: "0 0% 28%",
-    tertiary: "240 10% 30%",
-    tertiaryGlow: "240 15% 45%",
-    accent: "45 10% 60%",
-    accentGlow: "45 20% 75%",
+    primary: "208 55% 52%",
+    primaryGlow: "208 70% 68%",
+    secondary: "228 50% 50%",
+    secondaryGlow: "228 65% 66%",
+    tertiary: "266 45% 56%",
+    tertiaryGlow: "266 60% 70%",
+    accent: "42 75% 56%",
+    accentGlow: "42 90% 68%",
   },
 ];
 
@@ -233,23 +236,24 @@ export const THEMES: Record<Theme, ThemeColors> = {
   },
 };
 
-// Deep Space overrides the structural tokens regardless of theme — the cosmos
-// background is the only color the user sees, so UI chrome must be muted.
+// Deep Space keeps the page itself near-black so the cosmos shows through, but
+// lifts the structural tokens (cards, borders, muted text) so UI chrome stays
+// legible against the scene. Accent colors are brightened in the palette above.
 const DEEP_SPACE_OVERRIDES: Partial<ThemeColors> = {
   background: "0 0% 2%",
-  card: "0 0% 5%",
-  cardForeground: "0 0% 82%",
-  popover: "0 0% 4%",
-  popoverForeground: "0 0% 82%",
-  border: "0 0% 12%",
-  input: "0 0% 12%",
-  ring: "200 20% 35%",
-  muted: "0 0% 8%",
-  mutedForeground: "0 0% 55%",
-  secondary: "0 0% 8%",
-  secondaryForeground: "0 0% 82%",
-  accent: "0 0% 8%",
-  accentForeground: "0 0% 82%",
+  card: "210 12% 8%",
+  cardForeground: "0 0% 90%",
+  popover: "210 12% 7%",
+  popoverForeground: "0 0% 90%",
+  border: "210 12% 25%",
+  input: "210 12% 25%",
+  ring: "208 55% 52%",
+  muted: "0 0% 11%",
+  mutedForeground: "0 0% 70%",
+  secondary: "0 0% 12%",
+  secondaryForeground: "0 0% 92%",
+  accent: "0 0% 12%",
+  accentForeground: "0 0% 92%",
 };
 
 // ── HSL parsing helpers ────────────────────────────────────────────────────
