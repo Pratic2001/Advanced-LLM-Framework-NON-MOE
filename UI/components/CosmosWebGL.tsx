@@ -2,26 +2,36 @@
 
 /**
  * Deep-space background — a faithful port of the "Event Horizon" reference
- * (event_horizon.html). Same technique end to end:
+ * (event_horizon.html), including its improvements:
  *
- *   · A black event-horizon sphere (pure shadow) with a fresnel photon-ring
- *     rim and a warm additive halo sprite.
- *   · A flat, tilted accretion ring disk (fbm turbulence + doppler beaming,
- *     white-hot inner rim → golden mid → deep-orange outer, additive).
- *   · 9000 twinkling stars on a 5-tone palette.
- *   · Seven colourful additive nebula sprites (purple / blue / magenta / amber)
- *     drifting slowly on a distant shell.
- *   · Particle supernovae — one ambient (big) every 9–15 s, plus any number
- *     detonated by clicking empty sky — expanding with drag and cooling from
- *     hot-white to magenta/blue.
- *   · A fake-lensing post pass: screen-space warp around the shadow (with the
- *     golden ring at its rim), radial chromatic aberration, vignette, a
- *     dual-tone grade (cool shadows, warm highlights) and film grain.
+ *   · A black event-horizon sphere with a two-term fresnel photon-ring rim
+ *     (pow 4.5 halo + pow 12 near-white core) and a dual-layer pulsing warm
+ *     halo (a big out-of-phase glow that slowly rotates).
+ *   · A tilted accretion disk displaced into a puffy turbulent torus — the
+ *     vertex shader computes a real height field + normal (lambert shading,
+ *     limb brightening), the fragment shader runs a 4-stop colour ramp with
+ *     flicker, relativistic doppler beaming with blue/red-shift tinting.
+ *   · A secondary "polar ring" (Gargantua-style halo silhouette) torus
+ *     perpendicular to the disk, flowing independently.
+ *   · 9000 twinkling stars + seven colourful nebulae in a slowly-rotating
+ *     background group, so stars visibly sweep behind the hole and get bent.
+ *   · Supernovae: particle sparks (with a sparkle term) PLUS a procedural
+ *     "iris" billboard — a camera-facing quad of fine radial fibres, a
+ *     collarette ring and a young→old colour morph, growing like real ejecta.
+ *     One ambient (big) every 9–15 s, plus any number detonated by clicking
+ *     empty sky. Each blast feeds a `uFlash` into the post pass.
+ *   · A fake-lensing post pass: screen-space warp (with a breathing ripple),
+ *     a thin bright Einstein ring + near-white core, radial chromatic
+ *     aberration, stronger vignette, filmic tone shaping, dual-tone grade,
+ *     saturation lift and film grain.
  *
- * Rendered as a pure background: no page chrome, no drag-orbit, no wheel zoom.
- * The pointer only adds a gentle parallax and detonates supernovae; clicks that
- * land on interactive page elements are left untouched. `prefers-reduced-motion`
- * stops the camera auto-drift.
+ * Controls (as requested, everything else matches the reference):
+ *   · left click on empty sky  → supernova
+ *   · right mouse + drag       → orbit the camera angle
+ *   · shift + scroll           → dolly zoom in/out
+ *   · plain mouse move         → gentle parallax
+ * Interactive page elements are left untouched. `prefers-reduced-motion` stops
+ * the camera auto-drift.
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -167,10 +177,13 @@ interface Supernova {
   points: THREE.Points;
   geo: THREE.BufferGeometry;
   mat: THREE.ShaderMaterial;
+  iris: THREE.Mesh;
+  irisMat: THREE.ShaderMaterial;
   velocities: Float32Array;
   positions: Float32Array;
   birth: number;
   life: number;
+  big: boolean;
 }
 
 export function CosmosWebGL({ className = "" }: { className?: string }) {
@@ -191,8 +204,16 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         powerPreference: "high-performance",
       });
     } catch {
-      setBroken(true);
-      return;
+      try {
+        renderer = new THREE.WebGLRenderer({
+          antialias: false,
+          powerPreference: "default",
+          failIfMajorPerformanceCaveat: false,
+        });
+      } catch {
+        setBroken(true);
+        return;
+      }
     }
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -224,15 +245,17 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     let mouseDriftX = 0;
 
     function updateCamera(dt: number) {
-      cam.targetAzimuth += cam.autoDrift * dt;
+      cam.targetAzimuth += cam.autoDrift * dt * (orbitDragging ? 0 : 1);
       cam.azimuth += (cam.targetAzimuth - cam.azimuth) * Math.min(1, dt * 3.2);
       cam.polar += (cam.targetPolar - cam.polar) * Math.min(1, dt * 3.2);
       cam.radius += (cam.targetRadius - cam.radius) * Math.min(1, dt * 3.2);
       const polar = Math.max(0.25, Math.min(Math.PI - 0.25, cam.polar));
+      const breathe = Math.sin(clock.elapsedTime * 0.17) * 0.035;
+      const radiusBreathe = cam.radius + Math.sin(clock.elapsedTime * 0.11) * 0.25;
       camera.position.set(
-        cam.radius * Math.sin(polar) * Math.sin(cam.azimuth),
-        cam.radius * Math.cos(polar),
-        cam.radius * Math.sin(polar) * Math.cos(cam.azimuth),
+        radiusBreathe * Math.sin(polar + breathe) * Math.sin(cam.azimuth),
+        radiusBreathe * Math.cos(polar + breathe),
+        radiusBreathe * Math.sin(polar + breathe) * Math.cos(cam.azimuth),
       );
       camera.lookAt(0, 0, 0);
     }
@@ -267,6 +290,11 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       [0.6, "rgba(255,120,60,0.22)"],
       [1, "rgba(255,80,40,0)"],
     ]);
+
+    // Shared unit quad for the supernova "iris" billboard — geometry only
+    // carries UVs; every bit of shape comes from the fragment shader, so the
+    // visible silhouette is always a soft circle, never a texture square.
+    const irisGeo = new THREE.PlaneGeometry(1, 1);
 
     // ---- starfield ----
     function createStarfield(count: number): THREE.Points {
@@ -337,8 +365,14 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       return new THREE.Points(geo, mat);
     }
 
+    // Everything in the deep background lives in this group so it can drift
+    // independently of the camera — that relative motion is what makes the
+    // gravitational lensing near the horizon read as *bending* rather than a
+    // fixed distortion overlay.
+    const bgGroup = new THREE.Group();
+
     const stars = createStarfield(9000);
-    scene.add(stars);
+    bgGroup.add(stars);
 
     // ---- distant colourful nebulae (additive sprites) ----
     const nebulaGroup = new THREE.Group();
@@ -379,7 +413,9 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       spr.userData.driftSpeed = (Math.random() - 0.5) * 0.004;
       nebulaGroup.add(spr);
     }
-    scene.add(nebulaGroup);
+    bgGroup.add(nebulaGroup);
+    bgGroup.rotation.z = 0.3;
+    scene.add(bgGroup);
 
     // ---- black hole: event horizon, photon rim, disk, halo ----
     const bhGroup = new THREE.Group();
@@ -392,7 +428,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     const horizon = new THREE.Mesh(horizonGeo, horizonMat);
     bhGroup.add(horizon);
 
-    // Photon-ring rim glow (fresnel)
+    // Photon-ring rim glow (fresnel, two terms: wide warm halo + bright core)
     const rimGeo = new THREE.SphereGeometry(R_EH * 1.035, 64, 64);
     const rimMat = new THREE.ShaderMaterial({
       uniforms: {},
@@ -411,9 +447,12 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         varying vec3 vViewPos;
         void main(){
           vec3 viewDir = normalize(-vViewPos);
-          float fresnel = pow(1.0-max(dot(viewDir,vNormal),0.0), 3.2);
-          vec3 glowColor = vec3(1.0,0.82,0.58);
-          gl_FragColor = vec4(glowColor*fresnel*2.2, fresnel);
+          float f = max(dot(viewDir,vNormal),0.0);
+          float fresnel = pow(1.0-f, 4.5);
+          float core = pow(1.0-f, 12.0);
+          vec3 glowColor = mix(vec3(1.0,0.86,0.62), vec3(1.0,0.97,0.92), core);
+          float intensity = fresnel*2.0 + core*3.2;
+          gl_FragColor = vec4(glowColor*intensity, min(1.0, fresnel*1.3 + core));
         }
       `,
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
@@ -421,7 +460,8 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     const rim = new THREE.Mesh(rimGeo, rimMat);
     bhGroup.add(rim);
 
-    // Ambient warm halo (fakes bloom around the hole)
+    // Ambient warm halo — two layers pulsing out of phase so the glow itself
+    // feels alive rather than a flat sprite.
     const haloMat = new THREE.SpriteMaterial({
       map: glowTexWarm,
       transparent: true,
@@ -433,9 +473,20 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     halo.scale.set(9, 9, 1);
     bhGroup.add(halo);
 
-    // Accretion disk
+    const haloMat2 = new THREE.SpriteMaterial({
+      map: glowTexWarm,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      opacity: 0.35,
+    });
+    const halo2 = new THREE.Sprite(haloMat2);
+    halo2.scale.set(13, 13, 1);
+    bhGroup.add(halo2);
+
+    // Accretion disk — a puffy torus of turbulent plasma.
     const R_IN = R_EH * 1.9, R_OUT = R_EH * 8.5;
-    const diskGeo = new THREE.RingGeometry(R_IN, R_OUT, 200, 12);
+    const diskGeo = new THREE.RingGeometry(R_IN, R_OUT, 200, 28);
     const diskMat = new THREE.ShaderMaterial({
       uniforms: {
         uTime: { value: 0 },
@@ -443,10 +494,59 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         uOuter: { value: R_OUT },
       },
       vertexShader: `
+        uniform float uTime;
+        uniform float uInner;
+        uniform float uOuter;
         varying vec3 vPos;
+        varying float vShade;
+        varying float vRim;
+
+        float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453123); }
+        float noise(vec2 p){
+          vec2 i=floor(p), f=fract(p);
+          float a=hash(i), b=hash(i+vec2(1.0,0.0)), c=hash(i+vec2(0.0,1.0)), d=hash(i+vec2(1.0,1.0));
+          vec2 u=f*f*(3.0-2.0*f);
+          return mix(a,b,u.x) + (c-a)*u.y*(1.0-u.x) + (d-b)*u.x*u.y;
+        }
+        float fbm(vec2 p){
+          float v=0.0, amp=0.5;
+          for(int i=0;i<4;i++){ v += amp*noise(p); p *= 2.05; amp *= 0.55; }
+          return v;
+        }
+        // Vertical (out-of-plane) height of the disk surface — turns a flat
+        // ring into a puffy torus of turbulent plasma.
+        float heightAt(vec2 pos){
+          float r = length(pos);
+          float rn = clamp((r-uInner)/(uOuter-uInner), 0.0, 1.0);
+          float angle = atan(pos.y, pos.x);
+          vec2 c = vec2(cos(angle),sin(angle)) * (2.0+rn*3.0) + vec2(uTime*0.16, r*0.35 - uTime*mix(1.6,0.25,rn));
+          float n = fbm(c*1.4);
+          float profile = sin(clamp(rn,0.02,0.98)*3.14159265); // thin at both edges, puffed in the middle
+          return (n-0.5) * mix(0.55, 0.16, rn) * profile;
+        }
+
         void main(){
-          vPos = position;
-          gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0);
+          vec2 xy = position.xy;
+          float h = heightAt(xy);
+          float eps = 0.08;
+          float hx = heightAt(xy+vec2(eps,0.0));
+          float hy = heightAt(xy+vec2(0.0,eps));
+          vec3 n = normalize(vec3(-(hx-h)/eps, -(hy-h)/eps, 1.0));
+
+          vec3 displaced = vec3(xy, h);
+          vPos = displaced;
+
+          vec3 lightDir = normalize(vec3(0.35, 0.55, 0.75));
+          vShade = clamp(dot(n, lightDir), 0.12, 1.0);
+
+          vec3 viewNormal = normalize(normalMatrix * n);
+          vec4 mvPos = modelViewMatrix * vec4(displaced,1.0);
+          vec3 viewDir = normalize(-mvPos.xyz);
+          // Limb brightening: material seen edge-on through more of the puffy
+          // disk's depth scatters more light back at us.
+          vRim = pow(1.0-clamp(abs(dot(viewDir, viewNormal)),0.0,1.0), 2.4);
+
+          gl_Position = projectionMatrix*mvPos;
         }
       `,
       fragmentShader: `
@@ -454,6 +554,8 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         uniform float uInner;
         uniform float uOuter;
         varying vec3 vPos;
+        varying float vShade;
+        varying float vRim;
 
         float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453123); }
         float noise(vec2 p){
@@ -473,28 +575,42 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           float rn = clamp((r-uInner)/(uOuter-uInner), 0.0, 1.0);
           float angle = atan(vPos.y, vPos.x);
 
-          float angSpeed = mix(5.0, 0.35, rn);
+          float angSpeed = mix(9.0, 0.5, rn);
           float flowAngle = angle + uTime*angSpeed;
-          vec2 noiseCoord = vec2(cos(flowAngle), sin(flowAngle)) * (2.0 + rn*3.0) + vec2(0.0, uTime*0.06 + r*0.4);
-          float turb = fbm(noiseCoord*2.2);
-          float turb2 = fbm(noiseCoord*5.0 + 4.2);
-          float turbulence = mix(turb, turb2, 0.4);
+          vec2 noiseCoord = vec2(cos(flowAngle), sin(flowAngle)) * (2.0 + rn*3.0) + vec2(uTime*0.35, uTime*0.5 + r*0.4);
+          float turb = fbm(noiseCoord*2.2 + uTime*0.15);
+          float turb2 = fbm(noiseCoord*5.5 - uTime*0.4);
+          float turbulence = mix(turb, turb2, 0.45);
+          turbulence = pow(turbulence, 0.8);
 
-          vec3 hot  = vec3(1.0, 0.98, 0.92);
-          vec3 mid  = vec3(1.0, 0.5, 0.12);
-          vec3 cool = vec3(0.55, 0.06, 0.05);
-          vec3 col = mix(hot, mid, smoothstep(0.0,0.45,rn));
-          col = mix(col, cool, smoothstep(0.4,1.0,rn));
-          col *= (0.55 + 0.9*turbulence);
+          float flicker = 0.85 + 0.3*sin(uTime*3.0 + r*6.0 + turb*8.0) * (1.0-rn*0.5);
 
-          float doppler = 0.5 + 0.5*cos(angle - 0.5);
-          doppler = pow(doppler, 1.6);
-          col *= mix(0.45, 2.0, doppler);
+          vec3 hot  = vec3(1.0, 0.99, 0.95);
+          vec3 mid  = vec3(1.0, 0.72, 0.32);
+          vec3 amber= vec3(1.0, 0.45, 0.09);
+          vec3 cool = vec3(0.62, 0.10, 0.03);
+          vec3 col = mix(hot, mid, smoothstep(0.0,0.3,rn));
+          col = mix(col, amber, smoothstep(0.25,0.65,rn));
+          col = mix(col, cool, smoothstep(0.55,1.0,rn));
+          col *= (0.4 + 1.3*turbulence) * flicker;
+
+          // Relativistic beaming: material sweeping toward the camera is
+          // Doppler-boosted and blue-shifted; the receding side dims/reddens.
+          float doppler = 0.5 + 0.5*cos(angle - uTime*0.15 - 0.5);
+          float dopplerSharp = pow(doppler, 1.6);
+          col *= mix(0.32, 2.6, dopplerSharp);
+          col = mix(col, vec3(0.75,0.85,1.05)*length(col), smoothstep(0.55,1.0,doppler)*0.28);
+          col = mix(col, vec3(1.15,0.55,0.28)*length(col), smoothstep(0.45,0.0,doppler)*0.22);
+
+          // Fake volumetric lighting from the puffy-surface normal + warm
+          // limb-brightened rim — reads as an actual body of plasma.
+          col *= mix(0.55, 1.4, vShade);
+          col += vec3(1.0,0.82,0.55) * vRim * 0.6;
 
           float edgeFade = smoothstep(0.0,0.08,rn) * smoothstep(1.0,0.8,rn);
-          float alpha = edgeFade * (0.65 + 0.55*turbulence);
+          float alpha = edgeFade * (0.6 + 0.6*turbulence) * flicker + vRim*0.25*edgeFade;
 
-          gl_FragColor = vec4(col, alpha);
+          gl_FragColor = vec4(col, clamp(alpha,0.0,1.4));
         }
       `,
       transparent: true, side: THREE.DoubleSide, depthWrite: false,
@@ -505,8 +621,45 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     disk.rotation.z = 0.15;
     bhGroup.add(disk);
 
-    // ---- supernovae (colourful particle explosions) ----
+    // Secondary lensed ring — an approximation of the disk's light bent over
+    // the poles of the hole (the classic Gargantua "halo" silhouette).
+    const polarRingGeo = new THREE.TorusGeometry(R_EH * 1.28, R_EH * 0.16, 24, 200);
+    const polarRingMat = new THREE.ShaderMaterial({
+      uniforms: { uTime: { value: 0 } },
+      vertexShader: `
+        varying vec2 vUvV;
+        void main(){
+          vUvV = uv;
+          gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform float uTime;
+        varying vec2 vUvV;
+        float hash(float n){ return fract(sin(n)*43758.5453123); }
+        void main(){
+          float ang = vUvV.x*6.2831 + uTime*1.4;
+          float flow = sin(ang*3.0)*0.5+0.5;
+          float flow2 = sin(ang*7.0 - uTime*2.0)*0.5+0.5;
+          float turb = mix(flow, flow2, 0.5);
+          vec3 hot = vec3(1.0,0.95,0.85);
+          vec3 warm = vec3(1.0,0.55,0.2);
+          vec3 col = mix(warm, hot, turb) * (0.7+0.6*turb);
+          float edge = smoothstep(0.0,0.25,vUvV.y) * smoothstep(1.0,0.75,vUvV.y);
+          float alpha = edge * (0.35 + 0.35*turb);
+          gl_FragColor = vec4(col, alpha);
+        }
+      `,
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    });
+    const polarRing = new THREE.Mesh(polarRingGeo, polarRingMat);
+    polarRing.rotation.y = Math.PI * 0.5;
+    bhGroup.add(polarRing);
+
+    // ---- supernovae: particle sparks + procedural "iris" billboard ----
     const supernovae: Supernova[] = [];
+    let flashLevel = 0;
 
     function makeSupernova(pos: THREE.Vector3, big: boolean): Supernova {
       const count = big ? 900 : 420;
@@ -538,7 +691,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       geo.setAttribute("aRand", new THREE.BufferAttribute(rands, 1));
 
       const mat = new THREE.ShaderMaterial({
-        uniforms: { uAge: { value: 0 } },
+        uniforms: { uAge: { value: 0 }, uTime: { value: 0 } },
         vertexShader: `
           attribute float aSize;
           attribute float aRand;
@@ -555,17 +708,19 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         fragmentShader: `
           varying float vRand;
           uniform float uAge;
+          uniform float uTime;
           void main(){
             vec2 uv = gl_PointCoord-0.5;
             float d = length(uv);
             float alpha = smoothstep(0.5,0.0,d);
-            vec3 hotc  = vec3(1.0,1.0,0.92);
-            vec3 midc  = mix(vec3(1.0,0.55,0.12), vec3(0.85,0.15,0.65), vRand);
-            vec3 coolc = mix(vec3(0.55,0.05,0.05), vec3(0.15,0.25,0.95), vRand);
+            vec3 hotc  = vec3(1.0,1.0,0.94);
+            vec3 midc  = mix(vec3(1.0,0.5,0.14), vec3(0.9,0.2,0.6), vRand);
+            vec3 coolc = mix(vec3(0.65,0.08,0.35), vec3(0.2,0.35,1.0), vRand);
             vec3 col = mix(hotc, midc, smoothstep(0.0,0.4,uAge));
             col = mix(col, coolc, smoothstep(0.35,1.0,uAge));
             float fade = 1.0-smoothstep(0.55,1.0,uAge);
-            gl_FragColor = vec4(col, alpha*fade);
+            float sparkle = 0.75 + 0.35*sin(uTime*18.0 + vRand*60.0);
+            gl_FragColor = vec4(col*sparkle, alpha*fade);
           }
         `,
         transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
@@ -574,7 +729,100 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       const points = new THREE.Points(geo, mat);
       scene.add(points);
 
-      return { points, geo, mat, velocities, positions, birth: clock.elapsedTime, life: big ? 7.5 : 4.5 };
+      // The iris — a single always-camera-facing quad whose fragment shader
+      // grows fine radial fibres out from a bright core, the way a real
+      // supernova's ejecta forms filamentary structure. Everything is
+      // procedural and the silhouette is forced to a soft circle in-shader.
+      const irisMat = new THREE.ShaderMaterial({
+        uniforms: {
+          uAge: { value: 0 },
+          uTime: { value: 0 },
+          uSeed: { value: Math.random() * 1000 },
+        },
+        transparent: true, depthWrite: false, depthTest: true,
+        blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+        vertexShader: `
+          varying vec2 vUv;
+          void main(){
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          uniform float uAge, uTime, uSeed;
+          varying vec2 vUv;
+
+          float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453123); }
+          float noise(vec2 p){
+            vec2 i=floor(p), f=fract(p);
+            float a=hash(i), b=hash(i+vec2(1.0,0.0)), c=hash(i+vec2(0.0,1.0)), d=hash(i+vec2(1.0,1.0));
+            vec2 u=f*f*(3.0-2.0*f);
+            return mix(a,b,u.x) + (c-a)*u.y*(1.0-u.x) + (d-b)*u.x*u.y;
+          }
+          float fbm(vec2 p){
+            float v=0.0, amp=0.5;
+            for(int i=0;i<5;i++){ v += amp*noise(p); p *= 2.15; amp *= 0.55; }
+            return v;
+          }
+
+          void main(){
+            vec2 p = (vUv - 0.5) * 2.0;
+            float r = length(p);
+            if(r > 1.0) discard;
+            float ang = atan(p.y, p.x);
+
+            // Fine radial striations, like the fibrous structure of an iris
+            // or of real filamentary ejecta.
+            float fibers  = fbm(vec2(ang*46.0 + uSeed*11.0, r*3.2 - uTime*0.05));
+            float fibers2 = fbm(vec2(ang*90.0 + uSeed*23.0, r*6.0 + uTime*0.08));
+            float spiky   = pow(fbm(vec2(ang*30.0+uSeed*5.0, r*2.0)), 3.0);
+            float cloudy  = fbm(vec2(ang*7.0 + uSeed*3.0 + uTime*0.04, r*4.0 - uTime*0.07));
+            float texture1 = mix(fibers, fibers2, 0.5);
+
+            // Young explosions are tight, spiky, radiant threads; aged ones
+            // relax into a softer, cloudier filamentary shell.
+            float pattern = mix(mix(texture1, spiky, 0.5), cloudy, smoothstep(0.15,0.7,uAge));
+
+            // A collarette-like ring partway out, where density and color shift.
+            float ringPos = mix(0.42, 0.6, fbm(vec2(uSeed, ang*2.0))*0.3+0.5);
+            float collarette = smoothstep(ringPos-0.1, ringPos, r) * (1.0-smoothstep(ringPos, ringPos+0.16, r));
+
+            float core = pow(1.0-clamp(r,0.0,1.0), 3.4);
+            float edgeFade = 1.0 - smoothstep(0.72, 1.0, r);
+
+            vec3 youngCore = vec3(1.0,0.98,0.9);
+            vec3 youngMid  = vec3(1.0,0.62,0.22);
+            vec3 youngEdge = vec3(0.85,0.2,0.06);
+            vec3 oldCore   = vec3(0.7,0.82,1.0);
+            vec3 oldMid    = vec3(0.75,0.22,0.82);
+            vec3 oldEdge   = vec3(0.5,0.12,0.4);
+
+            vec3 coreCol = mix(youngCore, oldCore, uAge);
+            vec3 midCol  = mix(youngMid,  oldMid,  uAge);
+            vec3 edgeCol = mix(youngEdge, oldEdge, uAge);
+
+            vec3 col = mix(coreCol, midCol, smoothstep(0.0,0.55,r));
+            col = mix(col, edgeCol, smoothstep(0.45,1.0,r));
+            col *= (0.55 + 0.9*pattern);
+            col += edgeCol * collarette * 0.5;
+
+            float alpha = clamp(core*1.6 + pattern*edgeFade*0.85 + collarette*0.3*edgeFade, 0.0, 1.0);
+            alpha *= smoothstep(0.0, 0.03, uAge + 0.002);
+            alpha *= (1.0 - smoothstep(0.82, 1.0, uAge));
+
+            gl_FragColor = vec4(col, alpha);
+          }
+        `,
+      });
+      const iris = new THREE.Mesh(irisGeo, irisMat);
+      iris.position.copy(pos);
+      iris.scale.set(0.01, 0.01, 1);
+      scene.add(iris);
+
+      return {
+        points, geo, mat, iris, irisMat, velocities, positions,
+        birth: clock.elapsedTime, life: big ? 7.5 : 4.5, big,
+      };
     }
 
     function spawnSupernovaAtRay(clientX: number, clientY: number) {
@@ -589,6 +837,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         .clone()
         .add(raycaster.ray.direction.clone().multiplyScalar(dist));
       supernovae.push(makeSupernova(pos, false));
+      flashLevel = Math.min(1.0, flashLevel + 0.35);
     }
 
     function spawnAmbientSupernova() {
@@ -601,6 +850,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         r * Math.sin(theta) * Math.sin(phi),
       );
       supernovae.push(makeSupernova(pos, true));
+      flashLevel = Math.min(1.0, flashLevel + 0.5);
     }
 
     function updateSupernovae(dt: number) {
@@ -609,8 +859,10 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         const age = (clock.elapsedTime - s.birth) / s.life;
         if (age >= 1.0) {
           scene.remove(s.points);
+          scene.remove(s.iris);
           s.geo.dispose();
           s.mat.dispose();
+          s.irisMat.dispose();
           supernovae.splice(i, 1);
           continue;
         }
@@ -626,6 +878,16 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         }
         s.geo.attributes.position.needsUpdate = true;
         s.mat.uniforms.uAge.value = age;
+        s.mat.uniforms.uTime.value = clock.elapsedTime;
+
+        // The iris grows the way real ejecta expands — fast at first, slowing
+        // as it goes — and always faces the camera.
+        const baseSize = s.big ? 34 : 22;
+        const irisScale = baseSize * Math.pow(age + 0.015, 0.42);
+        s.iris.scale.set(irisScale, irisScale, 1);
+        s.iris.quaternion.copy(camera.quaternion);
+        s.irisMat.uniforms.uAge.value = age;
+        s.irisMat.uniforms.uTime.value = clock.elapsedTime;
       }
     }
 
@@ -646,6 +908,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         uBHRadius: { value: 0.1 },
         uAspect: { value: window.innerWidth / window.innerHeight },
         uTime: { value: 0 },
+        uFlash: { value: 0 },
       },
       vertexShader: `
         varying vec2 vUv;
@@ -660,6 +923,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         uniform float uBHRadius;
         uniform float uAspect;
         uniform float uTime;
+        uniform float uFlash;
         varying vec2 vUv;
 
         void main(){
@@ -670,8 +934,9 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           vec2 dir = dist > 0.0001 ? p/dist : vec2(0.0);
 
           float horizon = max(uBHRadius, 0.001);
-          float strength = (horizon*horizon*3.2) / max(dist*dist, horizon*horizon*0.3);
-          strength = clamp(strength, 0.0, 2.6);
+          float ripple = 1.0 + 0.08*sin(uTime*0.6) + 0.03*sin(uTime*2.3 + dist*40.0);
+          float strength = (horizon*horizon*3.6*ripple) / max(dist*dist, horizon*horizon*0.3);
+          strength = clamp(strength, 0.0, 2.8);
 
           vec2 bentP = p - dir*strength*horizon;
           vec2 sampleUV = vec2(bentP.x/uAspect, bentP.y) + uBHScreen;
@@ -682,25 +947,43 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
             color = vec3(0.0);
           } else {
             color = texture2D(tDiffuse, sampleUV).rgb;
-            float ringGlow = smoothstep(horizon*1.08, horizon*0.9, dist) * (1.0-smoothstep(horizon*0.9, horizon*0.78, dist));
-            color += vec3(1.0,0.85,0.6) * ringGlow * 1.6;
 
-            float ca = smoothstep(horizon*4.5, horizon*0.9, dist) * 0.0045;
+            // Thin, bright Einstein ring where lensed light from every side of
+            // the disk piles up right at the shadow's edge.
+            float ringGlow = smoothstep(horizon*1.05, horizon*0.92, dist) * (1.0-smoothstep(horizon*0.92, horizon*0.82, dist));
+            float ringCore = smoothstep(horizon*0.98, horizon*0.93, dist) * (1.0-smoothstep(horizon*0.93, horizon*0.88, dist));
+            color += vec3(1.0,0.82,0.55) * ringGlow * 1.9;
+            color += vec3(1.0,0.95,0.88) * ringCore * 2.4;
+
+            float ca = smoothstep(horizon*4.5, horizon*0.9, dist) * 0.006;
             vec2 caUV1 = clamp(sampleUV + dir*ca, 0.001, 0.999);
             vec2 caUV2 = clamp(sampleUV - dir*ca, 0.001, 0.999);
             color.r = texture2D(tDiffuse, caUV1).r;
             color.b = texture2D(tDiffuse, caUV2).b;
+            color += vec3(1.0,0.6,0.35) * ringGlow * 0.4 * ca * 40.0;
           }
 
-          float vig = smoothstep(0.95, 0.25, length(uv-0.5));
-          color *= mix(0.55, 1.0, vig);
+          float vig = smoothstep(0.95, 0.22, length(uv-0.5));
+          color *= mix(0.45, 1.0, vig);
+
+          // Filmic-leaning tone shaping: crush near-blacks, roll off hot
+          // highlights so the disk doesn't clip to flat white.
+          color = color / (1.0 + color*0.35);
+          color = pow(max(color,0.0), vec3(0.92));
 
           float lum = dot(color, vec3(0.299,0.587,0.114));
-          color += vec3(0.0,0.045,0.075) * (1.0-smoothstep(0.0,0.4,lum));
-          color += vec3(0.06,0.018,-0.02) * smoothstep(0.5,1.0,lum);
+          color += vec3(0.0,0.05,0.09) * (1.0-smoothstep(0.0,0.35,lum));
+          color += vec3(0.07,0.02,-0.025) * smoothstep(0.5,1.0,lum);
+
+          // Slight saturation lift for the punchy look of the reference.
+          float g = dot(color, vec3(0.299,0.587,0.114));
+          color = mix(vec3(g), color, 1.18);
 
           float grain = fract(sin(dot(uv*(uTime*60.0+1.0), vec2(12.9898,78.233)))*43758.5453);
-          color += (grain-0.5)*0.018;
+          color += (grain-0.5)*0.015;
+
+          color += vec3(1.0,0.9,0.75) * uFlash * 0.25;
+          color *= (1.0 + uFlash*0.3);
 
           gl_FragColor = vec4(color, 1.0);
         }
@@ -720,14 +1003,22 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       postMat.uniforms.uBHRadius.value = Math.max(cUV.distanceTo(eUV), 0.01);
     }
 
-    // ---- input: parallax + click-to-ignite (no drag orbit / wheel zoom) ----
-    let downX = 0, downY = 0, downTime = 0;
+    // ---- input: right-drag orbit, shift+scroll zoom, left-click supernova ----
+    let orbitDragging = false, lastX = 0, lastY = 0, downX = 0, downY = 0, downTime = 0;
+
     const onPointerDown = (e: PointerEvent) => {
       downX = e.clientX;
       downY = e.clientY;
       downTime = performance.now();
+      if (e.button === 2) {
+        orbitDragging = true;
+        lastX = e.clientX;
+        lastY = e.clientY;
+      }
     };
     const onPointerUp = (e: PointerEvent) => {
+      orbitDragging = false;
+      if (e.button !== 0) return; // only left click ignites supernovae
       const tgt = e.target as HTMLElement | null;
       if (
         tgt &&
@@ -744,11 +1035,36 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       }
     };
     const onPointerMove = (e: PointerEvent) => {
-      const nx = (e.clientX / window.innerWidth) * 2 - 1;
-      const ny = (e.clientY / window.innerHeight) * 2 - 1;
-      cam.targetAzimuth = cam.azimuth + nx * 0.12 - mouseDriftX;
-      cam.targetPolar = 1.25 + ny * 0.1;
-      mouseDriftX = nx * 0.12;
+      if (orbitDragging && (e.buttons & 2) === 2) {
+        const dx = e.clientX - lastX, dy = e.clientY - lastY;
+        cam.targetAzimuth -= dx * 0.0045;
+        cam.targetPolar -= dy * 0.0035;
+        lastX = e.clientX;
+        lastY = e.clientY;
+      } else {
+        const nx = (e.clientX / window.innerWidth) * 2 - 1;
+        const ny = (e.clientY / window.innerHeight) * 2 - 1;
+        cam.targetAzimuth = cam.azimuth + nx * 0.12 - mouseDriftX;
+        cam.targetPolar = 1.25 + ny * 0.1;
+        mouseDriftX = nx * 0.12;
+      }
+    };
+    const onWheel = (e: WheelEvent) => {
+      if (!e.shiftKey) return;
+      e.preventDefault();
+      cam.targetRadius = Math.max(3.5, Math.min(60, cam.targetRadius + e.deltaY * 0.01));
+    };
+    const onContextMenu = (e: MouseEvent) => {
+      const tgt = e.target as HTMLElement | null;
+      if (
+        tgt &&
+        tgt.closest(
+          "a,button,input,textarea,select,[role='button'],[contenteditable]",
+        )
+      ) {
+        return;
+      }
+      e.preventDefault();
     };
     const onResize = () => {
       camera.aspect = window.innerWidth / window.innerHeight;
@@ -762,6 +1078,9 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     window.addEventListener("pointermove", onPointerMove, { passive: true });
     window.addEventListener("pointerdown", onPointerDown, { passive: true });
     window.addEventListener("pointerup", onPointerUp, { passive: true });
+    window.addEventListener("pointercancel", () => { orbitDragging = false; });
+    window.addEventListener("wheel", onWheel, { passive: false });
+    window.addEventListener("contextmenu", onContextMenu);
 
     // ---- animate ----
     let ambientTimer = 0;
@@ -774,7 +1093,21 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
 
       (stars.material as THREE.ShaderMaterial).uniforms.uTime.value = t;
       diskMat.uniforms.uTime.value = t;
-      disk.rotation.z += dt * 0.01;
+      polarRingMat.uniforms.uTime.value = t;
+
+      // Real relative motion: the deep background slowly rotates independent
+      // of the camera, so stars visibly sweep behind the hole and get bent.
+      bgGroup.rotation.y += dt * 0.035;
+      bgGroup.rotation.x = Math.sin(t * 0.05) * 0.08;
+
+      // Frame-dragging style precession of the whole black-hole system.
+      disk.rotation.z += dt * 0.045;
+      bhGroup.rotation.y += dt * 0.012;
+
+      const haloPulse = 1.0 + Math.sin(t * 0.9) * 0.08;
+      halo.scale.set(9 * haloPulse, 9 * haloPulse, 1);
+      halo2.scale.set(13 / haloPulse, 13 / haloPulse, 1);
+      halo2.material.rotation += dt * 0.05;
 
       nebulaGroup.children.forEach((spr) => {
         const s = spr as THREE.Sprite;
@@ -783,6 +1116,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       });
 
       updateSupernovae(dt);
+      flashLevel = Math.max(0, flashLevel - dt * 1.4);
 
       ambientTimer += dt;
       if (ambientTimer > 9 + Math.random() * 6) {
@@ -792,6 +1126,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
 
       updateLensUniforms();
       postMat.uniforms.uTime.value = t;
+      postMat.uniforms.uFlash.value = flashLevel;
 
       renderer.setRenderTarget(rt);
       renderer.render(scene, camera);
@@ -808,11 +1143,15 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("wheel", onWheel);
+      window.removeEventListener("contextmenu", onContextMenu);
 
       for (const s of supernovae) {
         scene.remove(s.points);
+        scene.remove(s.iris);
         s.geo.dispose();
         s.mat.dispose();
+        s.irisMat.dispose();
       }
       for (const root of [scene, postScene]) {
         root.traverse((o) => {
@@ -823,6 +1162,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           for (const mat of mats) mat.dispose();
         });
       }
+      irisGeo.dispose();
       for (const t of disposables) t.dispose();
       rt.dispose();
       renderer.forceContextLoss();
