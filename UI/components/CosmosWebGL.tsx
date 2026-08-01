@@ -2,28 +2,33 @@
 
 /**
  * Deep-space background — a faithful port of the "Event Horizon" reference
- * (event_horizon.html), including its improvements:
+ * (event_horizon.html), including its latest improvements:
  *
- *   · A black event-horizon sphere with a two-term fresnel photon-ring rim
- *     (pow 4.5 halo + pow 12 near-white core) and a dual-layer pulsing warm
- *     halo (a big out-of-phase glow that slowly rotates).
- *   · A tilted accretion disk displaced into a puffy turbulent torus — the
- *     vertex shader computes a real height field + normal (lambert shading,
- *     limb brightening), the fragment shader runs a 4-stop colour ramp with
- *     flicker, relativistic doppler beaming with blue/red-shift tinting.
- *   · A secondary "polar ring" (Gargantua-style halo silhouette) torus
- *     perpendicular to the disk, flowing independently.
+ *   · Global colour-mood drift: the whole rig (disk, photon ring, halo bands,
+ *     glow sprites, grade) slowly breathes between a warm gold/amber plasma
+ *     and a searing blue-white one over a 95 s cycle (updatePalette + uPalette).
+ *   · A black event-horizon sphere with a fresnel photon-ring rim upgraded
+ *     with a hairline photon ring (pow 40), camera-relative Doppler beaming
+ *     and a warm↔blue palette blend.
+ *   · A 7-layer volumetric accretion disk — a stack of independently seeded,
+ *     vertically-offset puffy torus sheets (seat profile, per-layer density,
+ *     braided strands, temperature cells, camera-relative beaming) so it reads
+ *     as a genuinely thick glowing torus from every angle, including edge-on.
+ *   · Four nested polar-ring halo bands (makeHaloBand) wrapping the shadow in
+ *     warm→blue lensed arcs, each with its own flow speed and Doppler beaming.
  *   · 9000 twinkling stars + seven colourful nebulae in a slowly-rotating
  *     background group, so stars visibly sweep behind the hole and get bent.
- *   · Supernovae: particle sparks (with a sparkle term) PLUS a procedural
- *     "iris" billboard — a camera-facing quad of fine radial fibres, a
- *     collarette ring and a young→old colour morph, growing like real ejecta.
- *     One ambient (big) every 9–15 s, plus any number detonated by clicking
- *     empty sky. Each blast feeds a `uFlash` into the post pass.
- *   · A fake-lensing post pass: screen-space warp (with a breathing ripple),
- *     a thin bright Einstein ring + near-white core, radial chromatic
- *     aberration, stronger vignette, filmic tone shaping, dual-tone grade,
- *     saturation lift and film grain.
+ *   · Supernovae: asymmetric particle ejecta (bipolar jet, squash, point-
+ *     symmetric clump pairs, per-particle speed → colour-age) PLUS a genuine
+ *     3D spherical iris (not a camera-facing billboard) whose fragment shader
+ *     wraps one of five random remnant species over the sphere's surface and
+ *     whose vertices are noise-displaced per-explosion. Ambient big blasts
+ *     every 9–15 s, plus any number detonated by clicking empty sky. Each
+ *     blast feeds a `uFlash` into the post pass.
+ *   · A fake-lensing post pass: screen-space warp (breathing ripple), thin
+ *     bright Einstein ring + near-white core, radial chromatic aberration,
+ *     an 8-tap wide-radius bloom, vignette, filmic tone shaping, dual-tone
+ *     grade, saturation lift and film grain.
  *
  * Controls (as requested, everything else matches the reference):
  *   · left click on empty sky  → supernova
@@ -240,6 +245,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       800,
     );
     const clock = new THREE.Clock();
+    const orbitAxisWorld = new THREE.Vector3(0, 0, 1);
 
     // ---- camera orbit state (spherical, target = origin) ----
     const cam = {
@@ -295,11 +301,34 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       [0.6, "rgba(255,120,60,0.22)"],
       [1, "rgba(255,80,40,0)"],
     ]);
+    const glowTexBlue = makeRadialTexture(0, 1, [
+      [0, "rgba(235,248,255,1)"],
+      [0.25, "rgba(150,205,255,0.78)"],
+      [0.6, "rgba(70,140,255,0.24)"],
+      [1, "rgba(40,90,255,0)"],
+    ]);
 
-    // Shared unit quad for the supernova "iris" billboard — geometry only
-    // carries UVs; every bit of shape comes from the fragment shader, so the
-    // visible silhouette is always a soft circle, never a texture square.
-    const irisGeo = new THREE.PlaneGeometry(1, 1);
+    // ----------------------------------------------------------------------
+    // Global colour-mood drift: the whole rig (disk, photon ring, halo bands,
+    // glow sprites, grade) slowly breathes between the warm gold/amber mood of
+    // a cooler accretion flow and a searing blue-white superheated one, so the
+    // simulation never settles into one static "look" — same GR physics, two
+    // very different plasma temperatures, drifting into each other over minutes.
+    // ----------------------------------------------------------------------
+    const palette = { value: 0.0 };
+    const PALETTE_PERIOD = 95; // seconds for a full warm<->hot cycle
+    function updatePalette(t: number) {
+      palette.value = 0.5 + 0.5 * Math.sin((t / PALETTE_PERIOD) * Math.PI * 2 - Math.PI * 0.5);
+    }
+    const COLOR_WARM = new THREE.Color(0xffb46a);
+    const COLOR_HOT = new THREE.Color(0x9fd2ff);
+
+    // Shared unit sphere for the supernova "iris" — a genuine 3D shell, not a
+    // camera-facing card. The fragment shader maps its whole radiant-shell
+    // pattern onto this sphere's own surface direction, so the explosion has
+    // real volume and reads correctly from any viewing angle instead of always
+    // presenting the same flat cutout.
+    const irisGeo = new THREE.SphereGeometry(1, 48, 32);
 
     // ---- starfield ----
     function createStarfield(count: number): THREE.Points {
@@ -433,31 +462,62 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     const horizon = new THREE.Mesh(horizonGeo, horizonMat);
     bhGroup.add(horizon);
 
-    // Photon-ring rim glow (fresnel, two terms: wide warm halo + bright core)
+    // Photon-ring rim glow (fresnel, wide halo + bright core + hairline
+    // photon ring, with camera-relative Doppler beaming and palette blend).
     const rimGeo = new THREE.SphereGeometry(R_EH * 1.035, 64, 64);
     const rimMat = new THREE.ShaderMaterial({
-      uniforms: {},
+      uniforms: {
+        uPalette: { value: 0 },
+        uOrbitAxis: { value: new THREE.Vector3(0, 0, 1) },
+      },
       vertexShader: `
         varying vec3 vNormal;
         varying vec3 vViewPos;
+        varying vec3 vWorldPos;
         void main(){
           vNormal = normalize(normalMatrix*normal);
           vec4 mv = modelViewMatrix*vec4(position,1.0);
           vViewPos = mv.xyz;
+          vWorldPos = (modelMatrix*vec4(position,1.0)).xyz;
           gl_Position = projectionMatrix*mv;
         }
       `,
       fragmentShader: `
+        uniform float uPalette;
+        uniform vec3 uOrbitAxis;
         varying vec3 vNormal;
         varying vec3 vViewPos;
+        varying vec3 vWorldPos;
         void main(){
           vec3 viewDir = normalize(-vViewPos);
           float f = max(dot(viewDir,vNormal),0.0);
           float fresnel = pow(1.0-f, 4.5);
           float core = pow(1.0-f, 12.0);
-          vec3 glowColor = mix(vec3(1.0,0.86,0.62), vec3(1.0,0.97,0.92), core);
-          float intensity = fresnel*2.0 + core*3.2;
-          gl_FragColor = vec4(glowColor*intensity, min(1.0, fresnel*1.3 + core));
+          // A hairline-thin, high-contrast ring right at the shadow's own
+          // silhouette edge — the sharp feature EHT images are actually
+          // named for, distinct from the softer bloomy fresnel glow above it.
+          float photonRing = pow(1.0-f, 40.0);
+
+          // Same camera-relative beaming as the disk and halo bands, so the
+          // photon ring itself reads with the asymmetric brightness real
+          // EHT ring images show rather than glowing evenly all the way
+          // around.
+          vec3 radial = normalize(vWorldPos);
+          vec3 vel = normalize(cross(uOrbitAxis, radial));
+          vec3 viewDirW = normalize(cameraPosition - vWorldPos);
+          float beam = dot(vel, viewDirW);
+          float doppler = clamp(0.5 + 0.5*beam, 0.0, 1.0);
+          float beamMod = mix(0.4, 2.2, doppler);
+
+          vec3 rimTint = mix(vec3(1.0,0.86,0.62), vec3(0.72,0.9,1.0), uPalette);
+          vec3 coreTint = mix(vec3(1.0,0.97,0.92), vec3(0.93,0.98,1.0), uPalette);
+          vec3 glowColor = mix(rimTint, coreTint, core);
+          glowColor = mix(glowColor, vec3(1.3,0.7,0.4)*max(glowColor.r,max(glowColor.g,glowColor.b)), smoothstep(0.45,0.0,doppler)*0.5);
+          glowColor = mix(glowColor, vec3(0.75,0.9,1.35)*max(glowColor.r,max(glowColor.g,glowColor.b)), smoothstep(0.55,1.0,doppler)*0.5);
+          vec3 photonCol = mix(vec3(1.0,0.5,0.3), vec3(0.85,0.95,1.4), doppler);
+
+          vec3 finalCol = glowColor*(fresnel*2.0 + core*3.2) + photonCol*photonRing*3.0*beamMod;
+          gl_FragColor = vec4(finalCol, min(1.0, fresnel*1.3 + core + photonRing*beamMod));
         }
       `,
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
@@ -489,20 +549,51 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     halo2.scale.set(13, 13, 1);
     bhGroup.add(halo2);
 
-    // Accretion disk — a puffy torus of turbulent plasma.
+    // Second pair of sprites carrying the hot-blue texture, cross-faded against
+    // the warm pair above via opacity so the glow itself migrates smoothly
+    // between moods rather than just tinting (tinting alone can't reach the
+    // icy blue-white of a superheated flow from an amber-only texture).
+    const haloMatB = new THREE.SpriteMaterial({
+      map: glowTexBlue,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      opacity: 0.0,
+    });
+    const haloB = new THREE.Sprite(haloMatB);
+    haloB.scale.set(9, 9, 1);
+    bhGroup.add(haloB);
+
+    const haloMatB2 = new THREE.SpriteMaterial({
+      map: glowTexBlue,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      opacity: 0.0,
+    });
+    const haloB2 = new THREE.Sprite(haloMatB2);
+    haloB2.scale.set(13, 13, 1);
+    bhGroup.add(haloB2);
+
+    // Accretion disk — built as a genuine 3D torus, not a single flat sheet.
+    // A lone displaced ring, however wavy, still collapses to a hairline
+    // when the camera lines up exactly edge-on, because a wavy *surface* has
+    // no actual volume — it's still infinitely thin in cross-section. To get
+    // a disk with real thickness at every viewing angle (edge-on included),
+    // we stack several copies of the same turbulent ring at different
+    // vertical offsets, each independently seeded and tapered thinnest at
+    // the disk's own thickness profile, so together they read as a solid
+    // glowing torus with real depth rather than a flat printed record.
     const R_IN = R_EH * 1.9, R_OUT = R_EH * 8.5;
     const diskGeo = new THREE.RingGeometry(R_IN, R_OUT, 200, 28);
-    const diskMat = new THREE.ShaderMaterial({
-      uniforms: {
-        uTime: { value: 0 },
-        uInner: { value: R_IN },
-        uOuter: { value: R_OUT },
-      },
-      vertexShader: `
+    const DISK_VSHADER = `
         uniform float uTime;
         uniform float uInner;
         uniform float uOuter;
+        uniform float uYOffset;
+        uniform float uLayerSeed;
         varying vec3 vPos;
+        varying vec3 vWorldPos;
         varying float vShade;
         varying float vRim;
 
@@ -518,13 +609,16 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           for(int i=0;i<4;i++){ v += amp*noise(p); p *= 2.05; amp *= 0.55; }
           return v;
         }
-        // Vertical (out-of-plane) height of the disk surface — turns a flat
-        // ring into a puffy torus of turbulent plasma.
+        // Vertical (out-of-plane) height of the disk surface at a given local
+        // (x,y) — this is what turns a flat ring into an actual puffy torus
+        // of turbulent plasma instead of a painted-on record. uLayerSeed
+        // offsets the noise field per-layer so the stack doesn't look like
+        // identical sheets rigidly copy-pasted on top of each other.
         float heightAt(vec2 pos){
           float r = length(pos);
           float rn = clamp((r-uInner)/(uOuter-uInner), 0.0, 1.0);
           float angle = atan(pos.y, pos.x);
-          vec2 c = vec2(cos(angle),sin(angle)) * (2.0+rn*3.0) + vec2(uTime*0.16, r*0.35 - uTime*mix(1.6,0.25,rn));
+          vec2 c = vec2(cos(angle),sin(angle)) * (2.0+rn*3.0) + vec2(uTime*0.16 + uLayerSeed*4.1, r*0.35 - uTime*mix(1.6,0.25,rn) + uLayerSeed*6.3);
           float n = fbm(c*1.4);
           float profile = sin(clamp(rn,0.02,0.98)*3.14159265); // thin at both edges, puffed in the middle
           return (n-0.5) * mix(0.55, 0.16, rn) * profile;
@@ -538,8 +632,18 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           float hy = heightAt(xy+vec2(0.0,eps));
           vec3 n = normalize(vec3(-(hx-h)/eps, -(hy-h)/eps, 1.0));
 
-          vec3 displaced = vec3(xy, h);
+          // This layer's fixed vertical seat within the torus's cross-section,
+          // tapered by the same thin-at-both-edges profile as the turbulent
+          // wobble above — so the whole stack pinches down to a point at the
+          // disk's inner and outer radii (a proper torus tube) rather than
+          // extending as a flat-topped slab all the way to the edges.
+          float r0 = length(xy);
+          float rn0 = clamp((r0-uInner)/(uOuter-uInner), 0.0, 1.0);
+          float seatProfile = sin(clamp(rn0,0.02,0.98)*3.14159265);
+
+          vec3 displaced = vec3(xy, h + uYOffset*seatProfile);
           vPos = displaced;
+          vWorldPos = (modelMatrix * vec4(displaced,1.0)).xyz;
 
           vec3 lightDir = normalize(vec3(0.35, 0.55, 0.75));
           vShade = clamp(dot(n, lightDir), 0.12, 1.0);
@@ -548,17 +652,22 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           vec4 mvPos = modelViewMatrix * vec4(displaced,1.0);
           vec3 viewDir = normalize(-mvPos.xyz);
           // Limb brightening: material seen edge-on through more of the puffy
-          // disk's depth scatters more light back at us.
+          // disk's depth scatters more light back at us, the way a real
+          // optically-thick torus rim-lights rather than looking paper-flat.
           vRim = pow(1.0-clamp(abs(dot(viewDir, viewNormal)),0.0,1.0), 2.4);
 
           gl_Position = projectionMatrix*mvPos;
         }
-      `,
-      fragmentShader: `
+      `;
+    const DISK_FSHADER = `
         uniform float uTime;
         uniform float uInner;
         uniform float uOuter;
+        uniform float uPalette;
+        uniform float uDensity;
+        uniform vec3 uOrbitAxis;
         varying vec3 vPos;
+        varying vec3 vWorldPos;
         varying float vShade;
         varying float vRim;
 
@@ -588,81 +697,230 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           float turbulence = mix(turb, turb2, 0.45);
           turbulence = pow(turbulence, 0.8);
 
+          // Braided concentric strands: several thin sinusoidal streams offset
+          // in radius and phase, each riding its own bit of turbulence — the
+          // "ribbon of separate glowing threads" look of the reference
+          // photography rather than one smooth gradient.
+          float strandFreq = mix(26.0, 34.0, rn);
+          float strand = 0.0;
+          strand += 0.5+0.5*sin(rn*strandFreq*6.2831 + turb*4.0 + uTime*0.6);
+          strand += (0.5+0.5*sin(rn*strandFreq*6.2831*1.7 + 2.1 + turb2*5.0 - uTime*0.4))*0.6;
+          strand /= 1.6;
+          strand = pow(strand, 1.8);
+
           float flicker = 0.85 + 0.3*sin(uTime*3.0 + r*6.0 + turb*8.0) * (1.0-rn*0.5);
 
-          vec3 hot  = vec3(1.0, 0.99, 0.95);
-          vec3 mid  = vec3(1.0, 0.72, 0.32);
-          vec3 amber= vec3(1.0, 0.45, 0.09);
-          vec3 cool = vec3(0.62, 0.10, 0.03);
-          vec3 col = mix(hot, mid, smoothstep(0.0,0.3,rn));
-          col = mix(col, amber, smoothstep(0.25,0.65,rn));
-          col = mix(col, cool, smoothstep(0.55,1.0,rn));
+          // Local "temperature" isn't purely a function of distance — hot and
+          // cool turbulent cells interleave at the same radius the way real
+          // accretion-disk plasma does, and the whole field slowly drifts in
+          // time so the color mix is never static.
+          float tempNoise = fbm(noiseCoord*1.3 - uTime*0.06 + 11.0);
+          float coolNoise = fbm(noiseCoord*3.4 + uTime*0.09 + 5.0);
+          float temp = clamp(rn*1.15 - (tempNoise-0.5)*0.5 + (coolNoise-0.5)*0.18, 0.0, 1.0);
+
+          // Two plasma moods — a cooler warm-gold flow and a searing blue-white
+          // one — blended by uPalette so the whole disk's temperature identity
+          // can drift over time without changing the underlying structure.
+          vec3 whiteHot = mix(vec3(1.0, 1.0, 0.99),  vec3(1.0, 1.0, 1.0),  uPalette);
+          vec3 hot      = mix(vec3(1.0, 0.93, 0.82), vec3(0.85, 0.95, 1.0), uPalette);
+          vec3 gold     = mix(vec3(1.0, 0.78, 0.38), vec3(0.55, 0.78, 1.0), uPalette);
+          vec3 amber    = mix(vec3(1.0, 0.5, 0.12),  vec3(0.28, 0.55, 1.0), uPalette);
+          vec3 rust     = mix(vec3(0.86, 0.24, 0.05),vec3(0.16, 0.32, 0.92), uPalette);
+          vec3 deepRed  = mix(vec3(0.5, 0.07, 0.03), vec3(0.08, 0.14, 0.55), uPalette);
+          vec3 dustBlue = mix(vec3(0.35, 0.5, 0.85), vec3(0.55, 0.3, 0.9), uPalette);
+
+          vec3 col = mix(whiteHot, hot, smoothstep(0.0,0.12,temp));
+          col = mix(col, gold, smoothstep(0.08,0.28,temp));
+          col = mix(col, amber, smoothstep(0.22,0.5,temp));
+          col = mix(col, rust, smoothstep(0.42,0.72,temp));
+          col = mix(col, deepRed, smoothstep(0.66,1.0,temp));
+          // Cool dusty knots in the outer, turbulent-cool cells — the faint
+          // accent threads visible weaving through a real disk's outer reaches.
+          float dustMask = smoothstep(0.55,1.0,rn) * smoothstep(0.35,0.7,coolNoise);
+          col = mix(col, dustBlue*0.9, dustMask*0.35);
+
           col *= (0.4 + 1.3*turbulence) * flicker;
+          col *= (0.55 + 0.75*strand);
 
           // Relativistic beaming: material sweeping toward the camera is
-          // Doppler-boosted and blue-shifted; the receding side dims/reddens.
-          float doppler = 0.5 + 0.5*cos(angle - uTime*0.15 - 0.5);
+          // Doppler-boosted and blue-shifted; the receding side dims and
+          // reddens. This is now genuinely camera-relative rather than a
+          // time-rotating fake — orbital velocity at this point (perpendicular
+          // to the radius, in the disk's own rotation plane) is dotted
+          // against the actual direction to the viewer, so the bright limb
+          // tracks wherever the camera currently is, and the effect
+          // naturally fades toward neutral when looking straight down the
+          // rotation axis (face-on), exactly as it should.
+          vec3 radial = normalize(vWorldPos);
+          vec3 vel = normalize(cross(uOrbitAxis, radial));
+          vec3 viewDirW = normalize(cameraPosition - vWorldPos);
+          float beam = dot(vel, viewDirW);
+          float doppler = clamp(0.5 + 0.5*beam, 0.0, 1.0);
           float dopplerSharp = pow(doppler, 1.6);
           col *= mix(0.32, 2.6, dopplerSharp);
           col = mix(col, vec3(0.75,0.85,1.05)*length(col), smoothstep(0.55,1.0,doppler)*0.28);
           col = mix(col, vec3(1.15,0.55,0.28)*length(col), smoothstep(0.45,0.0,doppler)*0.22);
 
-          // Fake volumetric lighting from the puffy-surface normal + warm
-          // limb-brightened rim — reads as an actual body of plasma.
+          // Fake volumetric lighting from the puffy-surface normal, plus a
+          // warm limb-brightened rim — this is what reads as an actual body
+          // of turbulent plasma instead of a flat printed disc.
           col *= mix(0.55, 1.4, vShade);
           col += vec3(1.0,0.82,0.55) * vRim * 0.6;
 
           float edgeFade = smoothstep(0.0,0.08,rn) * smoothstep(1.0,0.8,rn);
           float alpha = edgeFade * (0.6 + 0.6*turbulence) * flicker + vRim*0.25*edgeFade;
 
-          gl_FragColor = vec4(col, clamp(alpha,0.0,1.4));
+          gl_FragColor = vec4(col, clamp(alpha,0.0,1.4) * uDensity);
         }
-      `,
-      transparent: true, side: THREE.DoubleSide, depthWrite: false,
-      blending: THREE.AdditiveBlending,
-    });
-    const disk = new THREE.Mesh(diskGeo, diskMat);
-    disk.rotation.x = Math.PI * 0.42;
-    disk.rotation.z = 0.15;
-    bhGroup.add(disk);
+      `;
 
-    // Secondary lensed ring — an approximation of the disk's light bent over
-    // the poles of the hole (the classic Gargantua "halo" silhouette).
-    const polarRingGeo = new THREE.TorusGeometry(R_EH * 1.28, R_EH * 0.16, 24, 200);
-    const polarRingMat = new THREE.ShaderMaterial({
-      uniforms: { uTime: { value: 0 } },
-      vertexShader: `
-        varying vec2 vUvV;
-        void main(){
-          vUvV = uv;
-          gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0);
-        }
-      `,
-      fragmentShader: `
-        uniform float uTime;
-        varying vec2 vUvV;
-        float hash(float n){ return fract(sin(n)*43758.5453123); }
-        void main(){
-          float ang = vUvV.x*6.2831 + uTime*1.4;
-          float flow = sin(ang*3.0)*0.5+0.5;
-          float flow2 = sin(ang*7.0 - uTime*2.0)*0.5+0.5;
-          float turb = mix(flow, flow2, 0.5);
-          vec3 hot = vec3(1.0,0.95,0.85);
-          vec3 warm = vec3(1.0,0.55,0.2);
-          vec3 col = mix(warm, hot, turb) * (0.7+0.6*turb);
-          float edge = smoothstep(0.0,0.25,vUvV.y) * smoothstep(1.0,0.75,vUvV.y);
-          float alpha = edge * (0.35 + 0.35*turb);
-          gl_FragColor = vec4(col, alpha);
-        }
-      `,
-      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-      side: THREE.DoubleSide,
+    // A small stack of layers spread through the torus's vertical extent.
+    // Density (and therefore visible brightness/alpha) tapers off toward the
+    // top and bottom the way a real optically-thick plasma torus's density
+    // falls off away from its mid-plane, so the cross-section reads as a
+    // soft, rounded glowing tube rather than a stack of hard-edged sheets —
+    // this is what finally gives the disk actual, real 3D depth: viewed dead
+    // edge-on it now shows as a genuinely thick glowing band, not a line.
+    const DISK_LAYER_OFFSETS = [-0.85, -0.55, -0.28, 0, 0.28, 0.55, 0.85];
+    const diskGroup = new THREE.Group();
+    const diskMats: THREE.ShaderMaterial[] = [];
+    DISK_LAYER_OFFSETS.forEach((yOff, i) => {
+      const density = Math.exp(-Math.pow(yOff / 0.62, 2.0)) * (yOff === 0 ? 1.0 : 0.62);
+      const mat = new THREE.ShaderMaterial({
+        uniforms: {
+          uTime: { value: 0 },
+          uInner: { value: R_IN },
+          uOuter: { value: R_OUT },
+          uPalette: { value: 0 },
+          uYOffset: { value: yOff * R_IN * 0.5 },
+          uLayerSeed: { value: i * 7.3 + 1.0 },
+          uDensity: { value: density },
+          uOrbitAxis: { value: new THREE.Vector3(0, 0, 1) },
+        },
+        vertexShader: DISK_VSHADER,
+        fragmentShader: DISK_FSHADER,
+        transparent: true,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      const mesh = new THREE.Mesh(diskGeo, mat);
+      diskGroup.add(mesh);
+      diskMats.push(mat);
     });
-    const polarRing = new THREE.Mesh(polarRingGeo, polarRingMat);
-    polarRing.rotation.y = Math.PI * 0.5;
-    bhGroup.add(polarRing);
+    diskGroup.rotation.x = Math.PI * 0.42;
+    diskGroup.rotation.z = 0.15;
+    bhGroup.add(diskGroup);
+    const diskMat = diskMats[Math.floor(diskMats.length / 2)]; // the yOff=0 mid-plane layer
 
-    // ---- supernovae: particle sparks + procedural "iris" billboard ----
+    // Secondary lensed rings — an approximation of the disk's light bent all
+    // the way over the poles of the hole (the classic "Gargantua halo"
+    // silhouette from the reference photography: several nested, differently
+    // coloured arcs of light wrapping the shadow, brightest and bluest near
+    // the horizon and cooling outward into gold, rust and violet). Each band
+    // is a torus perpendicular to the equatorial disk, so as a full ring it
+    // reads as a halo wrapping the sphere from every camera angle — and each
+    // flows and drifts independently so the nested arcs never look painted-on.
+    const polarRingMats: THREE.ShaderMaterial[] = [];
+    function makeHaloBand(
+      radiusF: number,
+      tubeF: number,
+      warmA: string,
+      warmB: string,
+      hotA: string,
+      hotB: string,
+      speed: number,
+      brightness: number,
+    ) {
+      const geo = new THREE.TorusGeometry(R_EH * radiusF, R_EH * tubeF, 20, 220);
+      const mat = new THREE.ShaderMaterial({
+        uniforms: {
+          uTime: { value: 0 },
+          uPalette: { value: 0 },
+          uWarmA: { value: new THREE.Color(warmA) },
+          uWarmB: { value: new THREE.Color(warmB) },
+          uHotA: { value: new THREE.Color(hotA) },
+          uHotB: { value: new THREE.Color(hotB) },
+          uSpeed: { value: speed },
+          uBright: { value: brightness },
+          uOrbitAxis: { value: new THREE.Vector3(0, 0, 1) },
+        },
+        vertexShader: `
+          varying vec2 vUvV;
+          varying vec3 vWorldPos;
+          void main(){
+            vUvV = uv;
+            vWorldPos = (modelMatrix * vec4(position,1.0)).xyz;
+            gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0);
+          }
+        `,
+        fragmentShader: `
+          uniform float uTime, uPalette, uSpeed, uBright;
+          uniform vec3 uWarmA, uWarmB, uHotA, uHotB;
+          uniform vec3 uOrbitAxis;
+          varying vec2 vUvV;
+          varying vec3 vWorldPos;
+          float hash(float n){ return fract(sin(n)*43758.5453123); }
+          float hash2(vec2 p){ return fract(sin(dot(p,vec2(41.3,289.1)))*43758.5453123); }
+          float noise2(vec2 p){
+            vec2 i=floor(p), f=fract(p);
+            float a=hash2(i), b=hash2(i+vec2(1.0,0.0)), c=hash2(i+vec2(0.0,1.0)), d=hash2(i+vec2(1.0,1.0));
+            vec2 u=f*f*(3.0-2.0*f);
+            return mix(a,b,u.x) + (c-a)*u.y*(1.0-u.x) + (d-b)*u.x*u.y;
+          }
+          void main(){
+            float ang = vUvV.x*6.2831 + uTime*uSpeed;
+            float flow  = sin(ang*3.0)*0.5+0.5;
+            float flow2 = sin(ang*7.0 - uTime*uSpeed*1.4)*0.5+0.5;
+            float fine  = noise2(vec2(ang*9.0 + uTime*uSpeed*0.6, vUvV.y*4.0 - uTime*0.1));
+            float turb = mix(flow, flow2, 0.5);
+            turb = mix(turb, fine, 0.35);
+            vec3 warm = mix(uWarmA, uWarmB, turb);
+            vec3 hot  = mix(uHotA,  uHotB,  turb);
+            vec3 col = mix(warm, hot, uPalette) * (0.7+0.7*turb);
+
+            // This halo is lensed light from the same rotating disk, so it
+            // carries the same approaching/receding beaming asymmetry that
+            // the direct disk view does — one side of the ring reads
+            // brighter and bluer, the other dimmer and redder, matching the
+            // asymmetric brightness real EHT ring images show rather than
+            // an evenly-lit torus of light.
+            vec3 radial = normalize(vWorldPos);
+            vec3 vel = normalize(cross(uOrbitAxis, radial));
+            vec3 viewDirW = normalize(cameraPosition - vWorldPos);
+            float beam = dot(vel, viewDirW);
+            float doppler = clamp(0.5 + 0.5*beam, 0.0, 1.0);
+            col *= mix(0.45, 1.9, doppler);
+            col = mix(col, vec3(0.8,0.92,1.2)*max(col.r,max(col.g,col.b)), smoothstep(0.55,1.0,doppler)*0.35);
+            col = mix(col, vec3(1.25,0.6,0.3)*max(col.r,max(col.g,col.b)), smoothstep(0.45,0.0,doppler)*0.3);
+
+            float edge = smoothstep(0.0,0.3,vUvV.y) * smoothstep(1.0,0.7,vUvV.y);
+            float alpha = edge * (0.4 + 0.4*turb) * uBright * mix(0.7,1.3,doppler);
+            gl_FragColor = vec4(col*uBright, alpha);
+          }
+        `,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.rotation.y = Math.PI * 0.5;
+      bhGroup.add(mesh);
+      polarRingMats.push(mat);
+      return mesh;
+    }
+    // Innermost — brightest, near-white/cyan, fastest flow (light grazing
+    // closest to the photon sphere is the most energetic and time-dilated).
+    makeHaloBand(1.10, 0.045, "#fff3d8", "#ffd9a0", "#eaf6ff", "#bfe6ff", 2.2, 1.3);
+    // Mid-inner — gold shifting to sky blue.
+    makeHaloBand(1.22, 0.07, "#ffcd7a", "#ff9a3d", "#9fd0ff", "#5fa0ff", 1.5, 1.0);
+    // Mid-outer — amber/rust shifting to mid blue.
+    makeHaloBand(1.37, 0.09, "#ff7a2e", "#c94a12", "#4d7dff", "#2b4fdd", 1.0, 0.75);
+    // Outermost — cooling into violet/purple on both palettes, dimmest, slowest.
+    makeHaloBand(1.55, 0.10, "#8a4fe0", "#4a2a90", "#6a5fe0", "#3a2a8f", 0.6, 0.5);
+
+    // ---- supernovae: asymmetric particles + genuine 3D spherical iris ----
     const supernovae: Supernova[] = [];
     let flashLevel = 0;
 
@@ -672,14 +930,92 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       const velocities = new Float32Array(count * 3);
       const sizes = new Float32Array(count);
       const rands = new Float32Array(count);
+      const speeds = new Float32Array(count);
 
+      // ---- Asymmetric ejecta rig — real core-collapse blasts are never
+      // isotropic: a bipolar jet axis (the collapsing core's rotation axis)
+      // punches material out much faster along one line, a handful of
+      // Rayleigh-Taylor "clumps" outrun the smoother envelope because denser
+      // knots feel less drag, and the whole ejecta cloud is mildly oblate/
+      // prolate rather than a perfect sphere of directions. All three biases
+      // are applied to the initial velocity field below, so the spark cloud
+      // itself reads as lopsided ejecta instead of a uniform starburst.
+      const jetAxis = new THREE.Vector3(
+        Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5,
+      ).normalize();
+      const jetBoost = 1.6 + Math.random() * 1.6;
+      const jetNarrow = 3.0 + Math.random() * 4.0;
+      const squashAxis = new THREE.Vector3(
+        Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5,
+      ).normalize();
+      const squashAmt = 0.15 + Math.random() * 0.3;
+
+      // Point-symmetric dominant pair — recent Cas A analysis finds its
+      // outer clumps line up in pairs directly opposite each other through
+      // the explosion's center, consistent with a jittering/precessing jet
+      // rather than scattered independent knots. One strong pair, sharing
+      // an axis but boosted independently, anchors the shape; the rest of
+      // the clumps stay weaker background structure so the pair actually
+      // reads as the dominant feature instead of blending in.
+      const pairAxis = new THREE.Vector3(
+        Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5,
+      ).normalize();
+      const pairWidth = 0.1 + Math.random() * 0.09;
+      const clumps: { dir: THREE.Vector3; width: number; strength: number }[] = [
+        {
+          dir: pairAxis.clone(),
+          width: pairWidth,
+          strength: 1.5 + Math.random() * 1.0,
+        },
+        {
+          dir: pairAxis.clone().negate(),
+          width: pairWidth,
+          strength: (1.5 + Math.random() * 1.0) * (0.65 + Math.random() * 0.3),
+        },
+      ];
+      const numClumps = 3 + Math.floor(Math.random() * 4);
+      for (let c = 0; c < numClumps; c++) {
+        clumps.push({
+          dir: new THREE.Vector3(
+            Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5,
+          ).normalize(),
+          width: 0.15 + Math.random() * 0.35,
+          strength: 0.35 + Math.random() * 0.6,
+        });
+      }
+
+      let maxSpeed = 0.0001;
+      const dirV = new THREE.Vector3();
       for (let i = 0; i < count; i++) {
         const theta = Math.acos(2 * Math.random() - 1);
         const phi = Math.random() * Math.PI * 2;
-        const speed = (2.0 + Math.random() * 6.0) * (big ? 1.6 : 1.0);
-        const dx = Math.sin(theta) * Math.cos(phi);
-        const dy = Math.cos(theta);
-        const dz = Math.sin(theta) * Math.sin(phi);
+        dirV.set(
+          Math.sin(theta) * Math.cos(phi),
+          Math.cos(theta),
+          Math.sin(theta) * Math.sin(phi),
+        );
+
+        // oblate/prolate flattening along a random axis — breaks the perfect
+        // sphere-of-directions before speed biasing even starts
+        const sAlign = dirV.dot(squashAxis);
+        dirV.addScaledVector(squashAxis, -sAlign * squashAmt).normalize();
+
+        let speed = (2.0 + Math.random() * 6.0) * (big ? 1.6 : 1.0);
+
+        // bipolar jet — sharply boosts speed near the jet axis (both ends)
+        const jAlign = Math.abs(dirV.dot(jetAxis));
+        speed *= 1.0 + jetBoost * Math.pow(jAlign, jetNarrow);
+
+        // Rayleigh-Taylor clumps — a few denser fingers punch further than
+        // the smooth surrounding ejecta, both individually (extra speed) and
+        // collectively (extra particles land near a clump direction purely
+        // because many independent draws share that speed boost)
+        for (const cl of clumps) {
+          const cAlign = Math.max(0, dirV.dot(cl.dir));
+          speed *= 1.0 + cl.strength * Math.pow(cAlign, 1.0 / cl.width);
+        }
+
+        const dx = dirV.x, dy = dirV.y, dz = dirV.z;
         positions[i * 3] = pos.x;
         positions[i * 3 + 1] = pos.y;
         positions[i * 3 + 2] = pos.z;
@@ -688,22 +1024,46 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         velocities[i * 3 + 2] = dz * speed;
         sizes[i] = Math.random() * 2.2 + 0.6;
         rands[i] = Math.random();
+        speeds[i] = speed;
+        if (speed > maxSpeed) maxSpeed = speed;
       }
+      // Fast outrunning knots vs. the smoother bulk shell — normalize each
+      // particle's initial speed into 0..1 so the fragment shader can make
+      // the real fast clumps (the ones that actually outran the envelope,
+      // like Cas A's 14,500 km/s knots against its ~5,000 km/s bulk shell)
+      // stay visibly hot and ionized longer than the slower material at the
+      // very same clock age, instead of every spark cooling in lockstep.
+      const speedNorm = new Float32Array(count);
+      for (let i = 0; i < count; i++) speedNorm[i] = speeds[i] / maxSpeed;
 
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
       geo.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
       geo.setAttribute("aRand", new THREE.BufferAttribute(rands, 1));
+      geo.setAttribute("aSpeed", new THREE.BufferAttribute(speedNorm, 1));
 
       const mat = new THREE.ShaderMaterial({
-        uniforms: { uAge: { value: 0 }, uTime: { value: 0 } },
+        uniforms: {
+          uAge: { value: 0 },
+          uTime: { value: 0 },
+          uTint: {
+            value: new THREE.Color(
+              0.75 + Math.random() * 0.5,
+              0.75 + Math.random() * 0.5,
+              0.75 + Math.random() * 0.5,
+            ),
+          },
+        },
         vertexShader: `
           attribute float aSize;
           attribute float aRand;
+          attribute float aSpeed;
           varying float vRand;
+          varying float vSpeed;
           uniform float uAge;
           void main(){
             vRand = aRand;
+            vSpeed = aSpeed;
             vec4 mv = modelViewMatrix*vec4(position,1.0);
             float sizeFade = mix(1.4, 0.15, uAge);
             gl_PointSize = aSize*sizeFade*(420.0/-mv.z);
@@ -712,17 +1072,26 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         `,
         fragmentShader: `
           varying float vRand;
+          varying float vSpeed;
           uniform float uAge;
           uniform float uTime;
+          uniform vec3 uTint;
           void main(){
             vec2 uv = gl_PointCoord-0.5;
             float d = length(uv);
             float alpha = smoothstep(0.5,0.0,d);
             vec3 hotc  = vec3(1.0,1.0,0.94);
-            vec3 midc  = mix(vec3(1.0,0.5,0.14), vec3(0.9,0.2,0.6), vRand);
-            vec3 coolc = mix(vec3(0.65,0.08,0.35), vec3(0.2,0.35,1.0), vRand);
-            vec3 col = mix(hotc, midc, smoothstep(0.0,0.4,uAge));
-            col = mix(col, coolc, smoothstep(0.35,1.0,uAge));
+            vec3 midc  = mix(vec3(1.0,0.72,0.32), vec3(0.55,0.78,1.0), vRand) * uTint;
+            vec3 coolc = mix(vec3(0.55,0.22,0.08), vec3(0.22,0.4,0.85), vRand) * uTint;
+            // Fast outrunning knots stay hot/ionized longer than the smoother
+            // bulk shell at the very same clock age — real remnants show
+            // exactly this split (Cas A's ~14,500 km/s knots against its
+            // ~5,000 km/s bulk shell), rather than every spark cooling in
+            // lockstep. Overall lifetime fade below still runs on the real
+            // uAge so despawn timing is untouched.
+            float colorAge = clamp(uAge * mix(1.55, 0.6, vSpeed), 0.0, 1.0);
+            vec3 col = mix(hotc, midc, smoothstep(0.0,0.4,colorAge));
+            col = mix(col, coolc, smoothstep(0.35,1.0,colorAge));
             float fade = 1.0-smoothstep(0.55,1.0,uAge);
             float sparkle = 0.75 + 0.35*sin(uTime*18.0 + vRand*60.0);
             gl_FragColor = vec4(col*sparkle, alpha*fade);
@@ -734,28 +1103,175 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       const points = new THREE.Points(geo, mat);
       scene.add(points);
 
-      // The iris — a single always-camera-facing quad whose fragment shader
-      // grows fine radial fibres out from a bright core, the way a real
-      // supernova's ejecta forms filamentary structure. Everything is
-      // procedural and the silhouette is forced to a soft circle in-shader.
+      // The iris — a genuine 3D shell (a real sphere, not a camera-facing
+      // card) whose fragment shader grows fine radial fibers out from a
+      // bright core, the way a real supernova's ejecta forms filamentary
+      // structure rather than fireworks sparks. It's given a fixed random
+      // 3D orientation at spawn (see iris.rotation below) and never re-faces
+      // the camera afterward, so orbiting around a live explosion reveals
+      // actual volume and parallax instead of a flat cutout. Everything
+      // (shape, color, growth) is procedural, mapped from the sphere's own
+      // surface direction, so the silhouette always closes smoothly at both
+      // poles — there is no flat edge to expose no matter the angle.
       const irisMat = new THREE.ShaderMaterial({
         uniforms: {
           uAge: { value: 0 },
           uTime: { value: 0 },
           uSeed: { value: Math.random() * 1000 },
+          uPalette: { value: 0 },
+          // Per-explosion randomization — every hypernova gets its own hue
+          // drift on each band, its own band widths/positions, and its own
+          // relative band weights, so no two ignitions settle into quite the
+          // same "eye" even though the underlying stages (flash, collapse,
+          // ring, iris, cloud) are always the same physics.
+          uHueRing: { value: (Math.random() - 0.5) * 0.10 },
+          uHueIris: { value: (Math.random() - 0.5) * 0.36 },
+          uHueOuter: { value: (Math.random() - 0.5) * 0.30 },
+          uSatJitter: { value: 0.85 + Math.random() * 0.3 },
+          uRingW: { value: 0.08 + Math.random() * 0.07 },
+          uIrisOut: { value: 0.52 + Math.random() * 0.20 },
+          uOuterOut: { value: 0.86 + Math.random() * 0.12 },
+          uW1: { value: 0.75 + Math.random() * 0.55 },
+          uW2: { value: 0.75 + Math.random() * 0.55 },
+          uW3: { value: 0.75 + Math.random() * 0.55 },
+          // Per-explosion silhouette warp — a random stretch axis plus a
+          // random strength so the overall outline is an irregular, lopsided
+          // blast front rather than a concentric-circle "eye". Slowly rotates
+          // over the explosion's life so the asymmetry itself drifts, the way
+          // a real expanding shock front keeps reshaping rather than holding
+          // a fixed non-circular-but-static outline.
+          uAnisoAngle: { value: Math.random() * Math.PI * 2 },
+          uAnisoAmt: { value: 0.16 + Math.random() * 0.26 },
+          uAnisoSpin: { value: (Math.random() - 0.5) * 0.05 },
+          // Which remnant "species" this explosion settles into — real
+          // hypernovae don't all relax into the same radiant-iris shape,
+          // some stay clumpy and one-sided (Cas A-like), some stay a smooth
+          // rounded shell with a single jet (Tycho-like), some end up a
+          // broken, gapped loop, some end up an elongated barrel with side
+          // filaments (W49B-like). Picked randomly per explosion; every
+          // species still draws its palette from the hue uniforms above so
+          // color randomization applies across all of them, not just one.
+          uDesign: { value: Math.floor(Math.random() * 5) },
+          uMaxR: { value: 1.0 },
+          uPlumeAngle: { value: Math.random() * Math.PI * 2 },
+          uPlumeAmt: { value: 0.18 + Math.random() * 0.42 },
+          // Aligned with the particle cloud's dominant jet-pair axis (see
+          // pairAxis above) rather than an independent random angle, so the
+          // shell's own bulge and the spark cloud's fastest ejecta agree on
+          // which direction the jet actually points.
+          uJetAngle: { value: Math.atan2(pairAxis.y, pairAxis.x) },
+          uGapAngle: { value: Math.random() * Math.PI * 2 },
+          uGapWidth: { value: 0.35 + Math.random() * 0.55 },
+          uKnotAngle: { value: Math.random() * Math.PI * 2 },
         },
         transparent: true, depthWrite: false, depthTest: true,
         blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
         vertexShader: `
-          varying vec2 vUv;
+          varying vec3 vDir;
+          uniform float uAge, uSeed, uTime;
+          uniform float uAnisoAngle, uAnisoAmt, uAnisoSpin;
+          uniform float uPlumeAngle, uPlumeAmt, uJetAngle, uGapAngle, uGapWidth, uDesign;
+
+          // Cheap 3D value-noise/fbm so the shock front itself can be
+          // displaced per-vertex, in true 3D, with no pole singularity —
+          // this is what actually breaks the perfect-sphere silhouette,
+          // since the SphereGeometry this mesh starts from is otherwise a
+          // true sphere no matter how the fragment shader colors it.
+          float vhash(vec3 p){ return fract(sin(dot(p,vec3(127.1,311.7,74.7)))*43758.5453123); }
+          float vnoise(vec3 p){
+            vec3 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
+            float n000=vhash(i), n100=vhash(i+vec3(1,0,0));
+            float n010=vhash(i+vec3(0,1,0)), n110=vhash(i+vec3(1,1,0));
+            float n001=vhash(i+vec3(0,0,1)), n101=vhash(i+vec3(1,0,1));
+            float n011=vhash(i+vec3(0,1,1)), n111=vhash(i+vec3(1,1,1));
+            float nx00=mix(n000,n100,f.x), nx10=mix(n010,n110,f.x);
+            float nx01=mix(n001,n101,f.x), nx11=mix(n011,n111,f.x);
+            return mix(mix(nx00,nx10,f.y), mix(nx01,nx11,f.y), f.z);
+          }
+          float vfbm(vec3 p){
+            float v=0.0, amp=0.5;
+            for(int i=0;i<4;i++){ v += amp*vnoise(p); p*=2.15; amp*=0.55; }
+            return v;
+          }
+
           void main(){
-            vUv = uv;
-            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            // Position on a unit sphere IS its own direction from center —
+            // this replaces the old billboard's flat UV coordinate with a
+            // genuine 3D direction, so the fragment shader below can wrap
+            // its whole pattern fully around a real volume.
+            vec3 dir = normalize(position);
+            vDir = dir;
+
+            // ---- Non-spherical shock-front growth. A real hypernova shell
+            // is lumpy and lopsided from the instant it leaves the star:
+            // Rayleigh-Taylor instabilities tear the front into fingers at
+            // every scale, any jet/torus asymmetry from the progenitor
+            // persists and grows, and the front never re-rounds itself back
+            // into a sphere as it expands. Displace every vertex along its
+            // own radial direction using low+mid+high frequency 3D noise
+            // (bumps at multiple scales at once, not one soft wobble), plus
+            // the same jet / plume / gap axes the fragment shader already
+            // uses so the geometric silhouette and the surface texture agree.
+            float growAge = 0.15 + uAge*0.85;
+            float nLow  = vfbm(dir*1.6 + uSeed);
+            float nMid  = vfbm(dir*4.2 + uSeed*1.7 + 30.0);
+            float nHigh = vfbm(dir*9.5 + uSeed*3.1 + 70.0);
+            float bump = (nLow-0.5)*0.6 + (nMid-0.5)*0.35*growAge + (nHigh-0.5)*0.18*growAge;
+
+            // elliptical stretch — same rotating axis as the fragment
+            // shader's aniso warp, so the lopsided outline it already paints
+            // is backed by an actually-lopsided mesh
+            float aa = uAnisoAngle + uTime*uAnisoSpin;
+            vec2 dxy = vec2(dot(dir.xy, vec2(cos(aa),sin(aa))), dot(dir.xy, vec2(-sin(aa),cos(aa))));
+            float stretch = 1.0 + uAnisoAmt*0.6*(dxy.x*dxy.x - dxy.y*dxy.y);
+
+            // bipolar jet growth boost along its axis
+            vec2 jetDir = vec2(cos(uJetAngle), sin(uJetAngle));
+            float jetAlign = max(0.0, dot(normalize(dir.xy+1e-4), jetDir));
+            float jetBoost = pow(jetAlign, 6.0) * (0.5+uPlumeAmt) * growAge;
+
+            // gap pinch — for the broken-loop species, thins the shell right
+            // where the ring is meant to gap open
+            vec2 gapDir = vec2(cos(uGapAngle), sin(uGapAngle));
+            float gapAlign = max(0.0, dot(normalize(dir.xy+1e-4), gapDir));
+            float gapPinch = (uDesign > 2.5 && uDesign < 3.5) ? pow(gapAlign, 4.0)*0.35 : 0.0;
+
+            float growth = clamp(1.0 + bump*0.9 + jetBoost - gapPinch, 0.35, 1.9) * stretch;
+
+            vec3 displaced = dir * growth;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
           }
         `,
         fragmentShader: `
-          uniform float uAge, uTime, uSeed;
-          varying vec2 vUv;
+          uniform float uAge, uTime, uSeed, uPalette;
+          uniform float uHueRing, uHueIris, uHueOuter, uSatJitter;
+          uniform float uRingW, uIrisOut, uOuterOut, uW1, uW2, uW3;
+          uniform float uAnisoAngle, uAnisoAmt, uAnisoSpin;
+          uniform float uDesign, uMaxR, uPlumeAngle, uPlumeAmt, uJetAngle;
+          uniform float uGapAngle, uGapWidth, uKnotAngle;
+          varying vec3 vDir;
+
+          // Minimal RGB<->HSV round trip so each band's base color can be hue-
+          // rotated per instance while keeping the same brightness structure.
+          vec3 rgb2hsv(vec3 c){
+            vec4 K = vec4(0.0,-1.0/3.0,2.0/3.0,-1.0);
+            vec4 p = mix(vec4(c.bg,K.wz), vec4(c.gb,K.xy), step(c.b,c.g));
+            vec4 q = mix(vec4(p.xyw,c.r), vec4(c.r,p.yzx), step(p.x,c.r));
+            float d = q.x-min(q.w,q.y);
+            float e = 1.0e-10;
+            return vec3(abs(q.z+(q.w-q.y)/(6.0*d+e)), d/(q.x+e), q.x);
+          }
+          vec3 hsv2rgb(vec3 c){
+            vec4 K = vec4(1.0,2.0/3.0,1.0/3.0,3.0);
+            vec3 p = abs(fract(c.xxx+K.xyz)*6.0-K.www);
+            return c.z * mix(K.xxx, clamp(p-K.xxx,0.0,1.0), c.y);
+          }
+          vec3 hueShift(vec3 col, float amt, float satMul){
+            vec3 hsv = rgb2hsv(col);
+            hsv.x = fract(hsv.x + amt);
+            hsv.y = clamp(hsv.y*satMul, 0.0, 1.0);
+            return hsv2rgb(hsv);
+          }
 
           float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453123); }
           float noise(vec2 p){
@@ -766,67 +1282,345 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           }
           float fbm(vec2 p){
             float v=0.0, amp=0.5;
-            for(int i=0;i<5;i++){ v += amp*noise(p); p *= 2.15; amp *= 0.55; }
+            for(int i=0;i<6;i++){ v += amp*noise(p); p *= 2.13; amp *= 0.55; }
             return v;
           }
 
           void main(){
-            vec2 p = (vUv - 0.5) * 2.0;
-            float r = length(p);
-            if(r > 1.0) discard;
-            float ang = atan(p.y, p.x);
+            // True spherical silhouette: treat the fragment's direction on
+            // the unit sphere as spherical coordinates around the mesh's own
+            // local Z axis (its "pole", fixed at a random 3D orientation
+            // when the explosion spawned — see iris.rotation in JS). theta
+            // is 0 at the pole and PI at the antipode, so theta/PI is a
+            // radius-like value that is *always* bounded to [0,1] by the
+            // geometry itself — unlike a flat quad's UV, there is no literal
+            // physical edge it can prematurely hit or expose as a hard line.
+            vec3 dir = normalize(vDir);
+            float theta = acos(clamp(dir.z, -1.0, 1.0));
+            float ang0  = atan(dir.y, dir.x);
+            // Reuse the original 2D warp/band math unchanged below by
+            // feeding it a unit-disc proxy coordinate built from (theta,
+            // ang0) — same lopsided, slowly-spinning silhouette as before,
+            // just wrapped fully around a real 3D shell instead of stamped
+            // onto a camera-facing card, so every band, ring, jet and plume
+            // now genuinely propagates through 3D space and reads correctly
+            // from any viewing angle, including face-on to the pole.
+            vec2 p = vec2(cos(ang0), sin(ang0)) * (theta / 3.14159265);
 
-            // Fine radial striations, like the fibrous structure of an iris
-            // or of real filamentary ejecta.
-            float fibers  = fbm(vec2(ang*46.0 + uSeed*11.0, r*3.2 - uTime*0.05));
-            float fibers2 = fbm(vec2(ang*90.0 + uSeed*23.0, r*6.0 + uTime*0.08));
-            float spiky   = pow(fbm(vec2(ang*30.0+uSeed*5.0, r*2.0)), 3.0);
-            float cloudy  = fbm(vec2(ang*7.0 + uSeed*3.0 + uTime*0.04, r*4.0 - uTime*0.07));
+            // Warp into a randomly-oriented, slowly-spinning elliptical frame
+            // before doing any radial math. This alone breaks the "perfect
+            // iris" symmetry: every downstream band (core, ring, iris, outer
+            // cloud) inherits a lopsided, drifting silhouette instead of
+            // concentric circles, because r and ang are now measured in the
+            // warped frame, not screen space.
+            float anisoAng = uAnisoAngle + uTime*uAnisoSpin;
+            float aca = cos(anisoAng), asa = sin(anisoAng);
+            vec2 pa = vec2(p.x*aca + p.y*asa, -p.x*asa + p.y*aca);
+            pa.x *= (1.0 + uAnisoAmt);
+            pa.y *= (1.0 - uAnisoAmt*0.55);
+            vec2 pw = vec2(pa.x*aca - pa.y*asa, pa.x*asa + pa.y*aca);
+
+            float r = length(pw);
+            if(r > uMaxR) discard;
+            float ang = atan(pw.y, pw.x);
+            float TAU = 6.2831853;
+            // angular distance from a to b, wrapped into [0, PI]
+            #define ADIST(a,b) abs(mod((a)-(b)+3.14159265, TAU)-3.14159265)
+
+            // Fine radial striations — the feather-like filament structure
+            // running through the iris band and the fibrous ring right at the
+            // collapsed core's edge, the way real ionized ejecta forms fine
+            // threads rather than a smooth gradient.
+            float fibers     = fbm(vec2(ang*46.0 + uSeed*11.0, r*3.2 - uTime*0.05));
+            float fibers2    = fbm(vec2(ang*90.0 + uSeed*23.0, r*6.0 + uTime*0.08));
+            float fineFibers = fbm(vec2(ang*160.0 - uSeed*17.0, r*11.0 + uTime*0.12));
             float texture1 = mix(fibers, fibers2, 0.5);
+            texture1 = mix(texture1, fineFibers, 0.3);
 
-            // Young explosions are tight, spiky, radiant threads; aged ones
-            // relax into a softer, cloudier filamentary shell.
-            float pattern = mix(mix(texture1, spiky, 0.5), cloudy, smoothstep(0.15,0.7,uAge));
+            // Blotchy, uneven nebula texture for the outer cloud shell.
+            float cloudy = fbm(vec2(ang*7.0 + uSeed*3.0 + uTime*0.04, r*4.0 - uTime*0.07));
+            float clumpField = fbm(vec2(ang*11.0 + uSeed*2.3, r*3.6) - uTime*0.02);
+            float rift = smoothstep(0.32,0.52,clumpField);
+            float knot = smoothstep(0.62,0.88,clumpField);
+            float speckle = pow(hash(floor(dir.xy*260.0 + dir.z*130.0) + uSeed), 24.0);
 
-            // A collarette-like ring partway out, where density and color shift.
-            float ringPos = mix(0.42, 0.6, fbm(vec2(uSeed, ang*2.0))*0.3+0.5);
-            float collarette = smoothstep(ringPos-0.1, ringPos, r) * (1.0-smoothstep(ringPos, ringPos+0.16, r));
+            // Organic, irregular band edges — real remnant shells are never
+            // clean circles. Stack three octaves at different angular
+            // frequencies — broad lobing, mid-scale scalloping, fine jagged
+            // pokes — so the boundary reads as genuinely torn structure, the
+            // way real ejecta fronts are uneven at every scale simultaneously,
+            // not just a single soft wobble. The outer cloud gets an extra,
+            // independently-seeded layer so its edge tears on its own rather
+            // than staying perfectly concentric with the inner bands.
+            float edgeLow  = fbm(vec2(ang*2.4  + uSeed*1.7, uTime*0.018)) - 0.5;
+            float edgeMid  = fbm(vec2(ang*7.5  + uSeed*4.3, uTime*0.03 + 40.0)) - 0.5;
+            float edgeHigh = fbm(vec2(ang*18.0 + uSeed*9.1, uTime*0.05 + 90.0)) - 0.5;
+            float edgeNoise = edgeLow*0.85 + edgeMid*0.45 + edgeHigh*0.22;
+            float edgeOuterExtra = fbm(vec2(ang*3.1 + uSeed*6.6, uTime*0.022 + 130.0)) - 0.5;
+            float edgeNoiseOuter = edgeNoise + edgeOuterExtra*0.6;
 
-            float core = pow(1.0-clamp(r,0.0,1.0), 3.4);
-            float edgeFade = 1.0 - smoothstep(0.72, 1.0, r);
+            // ---- Ignition flash: a brilliant white-blue point with sharp
+            // diffraction spikes and a thin horizontal streak, matching the
+            // reference footage's first instant reading as an over-exposed
+            // star rather than a nebula.
+            float spikeAng  = abs(fract(ang/6.2831*6.0)-0.5)*2.0;
+            float spike     = pow(1.0-spikeAng, 22.0) * pow(1.0-clamp(r,0.0,1.0), 0.6);
+            float spikeAng2 = abs(fract((ang+0.5)/6.2831*4.0)-0.5)*2.0;
+            float spike2    = pow(1.0-spikeAng2, 14.0) * pow(1.0-clamp(r,0.0,1.0), 0.4);
+            float streak    = pow(1.0-abs(sin(ang)), 50.0) * (1.0-smoothstep(0.0,0.75,r));
+            float ignite     = 1.0 - smoothstep(0.0,0.22,uAge);
+            float igniteCore = pow(1.0-clamp(r,0.0,1.0), 2.2);
+            vec3 igniteCol = hueShift(vec3(0.85,0.95,1.0), uHueIris*0.4, 1.0) * igniteCore * 2.2
+                           + vec3(1.0,1.0,1.0) * (spike+spike2*0.7) * 1.6
+                           + hueShift(vec3(0.8,0.9,1.0), uHueIris*0.4, 1.0) * streak * 1.8;
+            float igniteAlpha = clamp(igniteCore*2.0 + spike + spike2 + streak, 0.0, 1.0);
 
-            vec3 youngCore = vec3(1.0,0.98,0.9);
-            vec3 youngMid  = vec3(1.0,0.62,0.22);
-            vec3 youngEdge = vec3(0.85,0.2,0.06);
-            vec3 oldCore   = vec3(0.7,0.82,1.0);
-            vec3 oldMid    = vec3(0.75,0.22,0.82);
-            vec3 oldEdge   = vec3(0.5,0.12,0.4);
+            // ---- Remnant species: which overall structure this explosion
+            // settles into. Real hypernovae don't all relax into the same
+            // radiant-shell "eye" — some stay clumpy and one-sided, some
+            // stay a smooth rounded cloud with a single jet, some end up a
+            // broken gapped loop, some end up an elongated barrel with side
+            // filaments. Picked randomly per explosion via uDesign; every
+            // species still draws its palette from the hue uniforms above,
+            // so color randomization always applies, whichever shape wins.
+            vec3 col = vec3(0.0);
+            float shellAlpha = 0.0;
 
-            vec3 coreCol = mix(youngCore, oldCore, uAge);
-            vec3 midCol  = mix(youngMid,  oldMid,  uAge);
-            vec3 edgeCol = mix(youngEdge, oldEdge, uAge);
+            if(uDesign < 0.5){
+              // ---- Species 0: refined radiant shell — concentric core/
+              // ring/iris/outer bands, now layered with localized brightness
+              // and hue patchiness (real shells never radiate perfectly
+              // evenly) and an optional wispy plume punching past the
+              // envelope.
+              float coreGrow = smoothstep(0.1,0.42,uAge) * (1.0 - 0.35*smoothstep(0.55,1.0,uAge));
+              float coreR = coreGrow*0.15 + edgeNoise*0.035;
+              float coreMask = 1.0 - smoothstep(coreR-0.015, coreR+0.02, r);
 
-            vec3 col = mix(coreCol, midCol, smoothstep(0.0,0.55,r));
-            col = mix(col, edgeCol, smoothstep(0.45,1.0,r));
-            col *= (0.55 + 0.9*pattern);
-            col += edgeCol * collarette * 0.5;
+              float ring1Out = coreR + uRingW + edgeNoise*0.06;
+              float ring1 = smoothstep(coreR, coreR+0.02, r) * (1.0-smoothstep(ring1Out-0.05, ring1Out, r));
+              vec3 ring1Col = hueShift(mix(vec3(1.0,0.97,0.85), vec3(1.0,0.6,0.22), fibers), uHueRing, uSatJitter);
 
-            float alpha = clamp(core*1.6 + pattern*edgeFade*0.85 + collarette*0.3*edgeFade, 0.0, 1.0);
+              float irisOut = uIrisOut + edgeNoise*0.12;
+              float irisBand = smoothstep(ring1Out-0.04, ring1Out+0.05, r) * (1.0-smoothstep(irisOut-0.08, irisOut, r));
+              vec3 irisCol = mix(vec3(0.32,0.58,0.95), vec3(0.75,0.9,1.0), texture1);
+              irisCol = mix(irisCol, vec3(0.9,0.96,1.0), pow(texture1,4.0)*0.5);
+              irisCol = hueShift(irisCol, uHueIris, uSatJitter);
+
+              float outerOut = clamp(uOuterOut + edgeNoiseOuter*0.17, 0.3, 0.97);
+              float outerBand = smoothstep(irisOut-0.05, irisOut+0.06, r) * (1.0-smoothstep(outerOut-0.1, outerOut, r));
+              vec3 outerCol = mix(vec3(1.0,0.55,0.2), vec3(0.5,0.16,0.07), cloudy);
+              outerCol = mix(outerCol, vec3(0.3,0.45,0.78), smoothstep(0.6,0.9,cloudy)*0.3);
+              outerCol = hueShift(outerCol, uHueOuter, uSatJitter);
+
+              // Localized patchiness — breaks up the perfectly-even radiate
+              // look band by band, both in brightness and in hue.
+              float patchN = fbm(vec2(ang*3.3 + uSeed*5.1, r*2.1 - uTime*0.015));
+              float patchMod = mix(0.55, 1.3, patchN);
+              ring1Col = hueShift(ring1Col, (patchN-0.5)*0.05, 1.0);
+              irisCol  = hueShift(irisCol,  (patchN-0.5)*0.05, 1.0);
+              outerCol = hueShift(outerCol, (patchN-0.5)*0.05, 1.0);
+
+              col += ring1Col * ring1 * (0.9 + 0.6*fineFibers) * uW1 * patchMod;
+              col += irisCol * irisBand * (0.85 + 0.5*texture1) * uW2 * patchMod;
+              col += outerCol * outerBand * (0.6 + 0.7*cloudy) * mix(1.0,0.35,rift) * uW3 * patchMod;
+              col += outerCol * knot * outerBand * 0.4 * uW3;
+              col += vec3(1.0,0.97,0.9) * speckle * (irisBand+outerBand);
+
+              shellAlpha = clamp(ring1*uW1 + irisBand*uW2 + outerBand*uW3*0.9, 0.0, 1.0);
+              shellAlpha *= mix(1.0, 0.4, rift*outerBand);
+              shellAlpha = clamp(shellAlpha + speckle*0.4*(irisBand+outerBand), 0.0, 1.0);
+              shellAlpha *= (1.0 - coreMask);
+
+              // Wispy plume — some ignitions punch a filament out past the
+              // main envelope, some don't; strength is randomized per blast.
+              float dAngP = ADIST(ang, uPlumeAngle);
+              float plumeWidth = 0.28 + uPlumeAmt*0.3;
+              float plumeMask = pow(max(0.0, 1.0-dAngP/plumeWidth), 3.0);
+              float plumeReach = outerOut + uPlumeAmt*(uMaxR-outerOut);
+              float plumeRad = smoothstep(outerOut-0.05, outerOut+0.02, r) * (1.0-smoothstep(plumeReach-0.05, plumeReach+0.05, r));
+              float plumeNoise = fbm(vec2(ang*20.0+uSeed*7.7, r*8.0 - uTime*0.1));
+              float plumeVal = plumeMask*plumeRad*smoothstep(0.3,0.85,plumeNoise);
+              col += hueShift(outerCol, 0.04, 1.0) * plumeVal * 1.3;
+              shellAlpha = clamp(shellAlpha + plumeVal, 0.0, 1.0);
+
+            } else if(uDesign < 1.5){
+              // ---- Species 1: clumpy patchwork remnant — no clean
+              // concentric rings, just irregular color zones, a fine bright
+              // filament net laid over the top, and one prominent one-sided
+              // horn of ejecta punching outward, the way an off-center blast
+              // wave dumps most of its energy in one direction.
+              float zoneA = fbm(vec2(ang*1.6 + uSeed*2.1,      r*1.3 - uTime*0.01));
+              float zoneB = fbm(vec2(ang*1.9 + uSeed*5.3+50.0, r*1.5 + uTime*0.012));
+              float zoneC = fbm(vec2(ang*1.4 + uSeed*8.7+90.0, r*1.1 - uTime*0.008));
+              float wsum = zoneA+zoneB+zoneC+0.0001;
+              float wA = zoneA/wsum, wB = zoneB/wsum, wC = zoneC/wsum;
+              vec3 colA = hueShift(vec3(0.55,0.75,0.30), uHueRing,  uSatJitter);
+              vec3 colB = hueShift(vec3(0.80,0.50,0.92), uHueIris,  uSatJitter);
+              vec3 colC = hueShift(vec3(1.00,0.82,0.52), uHueOuter, uSatJitter);
+              vec3 zoneCol = colA*wA + colB*wB + colC*wC;
+
+              float outerOutD1 = clamp(uOuterOut*1.05 + edgeNoiseOuter*0.24, 0.4, uMaxR*0.98);
+              float fillMask = 1.0 - smoothstep(outerOutD1-0.08, outerOutD1, r);
+              float blotch = smoothstep(0.25,0.85, clumpField);
+              fillMask *= mix(0.5, 1.0, blotch);
+              fillMask *= mix(0.65, 1.0, smoothstep(0.0,0.3,r));
+
+              float ridge = 1.0 - abs(fbm(vec2(ang*30.0+uSeed*13.0, r*9.0 - uTime*0.06))*2.0-1.0);
+              float filament = pow(ridge, 10.0);
+              vec3 filCol = hueShift(vec3(0.55,0.75,1.0), uHueRing*0.5, 1.0);
+
+              col += zoneCol * fillMask * (0.7 + 0.5*texture1);
+              col += filCol * filament * fillMask * 1.3;
+              col += vec3(1.0,0.97,0.9) * speckle * fillMask * 0.8;
+              shellAlpha = clamp(fillMask*0.95 + filament*0.6*fillMask + speckle*fillMask*0.5, 0.0, 1.0);
+
+              float dAngP = ADIST(ang, uPlumeAngle);
+              float plumeWidth = 0.34 + uPlumeAmt*0.35;
+              float plumeMask = pow(max(0.0, 1.0-dAngP/plumeWidth), 2.5);
+              float plumeReach = outerOutD1 + (0.35+uPlumeAmt*0.7)*(uMaxR-outerOutD1);
+              float plumeRad = smoothstep(outerOutD1-0.06, outerOutD1+0.02, r) * (1.0-smoothstep(plumeReach-0.06, plumeReach+0.06, r));
+              float plumeNoise = fbm(vec2(ang*16.0+uSeed*6.3, r*6.0 - uTime*0.08));
+              float plumeVal = plumeMask*plumeRad*smoothstep(0.25,0.8,plumeNoise);
+              col += colA * plumeVal * 1.1;
+              shellAlpha = clamp(shellAlpha + plumeVal, 0.0, 1.0);
+
+            } else if(uDesign < 2.5){
+              // ---- Species 2: smooth rounded cloud with a thin bright rim
+              // and a single curved jet — much less fine fiber texture than
+              // the others, reads as a soft, blurred remnant rather than
+              // filamentary.
+              float outerOutD2 = clamp(uOuterOut*0.9 + edgeLow*0.16, 0.45, uMaxR*0.95);
+              float fillMask = 1.0 - smoothstep(outerOutD2-0.07, outerOutD2, r);
+              fillMask *= mix(0.7, 1.0, smoothstep(0.0,0.35,r));
+
+              vec3 interior = mix(vec3(0.85,0.25,0.35), vec3(0.45,0.12,0.35), cloudy);
+              interior = hueShift(interior, uHueOuter, uSatJitter);
+
+              float rim = 1.0 - smoothstep(0.0,0.045,abs(r-outerOutD2));
+              vec3 rimCol = hueShift(vec3(0.35,0.55,1.0), uHueRing, 1.15);
+
+              float dAngJ = ADIST(ang, uJetAngle);
+              float jetMask = pow(max(0.0, 1.0-dAngJ/0.085), 6.0);
+              float jetOuter = mix(outerOutD2+0.18, uMaxR*0.96, 0.5+uPlumeAmt*0.5);
+              float jetRad = smoothstep(outerOutD2-0.05, outerOutD2, r) * (1.0-smoothstep(jetOuter-0.05, jetOuter, r));
+              vec3 jetCol = hueShift(vec3(1.0,0.95,0.6), uHueIris, 1.0);
+              float jetVal = jetMask*jetRad;
+
+              col += interior * fillMask * (0.55 + 0.4*cloudy);
+              col += rimCol * rim * 1.5;
+              col += jetCol * jetVal * 1.8;
+              shellAlpha = clamp(fillMask*0.8 + rim*1.3 + jetVal, 0.0, 1.0);
+
+            } else if(uDesign < 3.5){
+              // ---- Species 3: broken, gapped loop — mostly hollow, energy
+              // concentrated in a ring that doesn't fully close, one
+              // hemisphere reading a different hue than the other, one
+              // bright hot knot, and a faint diffuse halo cloud reaching
+              // out past the ring itself.
+              float ringMid = 0.64 + edgeLow*0.05;
+              float ringHalfW = 0.15 + abs(edgeMid)*0.05;
+              float ringShape = 1.0 - smoothstep(ringHalfW*0.55, ringHalfW, abs(r-ringMid));
+
+              float dAngGap = ADIST(ang, uGapAngle);
+              float gapFactor = smoothstep(uGapWidth*0.5, uGapWidth*0.5+0.35, dAngGap);
+              ringShape *= mix(0.12, 1.0, gapFactor);
+
+              float hemi = smoothstep(-0.2,0.6, sin(ang - uGapAngle - 1.2));
+              vec3 ringColA = hueShift(vec3(0.25,0.55,1.0), uHueRing, uSatJitter);
+              vec3 ringColB = hueShift(vec3(0.25,0.9,0.65), uHueIris, uSatJitter);
+              vec3 ringCol = mix(ringColA, ringColB, hemi);
+              ringCol = mix(ringCol, vec3(1.0), pow(texture1,5.0)*0.4);
+
+              float dAngK = ADIST(ang, uKnotAngle);
+              float knotMask = pow(max(0.0,1.0-dAngK/0.12),4.0) * pow(max(0.0,1.0-abs(r-ringMid)/(ringHalfW*1.3)),3.0);
+              vec3 knotCol = hueShift(vec3(1.0,0.75,0.35), uHueOuter, 1.0);
+
+              float haloMask = smoothstep(ringMid+ringHalfW*0.4, ringMid+ringHalfW*1.7, r) * (1.0-smoothstep(uMaxR*0.85,uMaxR,r));
+              haloMask *= (0.2+0.5*cloudy);
+              vec3 haloCol = hueShift(mix(vec3(0.5,0.08,0.05), vec3(0.7,0.15,0.05), cloudy), uHueOuter*0.6, 0.9);
+
+              float interiorMask = (1.0-smoothstep(ringMid-ringHalfW*1.2, ringMid-ringHalfW*0.3, r)) * 0.16;
+              vec3 interiorCol = hueShift(vec3(0.08,0.08,0.25), uHueRing*0.4, 0.8);
+
+              col += ringCol * ringShape * (0.8+0.6*texture1);
+              col += knotCol * knotMask * 1.7;
+              col += haloCol * haloMask;
+              col += interiorCol * interiorMask;
+              shellAlpha = clamp(ringShape*0.95 + knotMask*1.2 + haloMask*0.7 + interiorMask, 0.0, 1.0);
+
+            } else {
+              // ---- Species 4: elongated barrel with red bracket filaments
+              // on either side — a blue-green core cloud framed by thin red
+              // arcs left and right, plus a handful of hot point knots.
+              float outerOutD4 = clamp(uOuterOut*0.95 + edgeNoise*0.16, 0.4, uMaxR*0.95);
+              float fillMask = 1.0 - smoothstep(outerOutD4-0.12, outerOutD4-0.02, r);
+              fillMask *= mix(0.5, 1.0, smoothstep(0.15,0.6, fbm(vec2(ang*4.0+uSeed*3.3, r*3.0-uTime*0.02))));
+
+              vec3 coreCol = mix(vec3(0.15,0.55,0.9), vec3(0.15,0.85,0.45), cloudy);
+              coreCol = hueShift(coreCol, uHueIris, uSatJitter);
+
+              float ringThin = (1.0-smoothstep(0.0,0.05,abs(r-outerOutD4))) * smoothstep(0.5,0.9,abs(cos(ang)));
+              vec3 bracketCol = hueShift(vec3(0.9,0.2,0.15), uHueOuter, uSatJitter);
+
+              col += coreCol * fillMask * (0.7+0.5*texture1);
+              col += bracketCol * ringThin * 1.6;
+              col += vec3(1.0,0.95,0.85) * speckle * fillMask * 0.9;
+              shellAlpha = clamp(fillMask*0.9 + ringThin*1.3 + speckle*fillMask*0.6, 0.0, 1.0);
+            }
+
+            // ---- Blend ignition into the settled remnant, then fade the
+            // whole thing in at birth and out at the end of its life.
+            // Dust-lane occlusion — real remnants are never uniformly bright.
+            // Cool, unshocked dust threaded through the shell blocks and dims
+            // the glow behind it (JWST's Cas A imagery shows exactly this: a
+            // dust-dominated sheet pockmarked with dark gaps over the bright
+            // ejecta), so a coarse mask carves dark lanes and pockmarks
+            // through the shell instead of leaving it smoothly lit everywhere.
+            float dustLane = fbm(vec2(ang*5.0 + uSeed*4.4 + 200.0, r*3.4 - uTime*0.015));
+            float dustMask = smoothstep(0.58,0.72,dustLane) * smoothstep(0.03, uMaxR*0.9, r);
+            col *= mix(1.0, 0.12, dustMask);
+            shellAlpha *= mix(1.0, 0.35, dustMask);
+
+            vec3 col_final = mix(col, igniteCol, ignite);
+            float alpha = mix(shellAlpha, igniteAlpha, ignite);
             alpha *= smoothstep(0.0, 0.03, uAge + 0.002);
-            alpha *= (1.0 - smoothstep(0.82, 1.0, uAge));
+            alpha *= (1.0 - smoothstep(0.86, 1.0, uAge));
 
-            gl_FragColor = vec4(col, alpha);
+            // ---- Rarefaction: a real blast shell conserves mass as it
+            // expands, so its material thins out the further/longer it
+            // travels — without this the shell just keeps looking like a
+            // smooth, uniformly-dense skin inflating outward (a balloon)
+            // instead of an expanding front that gets wispier with age.
+            alpha *= mix(1.0, 0.45, smoothstep(0.12, 0.9, uAge));
+
+            // ---- Porosity: punch actual holes through the shell wherever a
+            // coarse, direction-consistent noise field dips low, so light
+            // passes clean through in patches the way it does through a real
+            // dust-and-debris cloud. Barely present during the initial flash
+            // (kept solid and bright), then opens up steadily as the remnant
+            // settles, so the transition itself reads as the skin breaking
+            // apart into cloud rather than a balloon that simply grows.
+            float porosity = fbm(vec2(ang*8.0 + uSeed*9.0 + dir.z*3.0, r*5.5 - uTime*0.04));
+            float poreThresh = mix(-0.35, 0.4, smoothstep(0.1, 0.6, uAge));
+            alpha *= smoothstep(poreThresh-0.16, poreThresh+0.16, porosity);
+
+            gl_FragColor = vec4(col_final, alpha);
           }
         `,
       });
+      if (irisMat.uniforms.uDesign.value === 3) irisMat.uniforms.uMaxR.value = 1.32;
       const iris = new THREE.Mesh(irisGeo, irisMat);
       iris.position.copy(pos);
-      iris.scale.set(0.01, 0.01, 1);
+      // Fixed random 3D orientation, set once and never touched again (no
+      // billboarding to the camera) — this is what lets the shell's own
+      // volume and lopsided silhouette show correctly as the viewer orbits.
+      iris.rotation.set(Math.random() * Math.PI * 2, Math.random() * Math.PI * 2, Math.random() * Math.PI * 2);
+      iris.scale.set(0.01, 0.01, 0.01);
       scene.add(iris);
 
       return {
         points, geo, mat, iris, irisMat, velocities, positions,
-        birth: clock.elapsedTime, life: big ? 7.5 : 4.5, big,
+        birth: clock.elapsedTime, life: big ? 8.5 : 6.5, big,
         eventHue: [205, 268, 330][(Math.random() * 3) | 0],
         afterglowSent: false,
       };
@@ -839,12 +1633,25 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       );
       const raycaster = new THREE.Raycaster();
       raycaster.setFromCamera(ndc, camera);
-      const dist = 18 + Math.random() * 30;
+
+      // Click position drives how far along that ray the ignition sits: a
+      // click near the center of the screen ignites relatively nearby, a
+      // click out toward the edges sends it receding into the distance.
+      // The shell itself grows to a ~27-34 unit radius at full size, and the
+      // camera normally orbits only ~15 units from the black hole, so the
+      // range has to be wide and the floor high enough that a "close" nova
+      // doesn't just engulf the whole frame regardless of where you clicked
+      // — otherwise every ignition reads as identically close-up.
+      const centerDist = Math.min(1.5, Math.hypot(ndc.x, ndc.y));
+      const edgeT = centerDist / 1.5; // 0 = dead-center, 1 = far corner
+      const dist = 24 + Math.pow(edgeT, 1.15) * 170 + (Math.random() - 0.5) * 10;
       const pos = raycaster.ray.origin
         .clone()
         .add(raycaster.ray.direction.clone().multiplyScalar(dist));
+
       supernovae.push(makeSupernova(pos, false));
-      flashLevel = Math.min(1.0, flashLevel + 0.35);
+      // Close ignitions still punch the screen flash harder than distant ones.
+      flashLevel = Math.min(1.0, flashLevel + 0.5 * (1.0 - edgeT) + 0.15);
       // Flood the palette with a white-gold flash pulse at the click point.
       emitCosmosEvent({
         type: "supernova", heat: 0.5, hue: 46, x: ndc.x, y: ndc.y,
@@ -896,14 +1703,17 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         s.mat.uniforms.uAge.value = age;
         s.mat.uniforms.uTime.value = clock.elapsedTime;
 
-        // The iris grows the way real ejecta expands — fast at first, slowing
-        // as it goes — and always faces the camera.
-        const baseSize = s.big ? 34 : 22;
+        // The iris grows outward the way real ejecta expands — fast at first,
+        // slowing as it goes. It's a real 3D shell now (see makeSupernova),
+        // scaled uniformly in all three axes and left at the fixed random
+        // orientation it was given at spawn — no camera-facing sync, so its
+        // volume and lopsided silhouette are genuinely visible from any angle.
+        const baseSize = s.big ? 34 : 27;
         const irisScale = baseSize * Math.pow(age + 0.015, 0.42);
-        s.iris.scale.set(irisScale, irisScale, 1);
-        s.iris.quaternion.copy(camera.quaternion);
+        s.iris.scale.set(irisScale, irisScale, irisScale);
         s.irisMat.uniforms.uAge.value = age;
         s.irisMat.uniforms.uTime.value = clock.elapsedTime;
+        s.irisMat.uniforms.uPalette.value = palette.value;
 
         // Once the ejecta cools into its coloured phase, fire a softer
         // afterglow pulse so the palette drifts teal/violet/magenta with it.
@@ -936,6 +1746,8 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         uAspect: { value: window.innerWidth / window.innerHeight },
         uTime: { value: 0 },
         uFlash: { value: 0 },
+        uPalette: { value: 0 },
+        uTexel: { value: new THREE.Vector2(1 / window.innerWidth, 1 / window.innerHeight) },
       },
       vertexShader: `
         varying vec2 vUv;
@@ -951,6 +1763,8 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         uniform float uAspect;
         uniform float uTime;
         uniform float uFlash;
+        uniform float uPalette;
+        uniform vec2 uTexel;
         varying vec2 vUv;
 
         void main(){
@@ -969,6 +1783,10 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           vec2 sampleUV = vec2(bentP.x/uAspect, bentP.y) + uBHScreen;
           sampleUV = clamp(sampleUV, 0.001, 0.999);
 
+          vec3 ringTint  = mix(vec3(1.0,0.82,0.55), vec3(0.75,0.9,1.0), uPalette);
+          vec3 coreTint  = mix(vec3(1.0,0.95,0.88), vec3(0.92,0.97,1.0), uPalette);
+          vec3 caTint    = mix(vec3(1.0,0.6,0.35),  vec3(0.55,0.75,1.0), uPalette);
+
           vec3 color;
           if(dist < horizon*0.9){
             color = vec3(0.0);
@@ -976,40 +1794,63 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
             color = texture2D(tDiffuse, sampleUV).rgb;
 
             // Thin, bright Einstein ring where lensed light from every side of
-            // the disk piles up right at the shadow's edge.
+            // the disk piles up right at the shadow's edge — the defining
+            // feature of a photorealistic black hole silhouette.
             float ringGlow = smoothstep(horizon*1.05, horizon*0.92, dist) * (1.0-smoothstep(horizon*0.92, horizon*0.82, dist));
             float ringCore = smoothstep(horizon*0.98, horizon*0.93, dist) * (1.0-smoothstep(horizon*0.93, horizon*0.88, dist));
-            color += vec3(1.0,0.82,0.55) * ringGlow * 1.9;
-            color += vec3(1.0,0.95,0.88) * ringCore * 2.4;
+            color += ringTint * ringGlow * 1.9;
+            color += coreTint * ringCore * 2.4;
 
             float ca = smoothstep(horizon*4.5, horizon*0.9, dist) * 0.006;
             vec2 caUV1 = clamp(sampleUV + dir*ca, 0.001, 0.999);
             vec2 caUV2 = clamp(sampleUV - dir*ca, 0.001, 0.999);
             color.r = texture2D(tDiffuse, caUV1).r;
             color.b = texture2D(tDiffuse, caUV2).b;
-            color += vec3(1.0,0.6,0.35) * ringGlow * 0.4 * ca * 40.0;
+            color += caTint * ringGlow * 0.4 * ca * 40.0;
           }
+
+          // Cheap wide-radius bloom: pull in a handful of bright-pass taps at
+          // increasing offsets and add them back additively, so the disk and
+          // halo bands bleed soft light into the surrounding dark the way an
+          // over-exposed, bloom-heavy render does in the reference footage.
+          vec3 bloom = vec3(0.0);
+          const int TAPS = 8;
+          for(int i=0;i<TAPS;i++){
+            float fi = float(i);
+            float ang = fi*2.399963;
+            float rad = (fi+1.0)*2.2;
+            vec2 off = vec2(cos(ang), sin(ang)) * uTexel * rad;
+            vec3 s = texture2D(tDiffuse, clamp(sampleUV+off,0.001,0.999)).rgb;
+            float br = max(0.0, dot(s,vec3(0.299,0.587,0.114)) - 0.55);
+            bloom += s * br;
+          }
+          bloom /= float(TAPS);
+          color += bloom * 0.9;
 
           float vig = smoothstep(0.95, 0.22, length(uv-0.5));
           color *= mix(0.45, 1.0, vig);
 
-          // Filmic-leaning tone shaping: crush near-blacks, roll off hot
-          // highlights so the disk doesn't clip to flat white.
+          // Filmic-leaning tone shaping: crush the near-blacks a touch, roll
+          // off the hot highlights so the disk doesn't clip to flat white.
           color = color / (1.0 + color*0.35);
           color = pow(max(color,0.0), vec3(0.92));
 
           float lum = dot(color, vec3(0.299,0.587,0.114));
-          color += vec3(0.0,0.05,0.09) * (1.0-smoothstep(0.0,0.35,lum));
-          color += vec3(0.07,0.02,-0.025) * smoothstep(0.5,1.0,lum);
+          vec3 shadowTint = mix(vec3(0.0,0.05,0.09), vec3(0.0,0.03,0.11), uPalette);
+          vec3 highlightTint = mix(vec3(0.07,0.02,-0.025), vec3(-0.02,0.02,0.06), uPalette);
+          color += shadowTint * (1.0-smoothstep(0.0,0.35,lum));
+          color += highlightTint * smoothstep(0.5,1.0,lum);
 
-          // Slight saturation lift for the punchy look of the reference.
+          // Slight saturation lift for the richly-colored, punchy look of the
+          // reference photography.
           float g = dot(color, vec3(0.299,0.587,0.114));
           color = mix(vec3(g), color, 1.18);
 
           float grain = fract(sin(dot(uv*(uTime*60.0+1.0), vec2(12.9898,78.233)))*43758.5453);
           color += (grain-0.5)*0.015;
 
-          color += vec3(1.0,0.9,0.75) * uFlash * 0.25;
+          vec3 flashTint = mix(vec3(1.0,0.9,0.75), vec3(0.85,0.92,1.0), uPalette);
+          color += flashTint * uFlash * 0.25;
           color *= (1.0 + uFlash*0.3);
 
           gl_FragColor = vec4(color, 1.0);
@@ -1099,6 +1940,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       renderer.setSize(window.innerWidth, window.innerHeight);
       rt.setSize(window.innerWidth, window.innerHeight);
       postMat.uniforms.uAspect.value = window.innerWidth / window.innerHeight;
+      postMat.uniforms.uTexel.value.set(1 / window.innerWidth, 1 / window.innerHeight);
     };
 
     window.addEventListener("resize", onResize);
@@ -1118,9 +1960,22 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
 
       updateCamera(dt);
 
+      updatePalette(t);
       (stars.material as THREE.ShaderMaterial).uniforms.uTime.value = t;
-      diskMat.uniforms.uTime.value = t;
-      polarRingMat.uniforms.uTime.value = t;
+      diskMats.forEach((m) => {
+        m.uniforms.uTime.value = t;
+        m.uniforms.uPalette.value = palette.value;
+      });
+      polarRingMats.forEach((m) => {
+        m.uniforms.uTime.value = t;
+        m.uniforms.uPalette.value = palette.value;
+      });
+      rimMat.uniforms.uPalette.value = palette.value;
+      postMat.uniforms.uPalette.value = palette.value;
+      haloMatB.opacity = 0.9 * palette.value;
+      haloMatB2.opacity = 0.35 * palette.value;
+      haloMat.opacity = 0.9 * (1.0 - palette.value * 0.65);
+      haloMat2.opacity = 0.35 * (1.0 - palette.value * 0.65);
 
       // Real relative motion: the deep background slowly rotates independent
       // of the camera, so stars visibly sweep behind the hole and get bent.
@@ -1128,13 +1983,27 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       bgGroup.rotation.x = Math.sin(t * 0.05) * 0.08;
 
       // Frame-dragging style precession of the whole black-hole system.
-      disk.rotation.z += dt * 0.045;
+      diskGroup.rotation.z += dt * 0.045;
       bhGroup.rotation.y += dt * 0.012;
+
+      // Real Doppler beaming needs the disk's actual current world-space
+      // rotation axis (not a fixed guess) since diskGroup/bhGroup keep
+      // precessing — pulled fresh each frame and shared by the disk layers,
+      // the lensed halo bands, and the photon ring so all three agree on
+      // which side of the hole is currently "approaching".
+      scene.updateMatrixWorld(true);
+      orbitAxisWorld.set(0, 0, 1).transformDirection(diskGroup.matrixWorld).normalize();
+      diskMats.forEach((m) => { m.uniforms.uOrbitAxis.value.copy(orbitAxisWorld); });
+      polarRingMats.forEach((m) => { m.uniforms.uOrbitAxis.value.copy(orbitAxisWorld); });
+      rimMat.uniforms.uOrbitAxis.value.copy(orbitAxisWorld);
 
       const haloPulse = 1.0 + Math.sin(t * 0.9) * 0.08;
       halo.scale.set(9 * haloPulse, 9 * haloPulse, 1);
       halo2.scale.set(13 / haloPulse, 13 / haloPulse, 1);
       halo2.material.rotation += dt * 0.05;
+      haloB.scale.set(9 * haloPulse, 9 * haloPulse, 1);
+      haloB2.scale.set(13 / haloPulse, 13 / haloPulse, 1);
+      haloB2.material.rotation += dt * 0.05;
 
       nebulaGroup.children.forEach((spr) => {
         const s = spr as THREE.Sprite;
