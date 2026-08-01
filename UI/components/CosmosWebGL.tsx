@@ -18,6 +18,12 @@
  *     warm→blue lensed arcs, each with its own flow speed and Doppler beaming.
  *   · 9000 twinkling stars + seven colourful nebulae in a slowly-rotating
  *     background group, so stars visibly sweep behind the hole and get bent.
+ *   · Meteor showers & comets: occasional streaks of light flying through the
+ *     skyEventsGroup. Meteor showers fan a burst of short additive streaks
+ *     out of a shared radiant; comets are rarer and slower with a glowing coma,
+ *     a long streak, and a wispy particle trail (custom aSize/aAlpha points
+ *     shader). All live in `scene`, so they pick up the same lensing bend as
+ *     the stars when they pass near the hole.
  *   · Supernovae: asymmetric particle ejecta (bipolar jet, squash, point-
  *     symmetric clump pairs, per-particle speed → colour-age) PLUS a genuine
  *     3D spherical iris (not a camera-facing billboard) whose fragment shader
@@ -454,6 +460,293 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     bgGroup.add(nebulaGroup);
     bgGroup.rotation.z = 0.3;
     scene.add(bgGroup);
+
+    // ---- meteor showers & comets: occasional streaking light across deep space ----
+    // These live directly in `scene` (not bgGroup) with an unrotated parent, so
+    // a spawn-time world-space travel direction stays valid for the object's
+    // whole lifetime without any per-frame matrix work — and since they're part
+    // of the same render-to-texture pass as the stars, they pick up the same
+    // gravitational-lensing bend from the post shader when they pass near the hole.
+    const skyEventsGroup = new THREE.Group();
+    scene.add(skyEventsGroup);
+
+    function makeStreakTexture(): THREE.CanvasTexture {
+      const w = 512, h = 128;
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext("2d")!;
+      ctx.clearRect(0, 0, w, h);
+
+      // A tapered needle — thin, transparent tail widening into a soft rounded
+      // head — blurred so it reads as a glowing streak of light rather than a
+      // hard-edged bar (a flat rectangle here is exactly what looks like a
+      // "strip of paper" flying through the scene).
+      ctx.filter = "blur(7px)";
+      ctx.beginPath();
+      ctx.moveTo(0, h / 2);
+      ctx.quadraticCurveTo(w * 0.38, h * 0.5 - h * 0.05, w * 0.64, h * 0.5 - h * 0.15);
+      ctx.lineTo(w * 0.86, h * 0.5 - h * 0.3);
+      ctx.arc(w * 0.86, h / 2, h * 0.3, -Math.PI / 2, Math.PI / 2);
+      ctx.lineTo(w * 0.64, h * 0.5 + h * 0.15);
+      ctx.quadraticCurveTo(w * 0.38, h * 0.5 + h * 0.05, 0, h / 2);
+      ctx.closePath();
+
+      const grad = ctx.createLinearGradient(0, 0, w, 0);
+      grad.addColorStop(0, "rgba(255,255,255,0)");
+      grad.addColorStop(0.45, "rgba(255,255,255,0.22)");
+      grad.addColorStop(0.8, "rgba(255,255,255,0.75)");
+      grad.addColorStop(1, "rgba(255,255,255,1)");
+      ctx.fillStyle = grad;
+      ctx.fill();
+      ctx.filter = "none";
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.needsUpdate = true;
+      disposables.push(tex);
+      return tex;
+    }
+    const streakTex = makeStreakTexture();
+
+    function colorVec3(hex: number): THREE.Vector3 {
+      const c = new THREE.Color(hex);
+      return new THREE.Vector3(c.r, c.g, c.b);
+    }
+
+    // bright end of the texture (u≈1) leads; material.rotation aligns that edge
+    // with the object's screen-space direction of travel every frame.
+    const _sPos = new THREE.Vector3(), _sAhead = new THREE.Vector3();
+    function orientStreak(sprite: THREE.Sprite, worldPos: THREE.Vector3, dirWorld: THREE.Vector3): void {
+      _sPos.copy(worldPos).project(camera);
+      _sAhead.copy(worldPos).addScaledVector(dirWorld, 3).project(camera);
+      const aspect = window.innerWidth / window.innerHeight;
+      const dx = (_sAhead.x - _sPos.x) * aspect;
+      const dy = _sAhead.y - _sPos.y;
+      if (dx * dx + dy * dy > 1e-9) sprite.material.rotation = Math.atan2(dy, dx);
+    }
+
+    function randOnSphere(r: number): THREE.Vector3 {
+      const theta = Math.acos(2 * Math.random() - 1);
+      const phi = Math.random() * Math.PI * 2;
+      return new THREE.Vector3(
+        r * Math.sin(theta) * Math.cos(phi),
+        r * Math.cos(theta),
+        r * Math.sin(theta) * Math.sin(phi),
+      );
+    }
+
+    // ---- meteor showers — small bursts of quick, bright streaks that all fan
+    // out from a shared "radiant" point, the way a real shower reads visually. ----
+    interface Meteor {
+      streak: THREE.Sprite;
+      coma: THREE.Sprite;
+      start: THREE.Vector3;
+      dir: THREE.Vector3;
+      length: number;
+      duration: number;
+      t: number;
+      streakLen: number;
+      streakWidth: number;
+    }
+    const meteors: Meteor[] = [];
+    const meteorPalette: { tint: number; glow: THREE.Texture }[] = [
+      { tint: 0xcfe6ff, glow: glowTexBlue }, // icy blue-white
+      { tint: 0xffe3bd, glow: glowTexWarm }, // pale gold
+      { tint: 0xe3d0ff, glow: glowTexBlue }, // soft violet
+      { tint: 0xffffff, glow: glowTexBlue }, // pure white
+    ];
+
+    function spawnMeteorShower(): void {
+      const radiant = randOnSphere(1).normalize();
+      const helper = Math.abs(radiant.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+      const tangentA = new THREE.Vector3().crossVectors(radiant, helper).normalize();
+      const tangentB = new THREE.Vector3().crossVectors(radiant, tangentA).normalize();
+      const shellR = 65 + Math.random() * 45;
+      const count = 8 + Math.floor(Math.random() * 10);
+
+      for (let i = 0; i < count; i++) {
+        const ang = Math.random() * Math.PI * 2;
+        const spreadDir = tangentA.clone().multiplyScalar(Math.cos(ang)).addScaledVector(tangentB, Math.sin(ang));
+        const start = radiant.clone().multiplyScalar(shellR).addScaledVector(spreadDir, Math.random() * 10);
+        const pal = meteorPalette[(Math.random() * meteorPalette.length) | 0];
+
+        const streak = new THREE.Sprite(new THREE.SpriteMaterial({
+          map: streakTex, color: pal.tint, transparent: true, depthWrite: false,
+          blending: THREE.AdditiveBlending, opacity: 0,
+        }));
+        const coma = new THREE.Sprite(new THREE.SpriteMaterial({
+          map: pal.glow, color: pal.tint, transparent: true, depthWrite: false,
+          blending: THREE.AdditiveBlending, opacity: 0,
+        }));
+        skyEventsGroup.add(streak, coma);
+
+        meteors.push({
+          streak, coma, start, dir: spreadDir,
+          length: 26 + Math.random() * 22,
+          duration: 0.5 + Math.random() * 0.55,
+          t: -Math.random() * 1.1, // stagger within the burst
+          streakLen: 10 + Math.random() * 7,
+          streakWidth: 0.45 + Math.random() * 0.3,
+        });
+      }
+    }
+
+    function updateMeteors(dt: number): void {
+      for (let i = meteors.length - 1; i >= 0; i--) {
+        const m = meteors[i];
+        m.t += dt;
+        if (m.t < 0) continue;
+        const p = m.t / m.duration;
+        if (p >= 1) { skyEventsGroup.remove(m.streak, m.coma); meteors.splice(i, 1); continue; }
+
+        const worldPos = m.start.clone().addScaledVector(m.dir, m.length * p);
+        let alpha = 1;
+        if (p < 0.15) alpha = p / 0.15;
+        else if (p > 0.65) alpha = 1 - (p - 0.65) / 0.35;
+
+        const sc = camera.position.distanceTo(worldPos) / 90;
+
+        m.coma.position.copy(worldPos);
+        m.coma.scale.set(1.5 * sc, 1.5 * sc, 1);
+        m.coma.material.opacity = alpha * 0.85;
+
+        const streakWorldLen = m.streakLen * sc;
+        m.streak.position.copy(worldPos).addScaledVector(m.dir, -streakWorldLen / 2);
+        m.streak.scale.set(streakWorldLen, m.streakWidth * sc, 1);
+        m.streak.material.opacity = alpha * 0.9;
+        orientStreak(m.streak, worldPos, m.dir);
+      }
+    }
+
+    // ---- comets — rarer, slower, brighter: a glowing coma, a long streak, and
+    // a wispy particle tail that trails rigidly behind the head (its offsets are
+    // baked in world-space at spawn time since the flight path is a straight
+    // line, so no per-frame recomputation is needed). ----
+    interface Comet {
+      streak: THREE.Sprite;
+      coma: THREE.Sprite;
+      trail: THREE.Points;
+      start: THREE.Vector3;
+      dir: THREE.Vector3;
+      length: number;
+      duration: number;
+      t: number;
+      streakLen: number;
+      streakWidth: number;
+    }
+    const comets: Comet[] = [];
+    const cometPalette: { tint: number; glow: THREE.Texture; hex: number }[] = [
+      { tint: 0xffd9a3, glow: glowTexWarm, hex: 0xffcf96 }, // molten gold
+      { tint: 0x9be8ff, glow: glowTexBlue, hex: 0x8be0ff }, // ice blue
+      { tint: 0xc9ffe0, glow: glowTexBlue, hex: 0xa8ffdb }, // pale emerald
+    ];
+
+    function makeTrailMaterial(colorVec: THREE.Vector3): THREE.ShaderMaterial {
+      return new THREE.ShaderMaterial({
+        uniforms: { uColor: { value: colorVec }, uOpacity: { value: 1 } },
+        vertexShader: `
+          attribute float aSize;
+          attribute float aAlpha;
+          varying float vAlpha;
+          void main(){
+            vAlpha = aAlpha;
+            vec4 mv = modelViewMatrix * vec4(position,1.0);
+            gl_PointSize = aSize * (300.0/-mv.z);
+            gl_Position = projectionMatrix*mv;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uColor;
+          uniform float uOpacity;
+          varying float vAlpha;
+          void main(){
+            vec2 uv = gl_PointCoord-0.5;
+            float d = length(uv);
+            float a = smoothstep(0.5,0.0,d);
+            gl_FragColor = vec4(uColor, a*vAlpha*uOpacity);
+          }
+        `,
+        transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      });
+    }
+
+    function buildCometTrail(dirWorld: THREE.Vector3, colorVec: THREE.Vector3): THREE.Points {
+      const N = 26;
+      const positions = new Float32Array(N * 3);
+      const sizes = new Float32Array(N);
+      const alphas = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        positions[i * 3] = -dirWorld.x * i * 0.9 + (Math.random() - 0.5) * 0.6;
+        positions[i * 3 + 1] = -dirWorld.y * i * 0.9 + (Math.random() - 0.5) * 0.6;
+        positions[i * 3 + 2] = -dirWorld.z * i * 0.9 + (Math.random() - 0.5) * 0.6;
+        sizes[i] = Math.max(0.3, 1.7 - i * 0.055);
+        alphas[i] = Math.max(0, 1 - i / N);
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geo.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+      geo.setAttribute("aAlpha", new THREE.BufferAttribute(alphas, 1));
+      return new THREE.Points(geo, makeTrailMaterial(colorVec));
+    }
+
+    function spawnComet(): void {
+      const pal = cometPalette[(Math.random() * cometPalette.length) | 0];
+      const colorVec = colorVec3(pal.hex);
+
+      const start = randOnSphere(80 + Math.random() * 40);
+      const helper = Math.abs(start.y) < 70 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+      const dir = new THREE.Vector3().crossVectors(start, helper).normalize();
+      if (Math.random() < 0.5) dir.negate();
+
+      const streak = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: streakTex, color: pal.tint, transparent: true, depthWrite: false,
+        blending: THREE.AdditiveBlending, opacity: 0,
+      }));
+      const coma = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: pal.glow, color: pal.tint, transparent: true, depthWrite: false,
+        blending: THREE.AdditiveBlending, opacity: 0,
+      }));
+      const trail = buildCometTrail(dir, colorVec);
+      skyEventsGroup.add(streak, coma, trail);
+
+      comets.push({
+        streak, coma, trail, start, dir,
+        length: 150 + Math.random() * 60,
+        duration: 9 + Math.random() * 5,
+        t: 0,
+        streakLen: 22 + Math.random() * 9,
+        streakWidth: 1.0 + Math.random() * 0.45,
+      });
+    }
+
+    function updateComets(dt: number): void {
+      for (let i = comets.length - 1; i >= 0; i--) {
+        const c = comets[i];
+        c.t += dt;
+        const p = c.t / c.duration;
+        if (p >= 1) { skyEventsGroup.remove(c.streak, c.coma, c.trail); comets.splice(i, 1); continue; }
+
+        const worldPos = c.start.clone().addScaledVector(c.dir, c.length * p);
+        let alpha = 1;
+        if (p < 0.08) alpha = p / 0.08;
+        else if (p > 0.82) alpha = 1 - (p - 0.82) / 0.18;
+
+        const sc = camera.position.distanceTo(worldPos) / 90;
+
+        c.coma.position.copy(worldPos);
+        c.coma.scale.set(6 * sc, 6 * sc, 1);
+        c.coma.material.opacity = alpha * 0.95;
+
+        const streakWorldLen = c.streakLen * sc;
+        c.streak.position.copy(worldPos).addScaledVector(c.dir, -streakWorldLen / 2);
+        c.streak.scale.set(streakWorldLen, c.streakWidth * sc, 1);
+        c.streak.material.opacity = alpha * 0.85;
+        orientStreak(c.streak, worldPos, c.dir);
+
+        c.trail.position.copy(worldPos);
+        (c.trail.material as THREE.ShaderMaterial).uniforms.uOpacity.value = alpha;
+      }
+    }
 
     // ---- black hole: event horizon, photon rim, disk, halo ----
     const bhGroup = new THREE.Group();
@@ -2145,6 +2438,8 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
 
     // ---- animate ----
     let ambientTimer = 0;
+    let meteorTimer = 1.5 + Math.random() * 1.5;
+    let cometTimer = 14 + Math.random() * 8;
     function animate() {
       raf = requestAnimationFrame(animate);
       const dt = Math.min(clock.getDelta(), 0.05);
@@ -2205,6 +2500,19 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
 
       updateSupernovae(dt);
       flashLevel = Math.max(0, flashLevel - dt * 1.4);
+
+      meteorTimer += dt;
+      if (meteorTimer > 3.5 + Math.random() * 4) {
+        meteorTimer = 0;
+        spawnMeteorShower();
+      }
+      cometTimer += dt;
+      if (cometTimer > 30 + Math.random() * 24) {
+        cometTimer = 0;
+        spawnComet();
+      }
+      updateMeteors(dt);
+      updateComets(dt);
 
       ambientTimer += dt;
       if (ambientTimer > 9 + Math.random() * 6) {
