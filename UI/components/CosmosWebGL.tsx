@@ -10,7 +10,7 @@
  *   · A black event-horizon sphere with a fresnel photon-ring rim upgraded
  *     with a hairline photon ring (pow 40), camera-relative Doppler beaming
  *     and a warm↔blue palette blend.
- *   · A 7-layer volumetric accretion disk — a stack of independently seeded,
+ *   · A 20-layer volumetric accretion disk — a stack of independently seeded,
  *     vertically-offset puffy torus sheets (seat profile, per-layer density,
  *     braided strands, temperature cells, camera-relative beaming) so it reads
  *     as a genuinely thick glowing torus from every angle, including edge-on.
@@ -25,10 +25,14 @@
  *     whose vertices are noise-displaced per-explosion. Ambient big blasts
  *     every 9–15 s, plus any number detonated by clicking empty sky. Each
  *     blast feeds a `uFlash` into the post pass.
- *   · A fake-lensing post pass: screen-space warp (breathing ripple), thin
- *     bright Einstein ring + near-white core, radial chromatic aberration,
- *     an 8-tap wide-radius bloom, vignette, filmic tone shaping, dual-tone
- *     grade, saturation lift and film grain.
+ *   · A real-geodesic post pass: every pixel's camera ray is integrated as an
+ *     actual bent photon path in Schwarzschild spacetime (RK4), so the shadow,
+ *     the Einstein ring and the lensed images of the disk — and of any live
+ *     hypernova, treated as a real sphere obstruction along the ray — all
+ *     emerge from the trace itself. Plus a thin proximity Einstein ring +
+ *     near-white core, radial chromatic aberration, a 512-tap wide-radius
+ *     bloom, vignette, filmic tone shaping, dual-tone grade, saturation lift
+ *     and film grain.
  *
  * Controls (as requested, everything else matches the reference):
  *   · left click on empty sky  → supernova
@@ -249,8 +253,8 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
 
     // ---- camera orbit state (spherical, target = origin) ----
     const cam = {
-      azimuth: 0.55, polar: 1.25, radius: 15,
-      targetAzimuth: 0.55, targetPolar: 1.25, targetRadius: 15,
+      azimuth: 0.55, polar: 1.25, radius: 34,
+      targetAzimuth: 0.55, targetPolar: 1.25, targetRadius: 34,
       autoDrift: reduced ? 0 : 0.028,
     };
     let mouseDriftX = 0;
@@ -620,7 +624,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           float angle = atan(pos.y, pos.x);
           vec2 c = vec2(cos(angle),sin(angle)) * (2.0+rn*3.0) + vec2(uTime*0.16 + uLayerSeed*4.1, r*0.35 - uTime*mix(1.6,0.25,rn) + uLayerSeed*6.3);
           float n = fbm(c*1.4);
-          float profile = sin(clamp(rn,0.02,0.98)*3.14159265); // thin at both edges, puffed in the middle
+          float profile = pow(sin(clamp(rn,0.1,0.98)*3.14159265), 0.55); // full-bodied near the inner edge, only pinches thin right at the outer rim
           return (n-0.5) * mix(0.55, 0.16, rn) * profile;
         }
 
@@ -639,7 +643,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           // extending as a flat-topped slab all the way to the edges.
           float r0 = length(xy);
           float rn0 = clamp((r0-uInner)/(uOuter-uInner), 0.0, 1.0);
-          float seatProfile = sin(clamp(rn0,0.02,0.98)*3.14159265);
+          float seatProfile = pow(sin(clamp(rn0,0.1,0.98)*3.14159265), 0.55);
 
           vec3 displaced = vec3(xy, h + uYOffset*seatProfile);
           vPos = displaced;
@@ -781,7 +785,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     // soft, rounded glowing tube rather than a stack of hard-edged sheets —
     // this is what finally gives the disk actual, real 3D depth: viewed dead
     // edge-on it now shows as a genuinely thick glowing band, not a line.
-    const DISK_LAYER_OFFSETS = [-0.85, -0.55, -0.28, 0, 0.28, 0.55, 0.85];
+    const DISK_LAYER_OFFSETS = [-0.967165, -0.640324, -0.596942, -0.544649, -0.533872, -0.398153, -0.278787, -0.275193, -0.274899, -0.193609, -0.027831, 0.110460, 0.127309, 0.208466, 0.231603, 0.319092, 0.494153, 0.807735, 0.906307, 0.999499];
     const diskGroup = new THREE.Group();
     const diskMats: THREE.ShaderMaterial[] = [];
     DISK_LAYER_OFFSETS.forEach((yOff, i) => {
@@ -792,7 +796,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           uInner: { value: R_IN },
           uOuter: { value: R_OUT },
           uPalette: { value: 0 },
-          uYOffset: { value: yOff * R_IN * 0.5 },
+          uYOffset: { value: yOff * R_IN * 1.0 },
           uLayerSeed: { value: i * 7.3 + 1.0 },
           uDensity: { value: density },
           uOrbitAxis: { value: new THREE.Vector3(0, 0, 1) },
@@ -925,7 +929,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     let flashLevel = 0;
 
     function makeSupernova(pos: THREE.Vector3, big: boolean): Supernova {
-      const count = big ? 900 : 420;
+      const count = big ? 2048 : 900;
       const positions = new Float32Array(count * 3);
       const velocities = new Float32Array(count * 3);
       const sizes = new Float32Array(count);
@@ -1092,7 +1096,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
             float colorAge = clamp(uAge * mix(1.55, 0.6, vSpeed), 0.0, 1.0);
             vec3 col = mix(hotc, midc, smoothstep(0.0,0.4,colorAge));
             col = mix(col, coolc, smoothstep(0.35,1.0,colorAge));
-            float fade = 1.0-smoothstep(0.55,1.0,uAge);
+            float fade = 1.0 - smoothstep(0.42, 1.0, uAge);
             float sparkle = 0.75 + 0.35*sin(uTime*18.0 + vRand*60.0);
             gl_FragColor = vec4(col*sparkle, alpha*fade);
           }
@@ -1584,7 +1588,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
             vec3 col_final = mix(col, igniteCol, ignite);
             float alpha = mix(shellAlpha, igniteAlpha, ignite);
             alpha *= smoothstep(0.0, 0.03, uAge + 0.002);
-            alpha *= (1.0 - smoothstep(0.86, 1.0, uAge));
+            alpha *= (1.0 - smoothstep(0.6, 1.0, uAge));
 
             // ---- Rarefaction: a real blast shell conserves mass as it
             // expands, so its material thins out the further/longer it
@@ -1738,6 +1742,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     const postScene = new THREE.Scene();
     const postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     const postGeo = new THREE.PlaneGeometry(2, 2);
+    const MAX_NOVAE = 6;
     const postMat = new THREE.ShaderMaterial({
       uniforms: {
         tDiffuse: { value: rt.texture },
@@ -1748,6 +1753,27 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         uFlash: { value: 0 },
         uPalette: { value: 0 },
         uTexel: { value: new THREE.Vector2(1 / window.innerWidth, 1 / window.innerHeight) },
+        // Real geodesic ray tracing uniforms: the camera's exact world-space
+        // basis + position (it's always orbiting/drifting) and the physical
+        // black hole / disk parameters, so the fragment shader can integrate
+        // true bent light paths instead of faking a 2D screen-space warp.
+        uCamPos: { value: new THREE.Vector3() },
+        uCamRight: { value: new THREE.Vector3(1, 0, 0) },
+        uCamUp: { value: new THREE.Vector3(0, 1, 0) },
+        uCamForward: { value: new THREE.Vector3(0, 0, -1) },
+        uTanHalfFovY: { value: Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) },
+        uRs: { value: R_EH },
+        uDiskNormal: { value: new THREE.Vector3(0, 0, 1) },
+        uDiskInner: { value: R_IN },
+        uDiskOuter: { value: R_OUT },
+        // Hypernovae are also real obstacles along the bent ray now — each
+        // active explosion's current world position and current bounding
+        // radius (it grows over its lifetime) gets fed in here every frame.
+        uNovaCount: { value: 0 },
+        uNovaPos: {
+          value: Array.from({ length: MAX_NOVAE }, () => new THREE.Vector3()),
+        },
+        uNovaRadius: { value: new Float32Array(MAX_NOVAE) },
       },
       vertexShader: `
         varying vec2 vUv;
@@ -1765,30 +1791,161 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         uniform float uFlash;
         uniform float uPalette;
         uniform vec2 uTexel;
+        uniform vec3 uCamPos, uCamRight, uCamUp, uCamForward;
+        uniform float uTanHalfFovY;
+        uniform float uRs;
+        uniform vec3 uDiskNormal;
+        uniform float uDiskInner, uDiskOuter;
+        #define MAX_NOVAE 6
+        uniform int uNovaCount;
+        uniform vec3 uNovaPos[MAX_NOVAE];
+        uniform float uNovaRadius[MAX_NOVAE];
         varying vec2 vUv;
+
+        // ---- Real photon geodesic integration in Schwarzschild spacetime ----
+        // Every pixel's camera ray is traced as an actual bent light path
+        // rather than warped in flat 2D screen space. The exact equatorial
+        // photon-orbit equation (du/dphi)^2 = 1/b^2 - u^2(1 - rs*u), with
+        // u = 1/r, differentiates to u'' = -u + 1.5*rs*u^2; the equivalent
+        // 3D vector form (conserving specific angular momentum h = p x v)
+        // is a central "acceleration" of -1.5*rs*|h|^2/r^5 * p, which is
+        // what's integrated below with RK4. Because central forces keep
+        // motion planar automatically, this naturally reproduces the true
+        // (larger-than-the-horizon) photon-capture shadow, the Einstein
+        // ring as an emergent pile-up of directions rather than a drawn-on
+        // circle, and correct multiple/higher-order images of the disk —
+        // and, now, of any hypernova the bent path happens to graze too.
+        vec2 reprojectDir(vec3 dirToHit, float tanX, float tanY, out bool ok){
+          float dx = dot(dirToHit, uCamRight), dy = dot(dirToHit, uCamUp), dz = dot(dirToHit, uCamForward);
+          ok = dz > 0.0001;
+          return vec2((dx/dz/tanX)*0.5+0.5, (dy/dz/tanY)*0.5+0.5);
+        }
+
+        bool traceGeodesic(vec2 ndc, out vec2 hitUV, out bool captured){
+          float tanY = uTanHalfFovY;
+          float tanX = tanY * uAspect;
+          vec3 dir = normalize(uCamForward + ndc.x*tanX*uCamRight + ndc.y*tanY*uCamUp);
+
+          vec3 p = uCamPos;
+          vec3 v = dir;
+          vec3 h = cross(p, v);
+          float h2 = dot(h,h);
+          captured = false;
+
+          float prevSide = dot(p, uDiskNormal);
+
+          const int STEPS = 200;
+          for(int i=0;i<STEPS;i++){
+            float r = length(p);
+            if(r < uRs*0.98){
+              captured = true;
+              return true;
+            }
+            if(r > 400.0){
+              bool ok;
+              hitUV = reprojectDir(normalize(v), tanX, tanY, ok);
+              return ok;
+            }
+
+            float stepSize = clamp(r*0.045, 0.001, 2.0);
+
+            vec3 k1p = v;
+            vec3 k1v = -1.5*uRs*h2/pow(length(p),5.0) * p;
+            vec3 p2 = p + 0.5*stepSize*k1p, v2 = v + 0.5*stepSize*k1v;
+            vec3 k2p = v2;
+            vec3 k2v = -1.5*uRs*h2/pow(length(p2),5.0) * p2;
+            vec3 p3 = p + 0.5*stepSize*k2p, v3 = v + 0.5*stepSize*k2v;
+            vec3 k3p = v3;
+            vec3 k3v = -1.5*uRs*h2/pow(length(p3),5.0) * p3;
+            vec3 p4 = p + stepSize*k3p, v4 = v + stepSize*k3v;
+            vec3 k4p = v4;
+            vec3 k4v = -1.5*uRs*h2/pow(length(p4),5.0) * p4;
+
+            vec3 pNew = p + (stepSize/6.0)*(k1p + 2.0*k2p + 2.0*k3p + k4p);
+            vec3 vNew = v + (stepSize/6.0)*(k1v + 2.0*k2v + 2.0*k3v + k4v);
+            vec3 stepDir = pNew - p;
+
+            // Nearest obstruction hit within this step, as a fraction 0..1
+            // along p -> pNew. Checked against every active hypernova
+            // sphere and the disk plane; whichever is actually reached
+            // first along the bent path wins.
+            float bestT = 2.0;
+            vec3 bestHitPoint = vec3(0.0);
+            bool foundHit = false;
+
+            for(int n=0;n<MAX_NOVAE;n++){
+              if(n >= uNovaCount) break;
+              vec3 f = p - uNovaPos[n];
+              float R = uNovaRadius[n];
+              float a = dot(stepDir, stepDir);
+              float b = 2.0*dot(f, stepDir);
+              float c = dot(f,f) - R*R;
+              float disc = b*b - 4.0*a*c;
+              if(disc >= 0.0 && a > 1e-9){
+                float sq = sqrt(disc);
+                float t1 = (-b - sq)/(2.0*a);
+                float t2 = (-b + sq)/(2.0*a);
+                float tHit = (t1 >= 0.0 && t1 <= 1.0) ? t1 : ((t2 >= 0.0 && t2 <= 1.0) ? t2 : -1.0);
+                if(tHit >= 0.0 && tHit < bestT){
+                  bestT = tHit;
+                  bestHitPoint = p + stepDir*tHit;
+                  foundHit = true;
+                }
+              }
+            }
+
+            float newSide = dot(pNew, uDiskNormal);
+            if(sign(newSide) != sign(prevSide) && abs(prevSide-newSide) > 1e-6){
+              float tCross = prevSide/(prevSide-newSide);
+              if(tCross >= 0.0 && tCross <= 1.0 && tCross < bestT){
+                vec3 crossPt = mix(p, pNew, tCross);
+                float rad = length(crossPt);
+                if(rad > uDiskInner && rad < uDiskOuter){
+                  bestT = tCross;
+                  bestHitPoint = crossPt;
+                  foundHit = true;
+                }
+              }
+            }
+
+            if(foundHit){
+              bool ok;
+              hitUV = reprojectDir(normalize(bestHitPoint - uCamPos), tanX, tanY, ok);
+              return ok;
+            }
+
+            prevSide = newSide;
+            p = pNew; v = vNew;
+          }
+          bool ok;
+          hitUV = reprojectDir(normalize(v), tanX, tanY, ok);
+          return ok;
+        }
 
         void main(){
           vec2 uv = vUv;
+          vec2 ndc = uv*2.0 - 1.0;
+
+          vec2 sampleUV = uv;
+          bool captured = false;
+          bool hit = traceGeodesic(ndc, sampleUV, captured);
+          sampleUV = clamp(sampleUV, 0.001, 0.999);
+
+          // Kept purely as an art-directed proximity measure (extra glow +
+          // chromatic spread right at the shadow edge); the ring's actual
+          // existence and shape now come from the raytrace itself.
           vec2 p = uv - uBHScreen;
           p.x *= uAspect;
           float dist = length(p);
           vec2 dir = dist > 0.0001 ? p/dist : vec2(0.0);
-
           float horizon = max(uBHRadius, 0.001);
-          float ripple = 1.0 + 0.08*sin(uTime*0.6) + 0.03*sin(uTime*2.3 + dist*40.0);
-          float strength = (horizon*horizon*3.6*ripple) / max(dist*dist, horizon*horizon*0.3);
-          strength = clamp(strength, 0.0, 2.8);
-
-          vec2 bentP = p - dir*strength*horizon;
-          vec2 sampleUV = vec2(bentP.x/uAspect, bentP.y) + uBHScreen;
-          sampleUV = clamp(sampleUV, 0.001, 0.999);
 
           vec3 ringTint  = mix(vec3(1.0,0.82,0.55), vec3(0.75,0.9,1.0), uPalette);
           vec3 coreTint  = mix(vec3(1.0,0.95,0.88), vec3(0.92,0.97,1.0), uPalette);
           vec3 caTint    = mix(vec3(1.0,0.6,0.35),  vec3(0.55,0.75,1.0), uPalette);
 
           vec3 color;
-          if(dist < horizon*0.9){
+          if(!hit || captured){
             color = vec3(0.0);
           } else {
             color = texture2D(tDiffuse, sampleUV).rgb;
@@ -1798,8 +1955,8 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
             // feature of a photorealistic black hole silhouette.
             float ringGlow = smoothstep(horizon*1.05, horizon*0.92, dist) * (1.0-smoothstep(horizon*0.92, horizon*0.82, dist));
             float ringCore = smoothstep(horizon*0.98, horizon*0.93, dist) * (1.0-smoothstep(horizon*0.93, horizon*0.88, dist));
-            color += ringTint * ringGlow * 1.9;
-            color += coreTint * ringCore * 2.4;
+            color += ringTint * ringGlow * 1.1;
+            color += coreTint * ringCore * 1.4;
 
             float ca = smoothstep(horizon*4.5, horizon*0.9, dist) * 0.006;
             vec2 caUV1 = clamp(sampleUV + dir*ca, 0.001, 0.999);
@@ -1814,7 +1971,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           // halo bands bleed soft light into the surrounding dark the way an
           // over-exposed, bloom-heavy render does in the reference footage.
           vec3 bloom = vec3(0.0);
-          const int TAPS = 8;
+          const int TAPS = 512;
           for(int i=0;i<TAPS;i++){
             float fi = float(i);
             float ang = fi*2.399963;
@@ -1862,6 +2019,9 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
 
     const bhCenterWorld = new THREE.Vector3(0, 0, 0);
     const bhEdgeWorld = new THREE.Vector3(R_EH, 0, 0);
+    const camRightV = new THREE.Vector3();
+    const camUpV = new THREE.Vector3();
+    const camForwardV = new THREE.Vector3();
     function updateLensUniforms() {
       const c = bhCenterWorld.clone().project(camera);
       const e = bhEdgeWorld.clone().project(camera);
@@ -1869,6 +2029,38 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       const eUV = new THREE.Vector2((e.x + 1) / 2, (e.y + 1) / 2);
       postMat.uniforms.uBHScreen.value.copy(cUV);
       postMat.uniforms.uBHRadius.value = Math.max(cUV.distanceTo(eUV), 0.01);
+
+      // Real per-pixel geodesic tracing needs the camera's exact current
+      // world-space basis/position (it's always orbiting or auto-drifting)
+      // and the disk's current world-space plane normal, since diskGroup
+      // keeps precessing too.
+      camera.updateMatrixWorld(true);
+      camera.matrixWorld.extractBasis(camRightV, camUpV, camForwardV);
+      camForwardV.negate(); // the camera looks down its local -Z axis
+      postMat.uniforms.uCamPos.value.copy(camera.position);
+      postMat.uniforms.uCamRight.value.copy(camRightV);
+      postMat.uniforms.uCamUp.value.copy(camUpV);
+      postMat.uniforms.uCamForward.value.copy(camForwardV);
+      postMat.uniforms.uDiskNormal.value.copy(orbitAxisWorld);
+
+      // Hypernovae move and grow constantly, so their sphere data for the
+      // tracer has to be refreshed every frame too.
+      const n = Math.min(supernovae.length, MAX_NOVAE);
+      postMat.uniforms.uNovaCount.value = n;
+      for (let i = 0; i < n; i++) {
+        const s = supernovae[i];
+        postMat.uniforms.uNovaPos.value[i].copy(s.iris.position);
+        // Capped well below the disk's outer radius: this sphere is only meant
+        // to catch the *ray tracer's* bent path so a lensed image of the nova
+        // reprojects correctly near its own silhouette. Left uncapped, a fully
+        // grown hypernova's true bounding sphere (up to ~34*1.9 units) can
+        // exceed the distance between where it ignited and the black hole
+        // itself, so the "obstacle" swallows the hole's own position and every
+        // ray aimed anywhere near it hits the nova first — which is what was
+        // reading as a growing orb smothering the horizon, and occasionally as
+        // the whole hole falling back to flat, un-bent shading.
+        postMat.uniforms.uNovaRadius.value[i] = Math.min(s.iris.scale.x * 1.9, 9.0);
+      }
     }
 
     // ---- input: right-drag orbit, shift+scroll zoom, left-click supernova ----
