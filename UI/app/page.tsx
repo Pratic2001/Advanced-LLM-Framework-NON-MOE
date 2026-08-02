@@ -45,6 +45,21 @@ const features = [
   },
 ];
 
+// Hero headline gradient. The default primary→secondary→tertiary ramp reads
+// well on most palettes, but ocean-depths is all cool blues/teals so that ramp
+// melts into the sea. Swap in a warm gold→amber→coral ramp that pops against
+// the cool waves (and harmonizes with the sun glints on the water).
+// NOTE: arbitrary Tailwind values must use comma-separated hsl() — a literal
+// space inside `from-[...]` splits the class name and drops the gradient,
+// leaving text-transparent glyphs invisible.
+const HERO_TEXT_GRADIENT: Record<string, string> = {
+  "ocean-depths":
+    "bg-gradient-to-r from-[hsl(44,100%,72%)] via-[hsl(28,100%,58%)] to-[hsl(12,100%,60%)]",
+};
+const HERO_UNDERLINE_GRADIENT: Record<string, string> = {
+  "ocean-depths": "from-[hsl(44,100%,68%)] to-[hsl(12,100%,58%)]",
+};
+
 function CursorGlow() {
   const mouseX = useMotionValue(0);
   const mouseY = useMotionValue(0);
@@ -287,17 +302,19 @@ export default function HomePage() {
                   <br />
                   <span
                     className={`relative inline-block bg-clip-text text-transparent ${
-                      isDeepSpace
+                      HERO_TEXT_GRADIENT[currentPalette.id] ??
+                      (isDeepSpace
                         ? "bg-gradient-to-r from-[hsl(var(--palette-primary))] via-[hsl(var(--palette-tertiary))] to-[hsl(var(--palette-accent))]"
-                        : "bg-gradient-to-r from-[hsl(var(--palette-primary))] via-[hsl(var(--palette-secondary))] to-[hsl(var(--palette-tertiary))]"
+                        : "bg-gradient-to-r from-[hsl(var(--palette-primary))] via-[hsl(var(--palette-secondary))] to-[hsl(var(--palette-tertiary))]")
                     }`}
                   >
                     Browser to Cluster
                     <motion.span
                       className={`absolute -bottom-2 left-0 h-1 rounded-full bg-gradient-to-r ${
-                        isDeepSpace
+                        HERO_UNDERLINE_GRADIENT[currentPalette.id] ??
+                        (isDeepSpace
                           ? "from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-tertiary))]"
-                          : "from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))]"
+                          : "from-[hsl(var(--palette-primary))] to-[hsl(var(--palette-secondary))]")
                       }`}
                       initial={{ width: 0 }}
                       animate={{ width: "100%" }}

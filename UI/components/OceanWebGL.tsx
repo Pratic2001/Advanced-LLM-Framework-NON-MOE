@@ -2,25 +2,34 @@
 
 // ── Ocean Depths — the underwater world for the "ocean-depths" palette ────
 //
-// Self-contained WebGL background modeled on CosmosWebGL.tsx's skeleton, but
-// with the water upgraded to a screen-space ray-traced ocean. A fullscreen
-// pass replaces the old displaced water mesh + god-ray sprites:
+// Self-contained WebGL background modeled on CosmosWebGL.tsx's skeleton, with
+// the water upgraded to a screen-space ray-traced ocean:
 //
 //   1. Underwater scene → render target. The seabed gradient plane, the
-//      gliding whale, sinking marine snow and bioluminescent bursts are all
-//      rendered below the surface into a color-only WebGLRenderTarget.
-//   2. Fullscreen ocean pass (half-res, blitted up). Per pixel it ray-marches
-//      the animated Gerstner height field to find the surface point + normal,
-//      then composites a fresnel-weighted mix of:
-//        • sky reflection (Schlick fresnel, sun glint on the wave normals),
+//      gliding whale, a drifting glittering fish shoal, marine snow and
+//      bioluminescent bursts are all rendered below the surface into a
+//      color-only WebGLRenderTarget.
+//   2. Fullscreen ocean pass (near-full-res, blitted up). Per pixel it
+//      ray-marches a 10-wave directional Gerstner height field (deep-water
+//      dispersion, swell fields, capillary ripples) to find the surface point
+//      + normal, then composites a fresnel-weighted mix of:
+//        • sky reflection — a Schlick mirror of a dramatic sky (warm horizon
+//          glow, sun disk + halo, drifting clouds) with a broad silvery sun
+//          path and a sparkling wave-facet glitter lobe,
 //        • Snell refraction (1/1.33) with a parallax sample of the underwater
 //          scene and per-channel Beer–Lambert absorption (red fades fastest),
+//          plus a sunlit surface-glow column,
 //        • volumetric god rays marched down the refracted ray — caustic focus
 //          from surface curvature, slanted with the sun, shadowed by an
-//          analytic sphere approximation of the whale.
+//          analytic sphere approximation of the whale,
+//        • whitecap foam where the surface steepens / crests, so the mirror
+//          breaks up like real wind-driven water.
+//   3. Grade — vignette + filmic rolloff + saturation lift.
 //
 // The splash rings draw over the ocean as a final overlay. Colors read live
-// from --palette-* so the PaletteEditor retunes the sea in real time.
+// from --palette-* so the PaletteEditor retunes the sea in real time. The sun
+// is kept ahead of the camera at a fixed elevation (offset to one side) so the
+// glitter path is always in frame.
 
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
@@ -56,15 +65,17 @@ float fbm(vec2 p){
   return v;
 }
 void main() {
-  vec3 deep = mix(uColorB, uColorC, 0.35) * 0.65;
-  vec3 col = deep;
-  float ri = fbm(vWorld.xz * 0.14 + uTime * 0.02);
-  col *= 0.8 + 0.35 * ri;
-  // Faint drifting bioluminescent patches on the floor.
+  vec3 deep = mix(uColorB, uColorC, 0.35);
+  // Broad dune ridges, darker canyons between them — contrast, not a flat wash.
+  float ridge = fbm(vWorld.xz * 0.05 + vec2(uTime * 0.008, 0.0));
+  vec3 col = deep * (0.5 + 0.55 * fbm(vWorld.xz * 0.14 + uTime * 0.02));
+  col *= 0.68 + 0.55 * smoothstep(0.5, 0.74, ridge);
+  col *= 0.82 + 0.3 * (1.0 - smoothstep(0.15, 0.38, ridge));
+  // Bioluminescent coral patches on the floor.
   float glow = fbm(vWorld.xz * 0.5 + vec2(uTime * 0.04, 0.0));
-  col += uColorD * smoothstep(0.6, 0.92, glow) * 0.3;
+  col += uColorD * smoothstep(0.6, 0.93, glow) * 0.55;
   float d = length(cameraPosition - vWorld);
-  col *= exp(-d * 0.02);
+  col *= exp(-d * 0.018);
   gl_FragColor = vec4(col, 1.0);
 }
 `;
@@ -93,6 +104,7 @@ uniform vec3 uColorA;
 uniform vec3 uColorB;
 uniform vec3 uColorC;
 uniform vec3 uColorD;
+uniform vec3 uSunDir;
 uniform vec3 uWhalePos;
 uniform sampler2D uUnderTex;
 varying vec2 vUv;
@@ -104,90 +116,88 @@ float noise(vec2 x){
   return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
              mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
 }
-float fbm(vec2 p){
+float fbmN(vec2 p, int oct){
   float v = 0.0; float a = 0.5;
-  for (int i = 0; i < 5; i++) { v += a * noise(p); p *= 2.1; a *= 0.5; }
+  for (int i = 0; i < 5; i++) {
+    if (i >= oct) break;
+    v += a * noise(p);
+    p *= 2.1; a *= 0.5;
+  }
   return v;
 }
 
-// Gerstner swell — the same three waves the old water mesh displaced.
-float waveHeight(vec2 base) {
+// ---- Directional Gerstner spectrum ---------------------------------------
+// 10 waves spanning 2.5..34 units of wavelength; phase speeds follow deep-
+// water dispersion (long swells travel faster than short ripples), so the
+// surface reads as a real ocean instead of a few slow bumps.
+const int NW = 10;
+const vec4 WAVES[10] = vec4[10](
+  vec4( 0.82,  0.57, 34.0, 0.300), // dominant swell
+  vec4( 0.82,  0.57, 20.0, 0.180),
+  vec4( 0.60,  0.80, 13.0, 0.130),
+  vec4( 0.60,  0.80,  8.0, 0.085),
+  vec4(-0.50,  0.87, 24.0, 0.160), // cross swell
+  vec4(-0.50,  0.87,  9.0, 0.100),
+  vec4( 0.30, -0.95, 16.0, 0.110), // wind chop
+  vec4( 0.30, -0.95,  6.0, 0.070),
+  vec4( 0.98,  0.20,  4.0, 0.045), // ripples
+  vec4( 0.10, -0.99,  2.5, 0.032)
+);
+
+// Slow swell field: wave energy groups in drifting patches (calm vs rough).
+float swellField(vec2 b, float t) {
+  return 0.65 + 0.7 * fbmN(b * 0.02 + vec2(t * 0.02, t * 0.014), 3);
+}
+
+float waveHeight(vec2 b, float t) {
+  float f = swellField(b, t);
   float h = 0.0;
-  float t = uTime;
-  {
-    float amp = 0.8, wl = 26.0, sp = 1.25;
-    vec2 dir = vec2(0.82, 0.57);
-    float k = 6.283185307 / wl;
-    h += amp * sin(k * dot(dir, base) + sp * t);
-  }
-  {
-    float amp = 0.48, wl = 13.0, sp = 1.8;
-    vec2 dir = vec2(-0.5, 0.87);
-    float k = 6.283185307 / wl;
-    h += amp * sin(k * dot(dir, base) + sp * t);
-  }
-  {
-    float amp = 0.28, wl = 7.0, sp = 2.6;
-    vec2 dir = vec2(0.3, -0.95);
-    float k = 6.283185307 / wl;
-    h += amp * sin(k * dot(dir, base) + sp * t);
+  for (int i = 0; i < NW; i++) {
+    vec4 w = WAVES[i];
+    float k = 6.283185307 / w.z;
+    float sp = 0.56 * sqrt(w.z);
+    h += w.w * f * sin(k * dot(w.xy, b) + sp * t);
   }
   return h;
 }
-vec3 surfaceNormal(vec2 base) {
+
+vec3 surfaceNormal(vec2 b, float t) {
+  float f = swellField(b, t);
   vec3 n = vec3(0.0, 1.0, 0.0);
-  float t = uTime;
-  {
-    float amp = 0.8, wl = 26.0, sp = 1.25;
-    vec2 dir = vec2(0.82, 0.57);
-    float k = 6.283185307 / wl;
-    float q = amp * cos(k * dot(dir, base) + sp * t);
-    n.x -= dir.x * k * q; n.z -= dir.y * k * q;
+  for (int i = 0; i < NW; i++) {
+    vec4 w = WAVES[i];
+    float k = 6.283185307 / w.z;
+    float sp = 0.56 * sqrt(w.z);
+    float q = w.w * f * cos(k * dot(w.xy, b) + sp * t);
+    n.x -= w.x * k * q;
+    n.z -= w.y * k * q;
   }
-  {
-    float amp = 0.48, wl = 13.0, sp = 1.8;
-    vec2 dir = vec2(-0.5, 0.87);
-    float k = 6.283185307 / wl;
-    float q = amp * cos(k * dot(dir, base) + sp * t);
-    n.x -= dir.x * k * q; n.z -= dir.y * k * q;
-  }
-  {
-    float amp = 0.28, wl = 7.0, sp = 2.6;
-    vec2 dir = vec2(0.3, -0.95);
-    float k = 6.283185307 / wl;
-    float q = amp * cos(k * dot(dir, base) + sp * t);
-    n.x -= dir.x * k * q; n.z -= dir.y * k * q;
-  }
+  // Capillary ripple: fine fbm gradient adds wind texture to every facet.
+  vec2 e = vec2(0.07, 0.0);
+  float r0 = fbmN(b * 9.0 + vec2(t * 0.5, t * 0.4), 3);
+  float rx = fbmN((b + vec2(e.x, 0.0)) * 9.0 + vec2(t * 0.5, t * 0.4), 3);
+  float rz = fbmN((b + vec2(0.0, e.x)) * 9.0 + vec2(t * 0.5, t * 0.4), 3);
+  n.x += (rx - r0) * 1.1;
+  n.z += (rz - r0) * 1.1;
   return normalize(n);
 }
+
 // Laplacian of the height field — where strongly negative the surface focuses
 // light → caustics.
-float waveLaplacian(vec2 base) {
+float waveLaplacian(vec2 b, float t) {
   float lap = 0.0;
-  float t = uTime;
-  {
-    float amp = 0.8, wl = 26.0, sp = 1.25;
-    vec2 dir = vec2(0.82, 0.57);
-    float k = 6.283185307 / wl;
-    lap -= amp * k * k * sin(k * dot(dir, base) + sp * t);
-  }
-  {
-    float amp = 0.48, wl = 13.0, sp = 1.8;
-    vec2 dir = vec2(-0.5, 0.87);
-    float k = 6.283185307 / wl;
-    lap -= amp * k * k * sin(k * dot(dir, base) + sp * t);
-  }
-  {
-    float amp = 0.28, wl = 7.0, sp = 2.6;
-    vec2 dir = vec2(0.3, -0.95);
-    float k = 6.283185307 / wl;
-    lap -= amp * k * k * sin(k * dot(dir, base) + sp * t);
+  for (int i = 0; i < NW; i++) {
+    vec4 w = WAVES[i];
+    float k = 6.283185307 / w.z;
+    float sp = 0.56 * sqrt(w.z);
+    lap -= w.w * k * k * sin(k * dot(w.xy, b) + sp * t);
   }
   return lap;
 }
-float causticAt(vec2 base) {
-  return clamp(exp(-waveLaplacian(base) * 3.2), 0.12, 2.2);
+float causticAt(vec2 b, float t) {
+  return clamp(exp(-waveLaplacian(b, t) * 3.2), 0.12, 2.2);
 }
+
 // Whale shadow cast on the god rays: 0 inside the sphere silhouette, 1 outside.
 float whaleShadow(vec3 Q, vec3 W, float Rw, vec3 L) {
   vec3 oc = Q - W;
@@ -196,36 +206,51 @@ float whaleShadow(vec3 Q, vec3 W, float Rw, vec3 L) {
   float s = smoothstep(Rw * 1.15, Rw * 0.5, perp);
   return (tL > 0.0) ? s : 1.0;
 }
-vec3 skyColor(vec3 d, vec3 L, vec3 sunCol, vec3 horizonCol, vec3 zenithCol) {
+
+// Sky: warm horizon glow rising into a deep zenith, with a sun disk + halo and
+// drifting clouds. Used for both the background and the water's reflection.
+vec3 skyColor(vec3 d, vec3 L, float t) {
   float h = clamp(d.y, 0.0, 1.0);
-  vec3 col = mix(horizonCol, zenithCol, pow(h, 0.55));
-  col += sunCol * pow(max(dot(d, L), 0.0), 10.0) * 0.14;
-  col += sunCol * pow(max(dot(d, L), 0.0), 140.0) * 0.4;
+  vec3 horizon = mix(uColorD, vec3(1.0, 0.9, 0.75), 0.5) * 1.5;
+  vec3 mid = mix(uColorB, uColorA, 0.35) * 0.6;
+  vec3 zenith = mix(uColorB, uColorA, 0.5) * 0.16;
+  vec3 col = mix(horizon, mid, smoothstep(0.0, 0.22, h));
+  col = mix(col, zenith, smoothstep(0.22, 1.0, h));
+
+  vec3 sunCol = vec3(1.0, 0.92, 0.72);
+  float sd = max(dot(d, L), 0.0);
+  col += sunCol * pow(sd, 14.0) * 0.4;   // wide warm halo
+  col += sunCol * pow(sd, 600.0) * 2.5;  // bright sun disk (HDR; grade rolls off)
+
+  // Soft clouds streaking the horizon.
+  float cl = fbmN(vec2(d.x * 4.0 + d.y * 8.0, d.z * 3.0 - d.y * 6.0) + vec2(t * 0.012, 0.0), 4);
+  float cMask = smoothstep(0.56, 0.9, cl) * smoothstep(0.0, 0.16, h);
+  col = mix(col, vec3(1.0, 0.88, 0.7) * 0.9, cMask * 0.5);
   return col;
 }
 
 void main() {
   vec2 ndc = vUv * 2.0 - 1.0;
+  vec2 vigUv = ndc;
+  vigUv.x *= uAspect;
   vec3 ro = uCamPos;
   vec3 rd = normalize(uCamForward + uCamRight * ndc.x * uTanHalfFovY * uAspect + uCamUp * ndc.y * uTanHalfFovY);
 
-  vec3 L = normalize(vec3(0.4, 0.75, -0.45));
-  vec3 sunCol = mix(vec3(1.0, 0.96, 0.9), uColorD, 0.25);
-  vec3 horizonCol = mix(uColorC, vec3(0.72, 0.8, 0.88), 0.3);
-  vec3 zenithCol = mix(uColorB, uColorA, 0.5) * 0.3;
+  vec3 L = uSunDir;
+  vec3 sunCol = vec3(1.0, 0.92, 0.72);
 
   // Rays above the horizon never reach the water → sky.
-  vec3 col = skyColor(rd, L, sunCol, horizonCol, zenithCol);
+  vec3 col = skyColor(rd, L, uTime);
 
   if (rd.y < 0.0) {
     // March down the view ray until it dips below the animated surface.
-    float tMax = min((ro.y + 5.0) / (-rd.y), 280.0);
-    float stepL = tMax / 28.0;
+    float tMax = min((ro.y + 6.0) / (-rd.y), 320.0);
+    float stepL = tMax / 30.0;
     float t = stepL * 0.5;
     bool hit = false;
-    for (int i = 0; i < 28; i++) {
+    for (int i = 0; i < 30; i++) {
       vec3 Q = ro + rd * t;
-      if (Q.y < waveHeight(Q.xz)) { hit = true; break; }
+      if (Q.y < waveHeight(Q.xz, uTime)) { hit = true; break; }
       t += stepL;
     }
     if (hit) {
@@ -234,66 +259,88 @@ void main() {
       for (int i = 0; i < 6; i++) {
         float tm = (tLo + tHi) * 0.5;
         vec3 Q = ro + rd * tm;
-        if (Q.y < waveHeight(Q.xz)) tHi = tm; else tLo = tm;
+        if (Q.y < waveHeight(Q.xz, uTime)) tHi = tm; else tLo = tm;
       }
       t = (tLo + tHi) * 0.5;
       vec3 P = ro + rd * t;
-      vec3 N = surfaceNormal(P.xz);
-
+      vec3 N = surfaceNormal(P.xz, uTime);
       vec3 V = -rd;
-      // Softer fresnel — the surface stays a mirror at grazing angles but
-      // lets the refracted world show through at most viewing angles.
-      float fres = 0.04 + 0.7 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
 
-      // Reflection — mostly sky at grazing angles.
+      // Schlick fresnel (n_water ≈ 1.34 → R0 ≈ 0.02). The distant sea is at a
+      // glancing angle → a near-perfect mirror; the water under the camera is
+      // steep → the refracted world shows through.
+      float fres = 0.02 + 0.98 * pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 5.0);
+
+      // ---- Reflection: mirror of the sky + sun path + facet glitter ----
       vec3 R = reflect(rd, N);
-      vec3 reflecCol = skyColor(R, L, sunCol, horizonCol, zenithCol);
+      vec3 refl = skyColor(R, L, uTime);
+      float rsd = max(dot(R, L), 0.0);
+      refl += sunCol * pow(rsd, 48.0) * 0.55;   // broad silvery sun path
       vec3 H = normalize(L + V);
-      reflecCol += sunCol * pow(max(dot(N, H), 0.0), 220.0) * 0.5;
+      float ndh = max(dot(N, H), 0.0);
+      float glint = pow(ndh, 340.0);
+      // Sparkle breakup so the glint shimmers along the wave field instead of
+      // sitting as one static blob.
+      float spark = fbmN(P.xz * 7.0 + vec2(uTime * 0.35, uTime * 0.27), 3);
+      refl += sunCol * glint * (0.5 + 1.6 * spark);
 
-      vec3 waterCol = reflecCol;
-      // Snell refraction into the water (air → water, 1/1.33).
+      // ---- Refraction into the water body ----
+      vec3 waterCol = vec3(0.05, 0.12, 0.18);
       vec3 T = refract(rd, N, 0.7519);
       if (T.y < -0.001) {
-        float tDeep = min((P.y + 24.0) / (-T.y), 70.0);
+        float tDeep = min((P.y + 26.0) / (-T.y), 80.0);
         // Parallax-sample the underwater scene where the ray lands.
         vec3 seabed = P + T * tDeep;
         vec4 clip = uProj * (uView * vec4(seabed, 1.0));
         vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
         vec3 under = texture2D(uUnderTex, clamp(uv, 0.0, 1.0)).rgb;
-        // Spectral absorption along the path (red is eaten fastest), but the
-        // depth never crushes to black — residual light scatters to a mid-blue.
-        vec3 sigma = vec3(0.11, 0.05, 0.024);
+        // Spectral absorption (red is eaten fastest); residual light scatters
+        // to a rich palette-driven deep blue rather than crushing to black.
+        vec3 sigma = vec3(0.10, 0.042, 0.02);
         vec3 absorb = exp(-sigma * tDeep);
-        vec3 scatter = mix(uColorB, uColorA, 0.5) * 0.4;
-        float absorbA = dot(absorb, vec3(0.299, 0.587, 0.114));
-        waterCol = under * absorb + scatter * (1.0 - absorbA);
+        vec3 deep = mix(uColorB, uColorA, 0.55) * 0.55;
+        float absorbLum = dot(absorb, vec3(0.299, 0.587, 0.114));
+        waterCol = under * absorb + deep * (1.0 - absorbLum);
+        // Sunlit water column: bright turquoise near the surface.
+        float surfaceGlow = exp(-tDeep * 0.16);
+        waterCol += mix(uColorA, vec3(1.0, 0.9, 0.7), 0.4) * surfaceGlow * 0.18;
         // Volumetric god rays down the refracted ray, slanted with the sun.
-        // The per-step factor is a small constant (not march-length-scaled) so
-        // the shafts read as soft shimmer instead of blowing out to white.
-        float stepD = tDeep / 18.0;
-        for (int i = 0; i < 18; i++) {
+        float stepD = tDeep / 20.0;
+        for (int i = 0; i < 20; i++) {
           float tp = (float(i) + 0.5) * stepD;
           vec3 Q = P + T * tp;
-          vec2 Sxz = Q.xz - (L.xz / L.y) * Q.y; // surface entry of this light
-          float cau = causticAt(Sxz);
+          vec2 Sxz = Q.xz - (L.xz / max(L.y, 0.001)) * Q.y; // surface entry of this light
+          float cau = causticAt(Sxz, uTime);
           float occl = whaleShadow(Q, uWhalePos, 5.0, L);
-          vec3 downAtten = exp(-sigma * tp * 0.55);
-          float shaft = cau * occl * exp(-tp * 0.045);
-          waterCol += downAtten * sunCol * shaft * 0.02;
+          vec3 downAtten = exp(-sigma * tp * 0.5);
+          float shaft = cau * occl * exp(-tp * 0.05);
+          waterCol += downAtten * sunCol * shaft * 0.035;
         }
       }
-      col = mix(waterCol, reflecCol, clamp(fres * 0.8, 0.0, 1.0));
+
+      // Compose: reflection wins at grazing, refraction at steep angles.
+      col = mix(waterCol, refl, clamp(fres, 0.05, 1.0));
+
+      // ---- Whitecap foam: steep slopes + crests break up the mirror ----
+      float slope = (1.0 - N.y) / max(N.y, 0.02);
+      float foam = smoothstep(2.6, 4.2, slope) * 0.6
+                 + smoothstep(0.85, 1.6, waveHeight(P.xz, uTime)) * 0.5;
+      foam = clamp(foam, 0.0, 1.0);
+      col = mix(col, vec3(0.92, 0.97, 1.0), foam * 0.55);
     }
   }
-  // Soft exponential rolloff — compresses highlights so the water never clips
-  // to pure white, while a touch of exposure lifts the dark end.
-  col = 1.0 - exp(-col * 1.3);
+
+  // ---- Grade: gentle corner shading + filmic rolloff + saturation lift ----
+  // Only the far corners are dimmed a touch — the sea stays bright edge-to-edge.
+  col *= 1.0 - 0.10 * smoothstep(1.25, 2.0, length(vigUv));
+  col = 1.0 - exp(-col * 1.5);
+  float lum = dot(col, vec3(0.299, 0.587, 0.114));
+  col = mix(vec3(lum), col, 1.18);
   gl_FragColor = vec4(col, 1.0);
 }
 `;
 
-// ── Blit: upscale the half-res ocean pass to the screen ────────────────────
+// ── Blit: upscale the ocean pass to the screen ─────────────────────────────
 const BLIT_FRAG = `
 uniform sampler2D uOceanTex;
 varying vec2 vUv;
@@ -391,8 +438,10 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
       uTanHalfFovY: { value: Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) },
       uAspect: { value: camera.aspect },
     };
+    // Sun direction — kept ahead of the camera each frame (see animate).
+    const sunDir = { value: new THREE.Vector3(0.35, 0.32, -0.89) };
 
-    // ── Render targets: underwater (full-res), ocean pass (half-res) ──────
+    // ── Render targets: underwater (full-res), ocean pass (near-full-res) ──
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     let rtW = Math.floor(window.innerWidth * dpr);
     let rtH = Math.floor(window.innerHeight * dpr);
@@ -401,7 +450,7 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
       magFilter: THREE.LinearFilter,
       format: THREE.RGBAFormat,
     });
-    const oceanRT = new THREE.WebGLRenderTarget(Math.floor(rtW * 0.75), Math.floor(rtH * 0.75), {
+    const oceanRT = new THREE.WebGLRenderTarget(Math.floor(rtW * 0.85), Math.floor(rtH * 0.85), {
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
       format: THREE.RGBAFormat,
@@ -423,6 +472,7 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
         uColorB: colB,
         uColorC: colC,
         uColorD: colD,
+        uSunDir: sunDir,
         uWhalePos: { value: new THREE.Vector3(30, -9, -40) },
         uUnderTex: { value: underRT.texture },
       },
@@ -467,12 +517,12 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
     const whale = new THREE.Group();
     const whaleBody = new THREE.Mesh(
       new THREE.SphereGeometry(1.6, 10, 8),
-      new THREE.MeshBasicMaterial({ color: 0x071019 }),
+      new THREE.MeshBasicMaterial({ color: 0x0b2438 }),
     );
     whaleBody.scale.set(1.8, 0.85, 0.6);
     const whaleTail = new THREE.Mesh(
       new THREE.ConeGeometry(0.55, 1.8, 4),
-      new THREE.MeshBasicMaterial({ color: 0x071019 }),
+      new THREE.MeshBasicMaterial({ color: 0x0b2438 }),
     );
     whaleTail.position.set(0, 0, -1.7);
     whaleTail.rotation.x = Math.PI / 2;
@@ -505,6 +555,38 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
     });
     const snow = new THREE.Points(snowGeo, snowMat);
     underScene.add(snow);
+
+    // ── Glittering fish shoal (drifting school of bright specks) ──────────
+    const FISH = 240;
+    const fishBase = new Float32Array(FISH * 3);
+    const fishPos = new Float32Array(FISH * 3);
+    const fishSeed = new Float32Array(FISH);
+    for (let i = 0; i < FISH; i++) {
+      const th = Math.random() * Math.PI * 2;
+      const ph = Math.acos(2 * Math.random() - 1);
+      const r = 0.6 + Math.pow(Math.random(), 0.5) * 2.6;
+      fishBase[i * 3] = Math.sin(ph) * Math.cos(th) * r;
+      fishBase[i * 3 + 1] = Math.cos(ph) * r * 0.35;
+      fishBase[i * 3 + 2] = Math.sin(ph) * Math.sin(th) * r;
+      fishSeed[i] = Math.random() * 100;
+      fishPos[i * 3] = fishBase[i * 3] + 8;
+      fishPos[i * 3 + 1] = fishBase[i * 3 + 1] - 8;
+      fishPos[i * 3 + 2] = fishBase[i * 3 + 2] - 18;
+    }
+    const fishGeo = new THREE.BufferGeometry();
+    fishGeo.setAttribute("position", new THREE.BufferAttribute(fishPos, 3));
+    const fishMat = new THREE.PointsMaterial({
+      color: 0xbfefff,
+      size: 0.22,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      sizeAttenuation: true,
+    });
+    const fish = new THREE.Points(fishGeo, fishMat);
+    underScene.add(fish);
+    const schoolCenter = new THREE.Vector3(8, -8, -18);
 
     // ── Bioluminescent bursts (underwater) ────────────────────────────────
     const glowTex = new THREE.CanvasTexture(makeGlowTexture());
@@ -655,7 +737,7 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
       rtW = Math.floor(window.innerWidth * dpr);
       rtH = Math.floor(window.innerHeight * dpr);
       underRT.setSize(rtW, rtH);
-      oceanRT.setSize(Math.floor(rtW * 0.75), Math.floor(rtH * 0.75));
+      oceanRT.setSize(Math.floor(rtW * 0.85), Math.floor(rtH * 0.85));
       renderer.setSize(window.innerWidth, window.innerHeight);
     };
     window.addEventListener("pointerdown", onPointerDown);
@@ -720,6 +802,16 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
       camU.uCamUp.value.copy(_up);
       camU.uCamForward.value.copy(_fwd);
 
+      // Keep the sun ahead of the camera at a fixed elevation, offset to one
+      // side so the glitter path runs diagonally across the sea.
+      const sunAz = Math.atan2(_fwd.x, _fwd.z) + 0.35;
+      const sunEl = 0.30;
+      sunDir.value.set(
+        Math.sin(sunAz) * Math.cos(sunEl),
+        Math.sin(sunEl),
+        Math.cos(sunAz) * Math.cos(sunEl),
+      );
+
       oceanMat.uniforms.uTime.value = t;
       seabedMat.uniforms.uTime.value = t;
 
@@ -731,6 +823,22 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
         if (whale.position.x < -60) whale.position.set(32, -8, -35);
       }
       oceanMat.uniforms.uWhalePos.value.copy(whale.position);
+
+      // Glittering shoal glides along a sinuous path.
+      schoolCenter.x = 8 + Math.sin(t * 0.11) * 14;
+      schoolCenter.y = -8 + Math.sin(t * 0.21) * 1.5;
+      schoolCenter.z = -18 + Math.cos(t * 0.08) * 8;
+      const fp = fish.geometry.getAttribute("position") as THREE.BufferAttribute;
+      for (let i = 0; i < FISH; i++) {
+        const wob = Math.sin(t * 1.3 + fishSeed[i]) * 0.6;
+        fp.setXYZ(
+          i,
+          schoolCenter.x + fishBase[i * 3] + wob,
+          schoolCenter.y + fishBase[i * 3 + 1] + Math.sin(t * 1.7 + fishSeed[i] * 1.7) * 0.35,
+          schoolCenter.z + fishBase[i * 3 + 2],
+        );
+      }
+      fp.needsUpdate = true;
 
       // Marine snow sinks and wraps.
       const sp = snow.geometry.getAttribute("position") as THREE.BufferAttribute;
@@ -783,7 +891,7 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
 
       if (!reduced) updateAmbient(dt);
 
-      // Pipeline: underwater scene → rt, ocean ray-march → half-res rt,
+      // Pipeline: underwater scene → rt, ocean ray-march → rt,
       // blit to screen, then surface overlays.
       renderer.setRenderTarget(underRT);
       renderer.clear();
@@ -827,6 +935,8 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
           else if (mat) mat.dispose();
         });
       });
+      fishGeo.dispose();
+      fishMat.dispose();
       underRT.dispose();
       oceanRT.dispose();
       disposables.forEach((t2) => t2.dispose());
