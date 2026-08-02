@@ -3,10 +3,21 @@
 // ── Aurora Borealis — the northern-lights world for "aurora-borealis" ─────
 //
 // Self-contained WebGL background modeled on CosmosWebGL.tsx's skeleton. Scene:
-// undulating fbm aurora curtains overhead, a dark low-poly mountain ridge,
-// sparse twinkling stars, occasional shooting stars, and a click-triggered
-// brightness wave that ripples across the curtains. Colors read live from
-// --palette-* so the PaletteEditor retunes the lights in real time.
+// high-poly aurora curtains overhead, a dark low-poly mountain ridge, sparse
+// twinkling stars, occasional shooting stars, and a click-triggered brightness
+// wave that ripples across the curtains.
+//
+// The curtains are no longer flat painted planes. Each is a genuinely
+// high-poly sheet (~8k vertices) whose vertex shader displaces every vertex
+// along the sheet normal with real curtain physics (multi-octave fold drapes
+// with a field-line lean, a Gaussian-windowed travelling undulation "surf"
+// packet, and a click-ripple bulge). The fragment shader then ray-marches a
+// thin emitting volume along the line of sight: the march window scales with
+// view angle (edge-on rays integrate a long path through the sheet → real
+// edge-on brightening and fold self-shadowing), and each sample re-evaluates
+// the same displacement field so the folds genuinely occlude each other.
+// Colors read live from --palette-* so the PaletteEditor retunes the lights
+// in real time.
 
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
@@ -14,29 +25,24 @@ import { supportsWebGL } from "./webglSupport";
 import { readPaletteColors, makePalettePoller } from "./worldUtils";
 import { emitCosmosEvent } from "./cosmosEvents";
 
-// ── Aurora curtain shader: layered noise folds + click ripple ─────────────
-const CURTAIN_VERT = `
-varying vec2 vUv;
-varying vec3 vWorld;
-void main() {
-  vUv = uv;
-  vec4 wp = modelMatrix * vec4(position, 1.0);
-  vWorld = wp.xyz;
-  gl_Position = projectionMatrix * viewMatrix * wp;
-}
-`;
+// ── Curtain physics / ray-march tuning ─────────────────────────────────────
+// Kept at the top of scope so they can be tuned in place without touching
+// shader strings (same pattern as OceanWebGL's wave constants).
+const FOLD_AMP = 13; // geometric fold drape depth (world units)
+const FOLD_FREQ = 0.055; // folds per world unit along the curtain length
+const LEAN = 0.32; // field-line tilt: horizontal shear per unit of altitude
+const SURF_AMP = 4.2; // travelling undulation packet amplitude
+const RIPPLE_AMP = 5.0; // click-ripple bulge amplitude
+const THICKNESS = 1.25; // emitting sheet half-thickness (world units)
+const MARCH_STEPS = 28; // ray-march integration steps per pixel
+const CURTAIN_EMIT = 1.0; // radiance scale of the integrated emission
+const RAY_FREQ = 0.42; // vertical ray striation frequency
+const RAY_TILT = 1.3; // field-aligned lean of the ray striations
+const PULSE_COLOR = 0.45; // click-pulse colour boost
+const FLASH_AMT = 0.55; // whole-scene flash boost
 
-const CURTAIN_FRAG = `
-uniform float uTime;
-uniform vec3 uColorA;
-uniform vec3 uColorB;
-uniform vec3 uColorC;
-uniform vec3 uAccent;
-uniform float uPulse;
-uniform vec3 uPulseCenter;
-uniform float uFlash;
-varying vec2 vUv;
-varying vec3 vWorld;
+// Shared noise / fbm helpers (the project's established GLSL idiom).
+const NOISE_GLSL = `
 float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float noise(vec2 x){
   vec2 i = floor(x); vec2 f = fract(x);
@@ -52,50 +58,183 @@ float fbm(vec2 p){
   for (int i = 0; i < 5; i++) { v += a * noise(p); p *= 2.1; a *= 0.5; }
   return v;
 }
+`;
+
+// The sheet's displacement field, evaluated at a local (s, v, u) where
+// s = length along the curtain (world units), v = mesh-local altitude
+// (world units, -halfH..halfH), u = normalized altitude (0 bottom, 1 top).
+// Returns the three components (fold, surf, ripple); the actual sheet offset
+// is (fold-0.5)*FOLD_AMP + surf*SURF_AMP + ripple*RIPPLE_AMP. Both shaders
+// evaluate the exact same function so the fragment march integrates through
+// the same geometry the vertex shader draws.
+const CURTAIN_FIELD = `
+uniform float uTime;
+uniform float uPulse;
+uniform vec3 uPulseCenter;
+uniform vec3 uOrigin;
+uniform vec3 uAxisX;
+uniform vec3 uAxisY;
+uniform float uHalfH;
+
+vec3 sheetComps(float s, float v, float u){
+  // Multi-octave fold drapes, sheared off-vertical by the magnetic dip so the
+  // curtain leans like a real field-aligned auroral arc.
+  float fold = fbm(vec2((s - v * LEAN) * FOLD_FREQ + uTime * 0.12, u * 1.2 + uTime * 0.05));
+  // Travelling undulation: a Gaussian-windowed sine packet gliding along the
+  // curtain — the "waves of light running along the aurora" motion.
+  float w = (s * 0.13 - uTime * 1.1) * 0.16;
+  float pack = exp(-w * w);
+  float surf = sin(s * 0.42 - uTime * 2.8) * pack;
+  // Click-ripple bulge: a radial displacement wave through the sheet.
+  vec2 pc = vec2(dot(uPulseCenter - uOrigin, uAxisX),
+                 dot(uPulseCenter - uOrigin, uAxisY) / (2.0 * uHalfH) + 0.5);
+  vec2 dpc = vec2(s - pc.x, (u - pc.y) * 2.0 * uHalfH);
+  float ripple = exp(-dot(dpc, dpc) * 0.02) * uPulse;
+  return vec3(fold, surf, ripple);
+}
+float sheetZ(vec3 comps){
+  return (comps.x - 0.5) * FOLD_AMP + comps.y * SURF_AMP + comps.z * RIPPLE_AMP;
+}
+`;
+
+// ── Vertex shader = real curtain physics ──────────────────────────────────
+// Displace every vertex along the sheet's own z, compute the perturbed normal
+// via finite differences of the same field (the deep-space disk's pattern),
+// and hand the fragment its world position, world normal, and local (s, u).
+const CURTAIN_VERT = `
+#define FOLD_AMP ${FOLD_AMP.toFixed(2)}
+#define FOLD_FREQ ${FOLD_FREQ.toFixed(4)}
+#define SURF_AMP ${SURF_AMP.toFixed(2)}
+#define RIPPLE_AMP ${RIPPLE_AMP.toFixed(2)}
+#define LEAN ${LEAN.toFixed(3)}
+${NOISE_GLSL}
+${CURTAIN_FIELD}
+varying vec3 vWorld;
+varying vec3 vNormal;
+varying float vS;
+varying float vU;
 void main() {
-  float v = vUv.y;
+  float s = position.x;
+  float v = position.y;
+  float u = uv.y;
+  float z = sheetZ(sheetComps(s, v, u));
+  // Finite-difference normal of the same field (out-of-plane z only).
+  float eps = 0.4;
+  float zx = sheetZ(sheetComps(s + eps, v, u));
+  float zy = sheetZ(sheetComps(s, v + eps, u));
+  vec3 nLocal = normalize(vec3(-(zx - z) / eps, -(zy - z) / eps, 1.0));
+  vec3 worldPos = (modelMatrix * vec4(position.x, position.y, z, 1.0)).xyz;
+  vWorld = worldPos;
+  vNormal = normalize(mat3(modelMatrix) * nLocal);
+  vS = s;
+  vU = u;
+  gl_Position = projectionMatrix * viewMatrix * vec4(worldPos, 1.0);
+}
+`;
 
-  // Curtain drapery — drifting fbm folds blended with a travelling wave.
-  float fold = clamp(fbm(vec2(vUv.x * 2.6 + uTime * 0.16, vUv.y * 1.3 + uTime * 0.05)), 0.0, 1.0);
-  float wavy = sin(vUv.x * 4.0 - uTime * 0.25) * 0.5 + 0.5;
-  float drape = clamp(fold * 0.75 + wavy * 0.25, 0.0, 1.0);
+// ── Fragment shader = ray trace the emitting sheet ────────────────────────
+// A bounded, jittered line-of-sight march through the thin curtain volume.
+// The march window scales with view angle: edge-on rays integrate a long path
+// through the sheet (real edge-on brightening); face-on rays cross it quickly.
+// Each sample re-evaluates the sheet's displaced z so the folds genuinely
+// shadow each other along the integration path.
+const CURTAIN_FRAG = `
+#define FOLD_AMP ${FOLD_AMP.toFixed(2)}
+#define FOLD_FREQ ${FOLD_FREQ.toFixed(4)}
+#define SURF_AMP ${SURF_AMP.toFixed(2)}
+#define RIPPLE_AMP ${RIPPLE_AMP.toFixed(2)}
+#define LEAN ${LEAN.toFixed(3)}
+#define THICKNESS ${THICKNESS.toFixed(2)}
+#define MARCH_STEPS ${MARCH_STEPS}
+#define CURTAIN_EMIT ${CURTAIN_EMIT.toFixed(2)}
+#define RAY_FREQ ${RAY_FREQ.toFixed(3)}
+#define RAY_TILT ${RAY_TILT.toFixed(2)}
+#define PULSE_COLOR ${PULSE_COLOR.toFixed(2)}
+#define FLASH_AMT ${FLASH_AMT.toFixed(2)}
+${NOISE_GLSL}
+${CURTAIN_FIELD}
+uniform vec3 uColorA;
+uniform vec3 uColorB;
+uniform vec3 uColorC;
+uniform vec3 uAccent;
+uniform float uFlash;
+uniform vec3 uAxisZ;
+varying vec3 vWorld;
+varying vec3 vNormal;
+varying float vS;
+varying float vU;
 
-  // Real-aurora colour ladder: bright green base -> teal -> cyan -> violet,
-  // with a rose/pink nitrogen fringe at the top of tall curtains.
-  float band = clamp(v * 0.85 + drape * 0.3 - 0.08, 0.0, 1.0);
+// Real-aurora colour ladder: bright green base -> teal -> cyan -> violet,
+// with a rose/pink nitrogen fringe at the top of tall curtains.
+vec3 auroraColor(float band) {
   vec3 col = uAccent;                                    // green base
   col = mix(col, uColorA, smoothstep(0.04, 0.42, band)); // teal
   col = mix(col, uColorB, smoothstep(0.35, 0.62, band)); // cyan
   col = mix(col, uColorC, smoothstep(0.6, 0.85, band));  // violet
   vec3 rose = mix(uColorC, vec3(0.9, 0.42, 0.62), 0.85);
   col = mix(col, rose, smoothstep(0.82, 1.0, band));     // pink fringe
+  return col;
+}
 
-  // Vertical auroral rays — bright striations that ebb and flow.
-  float rays = noise(vec2(vUv.x * 24.0 - uTime * 0.06, vUv.y * 4.0 + uTime * 0.03));
-  rays = rays * rays;
-  float rayEnv = 0.35 + 0.65 * fbm(vec2(vUv.x * 5.0 - uTime * 0.12, vUv.y * 2.5 + uTime * 0.06));
-  float rayMask = smoothstep(0.42, 0.9, rays * rayEnv);
-  col += uColorB * rayMask * 0.4;
-  col += rose * rayMask * 0.25;
+void main() {
+  vec3 rd = normalize(vWorld - cameraPosition);
+  // March window scales with view angle: edge-on (dot -> 0) integrates a long
+  // path through the sheet; face-on crosses it quickly.
+  float cosA = max(abs(dot(rd, normalize(vNormal))), 0.08);
+  float halfW = clamp(THICKNESS * 4.0 / cosA, 2.0, 40.0);
 
-  // Bright curtain base hugging the lower edge.
-  float baseGlow = exp(-v * 5.0) * (0.35 + 0.65 * drape);
+  // The fragment's own sheet reference: local (s, u) and displaced z.
+  float v0 = (vU - 0.5) * 2.0 * uHalfH;
+  vec3 comps0 = sheetComps(vS, v0, vU);
+  float refZ = sheetZ(comps0);
 
-  // Dissolve the top and bottom edges into the sky.
-  float vfade = smoothstep(0.0, 0.14, v) * smoothstep(1.0, 0.78, v);
+  float dl = 2.0 * halfW / float(MARCH_STEPS);
+  float jit = hash(gl_FragCoord.xy); // jitter kills banding along the march
+  vec3 base = vWorld - rd * halfW;
+  vec3 acc = vec3(0.0);
 
-  float alpha = (0.10 + 0.5 * drape + 0.45 * baseGlow + rayMask * 0.22) * vfade;
+  for (int i = 0; i < MARCH_STEPS; i++) {
+    float t = (float(i) + jit) * dl;
+    vec3 P = base + rd * t;
+    vec3 dP = P - uOrigin;
+    float sL = dot(dP, uAxisX);
+    float uL = dot(dP, uAxisY) / (2.0 * uHalfH) + 0.5;
+    float zL = dot(dP, uAxisZ);
+    if (uL < -0.05 || uL > 1.05) continue; // outside the curtain altitude
+    float vL = (uL - 0.5) * 2.0 * uHalfH;
 
-  // Click: a radial ripple from uPulseCenter plus a whole-scene flash.
-  vec2 d = vWorld.xz - uPulseCenter.xz;
-  float pd = dot(d, d);
-  float wave = exp(-pd * 0.004);
-  alpha += uPulse * (0.9 * wave + 0.35) * vfade;
-  col += uColorB * uPulse * wave * 0.45;
-  col += uAccent * uFlash * 0.55;
-  alpha += uFlash * 0.3 * vfade;
+    // Sheet density at this depth — measured against the sheet's own z at the
+    // sample's (s, u), so folds modulate the integration (self-shadowing).
+    vec3 comps = sheetComps(sL, vL, uL);
+    float zSheet = sheetZ(comps);
+    float q = (zL - zSheet) / THICKNESS;
+    float d = exp(-q * q);
+    if (d < 0.02) continue;
 
-  gl_FragColor = vec4(col, alpha);
+    // Vertical envelope: sharp lower border, fuzzy upper.
+    float env = smoothstep(0.0, 0.05, uL) * (1.0 - smoothstep(0.86, 1.0, uL));
+    if (env <= 0.0) continue;
+
+    // Vertical field-aligned rays + fold brightness.
+    float rays = noise(vec2(sL * RAY_FREQ + uL * RAY_TILT - uTime * 0.06, uL * 3.0 + uTime * 0.05));
+    rays *= rays;
+    float rayEnv = 0.4 + 0.6 * comps.x;
+    float bright = (0.4 + 1.1 * comps.x) * (0.45 + 1.1 * rays * rayEnv);
+
+    float band = clamp(uL * 0.95 + (comps.x - 0.5) * 0.35 + 0.05, 0.0, 1.0);
+    acc += auroraColor(band) * bright * env * d * dl * CURTAIN_EMIT;
+  }
+
+  // Click ripple + flash (kept outside the march, scaled by the fragment's
+  // own vertical envelope so it respects the curtain shape).
+  vec2 dw = vWorld.xz - uPulseCenter.xz;
+  float wave = exp(-dot(dw, dw) * 0.004);
+  float env0 = smoothstep(0.0, 0.05, vU) * (1.0 - smoothstep(0.86, 1.0, vU));
+  acc += uColorB * uPulse * wave * env0 * PULSE_COLOR;
+  acc += uAccent * uFlash * FLASH_AMT * env0;
+
+  // Additive output — the RGB *is* the radiance (alpha 1 adds it exactly).
+  gl_FragColor = vec4(acc, 1.0);
 }
 `;
 
@@ -177,38 +316,52 @@ export function AuroraWebGL({ className = "" }: { className?: string }) {
     // ── Aurora curtains ───────────────────────────────────────────────────
     let pulse = 0;
     const pulseCenter = new THREE.Vector3(0, 8, -20);
-    const curtainMat = new THREE.ShaderMaterial({
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      side: THREE.DoubleSide,
-      uniforms: {
-        uTime: { value: 0 },
-        uColorA: colA,
-        uColorB: colB,
-        uColorC: colC,
-        uAccent: colD,
-        uPulse: { value: 0 },
-        uPulseCenter: { value: pulseCenter },
-        uFlash: { value: 0 },
-      },
-      vertexShader: CURTAIN_VERT,
-      fragmentShader: CURTAIN_FRAG,
-    });
-    // Six curtain planes spread across the width so auroras fill the whole
-    // sky rather than a single central ribbon — near/mid/far layers for depth.
+    // Shared uniform values (same objects across every curtain material, so
+    // updating one updates all).
+    const sharedU = {
+      uTime: { value: 0 },
+      uColorA: colA,
+      uColorB: colB,
+      uColorC: colC,
+      uAccent: colD,
+      uPulse: { value: 0 },
+      uPulseCenter: { value: pulseCenter },
+      uFlash: { value: 0 },
+    };
+    // Four wide high-poly curtains (PlaneGeometry w×h, 192×40 segments ≈ 8k
+    // vertices each) — near/mid/far bands spread across the sky for depth.
+    // Each has its own material carrying its local frame (origin + basis axes
+    // + half-height) so the fragment march can map world points back to the
+    // curtain's (s, u, z) frame.
     const curtainCfg = [
-      { x: -48, y: 13, z: -46, ry: 0.45, w: 56, h: 28 },
-      { x: -26, y: 15, z: -52, ry: -0.4, w: 60, h: 32 },
-      { x: -8, y: 12, z: -26, ry: 0.1, w: 48, h: 26 },
-      { x: 12, y: 17, z: -44, ry: -0.28, w: 62, h: 34 },
-      { x: 32, y: 14, z: -34, ry: 0.38, w: 54, h: 29 },
-      { x: 52, y: 16, z: -50, ry: -0.48, w: 58, h: 31 },
+      { x: -44, y: 15, z: -52, ry: 0.5, w: 92, h: 34 },
+      { x: -8, y: 12, z: -28, ry: 0.06, w: 76, h: 27 },
+      { x: 24, y: 16, z: -48, ry: -0.32, w: 88, h: 33 },
+      { x: 54, y: 14, z: -38, ry: 0.42, w: 80, h: 30 },
     ];
+    const curtainMats: THREE.ShaderMaterial[] = [];
     for (const cfg of curtainCfg) {
-      const m = new THREE.Mesh(new THREE.PlaneGeometry(cfg.w, cfg.h), curtainMat);
+      const ry = cfg.ry;
+      const mat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+        uniforms: {
+          ...sharedU,
+          uOrigin: { value: new THREE.Vector3(cfg.x, cfg.y, cfg.z) },
+          uAxisX: { value: new THREE.Vector3(Math.cos(ry), 0, -Math.sin(ry)) },
+          uAxisY: { value: new THREE.Vector3(0, 1, 0) },
+          uAxisZ: { value: new THREE.Vector3(Math.sin(ry), 0, Math.cos(ry)) },
+          uHalfH: { value: cfg.h / 2 },
+        },
+        vertexShader: CURTAIN_VERT,
+        fragmentShader: CURTAIN_FRAG,
+      });
+      curtainMats.push(mat);
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(cfg.w, cfg.h, 192, 40), mat);
       m.position.set(cfg.x, cfg.y, cfg.z);
-      m.rotation.y = cfg.ry;
+      m.rotation.y = ry;
       m.renderOrder = 2;
       scene.add(m);
     }
@@ -450,9 +603,11 @@ export function AuroraWebGL({ className = "" }: { className?: string }) {
       );
       camera.lookAt(orbit.target);
 
-      curtainMat.uniforms.uTime.value = t;
-      curtainMat.uniforms.uPulse.value = pulse;
-      curtainMat.uniforms.uFlash.value = flash;
+      for (const mat of curtainMats) {
+        mat.uniforms.uTime.value = t;
+        mat.uniforms.uPulse.value = pulse;
+        mat.uniforms.uFlash.value = flash;
+      }
       starMat.opacity = 0.6 + 0.2 * Math.sin(t * 0.7);
 
       // Shooting stars.

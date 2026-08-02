@@ -8,12 +8,21 @@
 // and emit a signature event on guarded click so PaletteEventSync tints the
 // chrome.
 //
-// Scene: a glowing perspective grid scrolling toward the camera, a striped
-// retro-synthwave sun on the horizon, dark tower silhouettes flanking a
-// central avenue, neon pylons, floating wireframe holograms, rising data
-// motes, and click-spawned shockwave rings. Colors are read live from the
-// palette's --palette-* CSS vars (no fixed colors) so the in-app
-// PaletteEditor retunes the city in real time.
+// Scene: a glossy wet street under a glowing perspective grid that scrolls
+// toward the camera, a striped retro-synthwave sun on the horizon, dark tower
+// silhouettes flanking a central avenue, neon pylons, floating wireframe
+// holograms, rising data motes, and click-spawned shockwave rings. Colors are
+// read live from the palette's --palette-* CSS vars (no fixed colors) so the
+// in-app PaletteEditor retunes the city in real time.
+//
+// Ray tracing: the street is a real planar mirror. Each frame the city is
+// rendered a second time into a color render target from a camera reflected
+// across the y=0 street plane (the standard three.js planar-mirror technique,
+// plumbed like OceanWebGL.tsx's render-target pipeline). The floor mesh then
+// samples that target — every reflected ray traced exactly — with a fresnel
+// + wet-street falloff, a soft glossy blur, and the neon grid composited on
+// top so the scene reads as a wet synthwave boulevard rather than a flat
+// printed grid.
 
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
@@ -28,8 +37,17 @@ interface Ring {
   maxLife: number;
 }
 
-// ── Grid floor shader ──────────────────────────────────────────────────────
-const GRID_VERT = `
+// ── Glossy mirror-floor tuning ───────────────────────────────────────────
+const MIRROR_RT_SCALE = 0.75;   // reflection render-target resolution factor
+const FLOOR_FRESNEL_POW = 3.5;  // higher = reflections hug the horizon tighter
+const FLOOR_WET_GROWTH = 0.14;  // per-unit reflection growth with distance
+const FLOOR_GLOSS_TEXELS = 2.5; // glossy blur radius (in reflection texels)
+const FLOOR_GRID_ALPHA = 0.9;   // neon grid brightness over the mirror
+const TOWER_RIM_POW = 3.0;      // tower "glass" rim falloff
+const TOWER_RIM_BOOST = 0.85;   // tower rim brightness
+
+// ── Glossy mirror street shader ──────────────────────────────────────────
+const FLOOR_VERT = `
 varying vec3 vWorld;
 void main() {
   vec4 wp = modelMatrix * vec4(position, 1.0);
@@ -38,30 +56,128 @@ void main() {
 }
 `;
 
-const GRID_FRAG = `
+const FLOOR_FRAG = `
+#define FLOOR_GLOSS ${FLOOR_GLOSS_TEXELS.toFixed(2)}
+#define FLOOR_FRESNEL ${FLOOR_FRESNEL_POW.toFixed(2)}
+#define FLOOR_WET ${FLOOR_WET_GROWTH.toFixed(3)}
+#define FLOOR_GRID ${FLOOR_GRID_ALPHA.toFixed(2)}
 uniform float uTime;
+uniform vec3 uCamPos;
+uniform mat4 uProj;
+uniform mat4 uMirrorView;
+uniform sampler2D uCityTex;
+uniform vec2 uTexelSize;
 uniform vec3 uColorA;
 uniform vec3 uColorB;
+uniform vec3 uColorC;
 varying vec3 vWorld;
+
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float noise(vec2 x){
+  vec2 i = floor(x); vec2 f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
+             mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+
+// Sample the reflected city with a soft glossy blur (4 taps + centre).
+vec3 sampleReflection(vec2 uv) {
+  vec2 o = FLOOR_GLOSS * uTexelSize;
+  vec3 c  = texture2D(uCityTex, clamp(uv, 0.002, 0.998)).rgb;
+  c += texture2D(uCityTex, clamp(uv + vec2(o.x, 0.0), 0.002, 0.998)).rgb;
+  c += texture2D(uCityTex, clamp(uv - vec2(o.x, 0.0), 0.002, 0.998)).rgb;
+  c += texture2D(uCityTex, clamp(uv + vec2(0.0, o.y), 0.002, 0.998)).rgb;
+  c += texture2D(uCityTex, clamp(uv - vec2(0.0, o.y), 0.002, 0.998)).rgb;
+  return c * (1.0 / 5.0);
+}
+
 void main() {
+  // Perspective-correct planar reflection: where this street fragment lands
+  // in the mirrored camera's view of the city.
+  vec4 clip = uProj * (uMirrorView * vec4(vWorld, 1.0));
+  vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+  bool inMirror = clip.w > 0.01 && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+
+  // Distance + horizon fade (port of the original grid fade) — the street
+  // melts into the sky near the horizon.
+  float d = distance(vWorld, vec3(uCamPos.x, 0.0, uCamPos.z));
+  float fade = 1.0 - smoothstep(8.0, 68.0, d);
+  float horizon = smoothstep(-55.0, -95.0, vWorld.z);
+  float skyMask = 1.0 - horizon;
+
+  // Scrolling neon grid (port of the original GRID_FRAG) laid over the mirror.
   float t = uTime * 3.0;
-  vec3 wz = vWorld + vec3(0.0, 0.0, t);        // grid scrolls toward the camera
-  // Minor lines every 2 units
+  vec3 wz = vWorld + vec3(0.0, 0.0, t);
   float dx = abs(fract(wz.x / 2.0) - 0.5) * 2.0;
   float dz = abs(fract(wz.z / 2.0) - 0.5) * 2.0;
   float minor = smoothstep(0.10, 0.0, min(dx, dz));
-  // Major lines every 10 units, brighter
   float sx = abs(fract(wz.x / 10.0) - 0.5) * 10.0;
   float sz = abs(fract(wz.z / 10.0) - 0.5) * 10.0;
   float major = smoothstep(0.4, 0.0, min(sx, sz));
   float line = max(minor, major * 1.5);
-  // Fade with distance from the camera and into the horizon.
-  float d = distance(vWorld, vec3(cameraPosition.x, 0.0, cameraPosition.z));
-  float fade = 1.0 - smoothstep(8.0, 68.0, d);
-  float horizon = smoothstep(-55.0, -95.0, vWorld.z);
-  float intensity = line * fade * (1.0 - horizon);
-  vec3 col = mix(uColorA, uColorB, 0.5 + 0.5 * sin(vWorld.x * 0.05 + uTime * 0.7));
-  gl_FragColor = vec4(col, intensity * 0.9);
+  float gridI = line * fade * skyMask;
+  vec3 gridCol = mix(uColorA, uColorC, 0.5 + 0.5 * sin(vWorld.x * 0.05 + uTime * 0.7));
+
+  // Ray-traced reflection of the city on the glossy asphalt.
+  vec3 refl = vec3(0.0);
+  if (inMirror && fade > 0.001) {
+    refl = sampleReflection(uv);
+    // Fresnel: grazing angles (the horizon) reflect the most, the street
+    // under the camera is a flat dark gloss.
+    vec3 viewDir = normalize(uCamPos - vWorld);
+    float fres = 0.04 + 0.96 * pow(1.0 - max(dot(viewDir, vec3(0.0, 1.0, 0.0)), 0.0), FLOOR_FRESNEL);
+    // Wet-street growth: the mirror image reads in the mid-field and out.
+    float wet = 1.0 - exp(-d * FLOOR_WET);
+    refl *= fres * wet;
+  }
+
+  // Dark glossy asphalt where the reflection is weak.
+  vec3 asphalt = vec3(0.045, 0.05, 0.09) * skyMask;
+  vec3 col = asphalt + refl + gridCol * gridI * FLOOR_GRID;
+
+  // Melt into the sky/fog colour at the horizon (matches the clear colour
+  // 0x05060c so the street and sky meet seamlessly).
+  vec3 fogCol = vec3(0.02, 0.024, 0.047);
+  col = mix(col, fogCol, horizon);
+
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+// ── Glossy black-glass tower shader (fresnel neon rim) ─────────────────────
+const TOWER_VERT = `
+varying vec3 vWNormal;
+varying vec3 vWorld;
+void main() {
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  #ifdef USE_INSTANCING
+    wp = modelMatrix * instanceMatrix * vec4(position, 1.0);
+  #endif
+  vWorld = wp.xyz;
+  // Towers are axis-aligned boxes scaled only on Y, so the object-space
+  // normal is already the world normal (mat3(modelMatrix) is identity).
+  vWNormal = normalize(mat3(modelMatrix) * normal);
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}
+`;
+
+const TOWER_FRAG = `
+#define TOWER_RIM ${TOWER_RIM_POW.toFixed(2)}
+#define TOWER_RIMB ${TOWER_RIM_BOOST.toFixed(2)}
+uniform vec3 uColorA;
+uniform vec3 uColorD;
+varying vec3 vWNormal;
+varying vec3 vWorld;
+void main() {
+  vec3 N = normalize(vWNormal);
+  vec3 V = normalize(cameraPosition - vWorld);
+  float fres = pow(1.0 - abs(dot(N, V)), TOWER_RIM);
+  vec3 base = vec3(0.02, 0.025, 0.04);           // near-black glass
+  vec3 rim = mix(uColorA, uColorD, 0.5) * fres * TOWER_RIMB;
+  // A faint top sheen so the slabs read as lit glass, not flat black.
+  float top = smoothstep(-0.2, 0.9, N.y);
+  rim += uColorA * top * 0.05;
+  gl_FragColor = vec4(base + rim, 1.0);
 }
 `;
 
@@ -138,22 +254,53 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
     applyColors(readPaletteColors());
     const poll = makePalettePoller(400, applyColors);
 
-    // ── Grid floor ────────────────────────────────────────────────────────
-    const gridMat = new THREE.ShaderMaterial({
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
+    // ── Mirrored camera + reflection render target ────────────────────────
+    const mirrorCam = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      300,
+    );
+    // We set matrixWorld + matrixWorldInverse by hand each frame (reflected
+    // across the street). Stop the renderer from recomposing them from the
+    // camera's own identity position/quaternion, which would break the mirror.
+    mirrorCam.matrixWorldAutoUpdate = false;
+    const reflMatrix = new THREE.Matrix4().makeScale(1, -1, 1); // across y=0
+    const _reflM = new THREE.Matrix4();
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let rtW = Math.floor(window.innerWidth * dpr);
+    let rtH = Math.floor(window.innerHeight * dpr);
+    const cityRT = new THREE.WebGLRenderTarget(
+      Math.floor(rtW * MIRROR_RT_SCALE),
+      Math.floor(rtH * MIRROR_RT_SCALE),
+      {
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        format: THREE.RGBAFormat,
+      },
+    );
+
+    // ── Glossy mirror street (replaces the old flat grid plane) ───────────
+    const floorMat = new THREE.ShaderMaterial({
       uniforms: {
         uTime: { value: 0 },
+        uCamPos: { value: new THREE.Vector3() },
+        uProj: { value: camera.projectionMatrix.clone() },
+        uMirrorView: { value: new THREE.Matrix4() },
+        uCityTex: { value: cityRT.texture },
+        uTexelSize: { value: new THREE.Vector2(1 / cityRT.width, 1 / cityRT.height) },
         uColorA: colA,
-        uColorB: colC,
+        uColorB: colB,
+        uColorC: colC,
       },
-      vertexShader: GRID_VERT,
-      fragmentShader: GRID_FRAG,
+      vertexShader: FLOOR_VERT,
+      fragmentShader: FLOOR_FRAG,
+      side: THREE.DoubleSide,
     });
-    const grid = new THREE.Mesh(new THREE.PlaneGeometry(240, 240, 1, 1), gridMat);
-    grid.rotation.x = -Math.PI / 2;
-    scene.add(grid);
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(300, 300, 1, 1), floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    scene.add(floor);
 
     // ── Retro sun + halo ──────────────────────────────────────────────────
     const sunTex = new THREE.CanvasTexture(makeSunTexture());
@@ -185,9 +332,17 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
     halo.position.set(0, 7, -75);
     scene.add(halo);
 
-    // ── Tower silhouettes (instanced) ─────────────────────────────────────
+    // ── Tower silhouettes (instanced, now glossy black glass) ─────────────
     const towerGeo = new THREE.BoxGeometry(1.6, 1, 1.6);
-    const towerMat = new THREE.MeshBasicMaterial({ color: 0x04060c });
+    const towerMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uColorA: colA,
+        uColorD: colD,
+      },
+      vertexShader: TOWER_VERT,
+      fragmentShader: TOWER_FRAG,
+      side: THREE.DoubleSide,
+    });
     const towers = new THREE.InstancedMesh(towerGeo, towerMat, 48);
     const dummy = new THREE.Object3D();
     for (let i = 0; i < 48; i++) {
@@ -214,6 +369,7 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
         opacity: 0.8,
         depthWrite: false,
         blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
       });
       const m = new THREE.Mesh(pylonGeo, mat);
       m.position.set(side * 3.5, 8, -12 - i * 5);
@@ -237,6 +393,7 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
         opacity: 0.7,
         depthWrite: false,
         blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
       });
       const m = new THREE.Mesh(geo, mat);
       m.position.set((i - 1) * 14, 9 + i * 2.5, -22 - i * 14);
@@ -244,7 +401,7 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
       holos.push(m);
     }
 
-    // ── Rising data motes ─────────────────────────────────────────────────
+    // ── Rising data motes (above the street so the mirror doesn't hide them)
     const MOTES = 220;
     const motePos = new Float32Array(MOTES * 3);
     const moteCol = new Float32Array(MOTES * 3);
@@ -252,7 +409,7 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
     const moteTints = [colA.value, colC.value, colD.value];
     for (let i = 0; i < MOTES; i++) {
       motePos[i * 3] = (Math.random() - 0.5) * 70;
-      motePos[i * 3 + 1] = -2 + Math.random() * 14;
+      motePos[i * 3 + 1] = Math.random() * 14;
       motePos[i * 3 + 2] = 20 - Math.random() * 95;
       const tint = moteTints[i % 3];
       moteCol[i * 3] = tint.r;
@@ -274,6 +431,11 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
     });
     const motes = new THREE.Points(moteGeo, moteMat);
     scene.add(motes);
+
+    // ── Shockwave rings live in their own group so the mirror pass can
+    //    hide them (they sit on the street and shouldn't double-render). ──
+    const ringGroup = new THREE.Group();
+    scene.add(ringGroup);
 
     // ── Interaction state ─────────────────────────────────────────────────
     const orbit = {
@@ -350,6 +512,11 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
     const onResize = () => {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
+      mirrorCam.aspect = camera.aspect;
+      rtW = Math.floor(window.innerWidth * dpr);
+      rtH = Math.floor(window.innerHeight * dpr);
+      cityRT.setSize(Math.floor(rtW * MIRROR_RT_SCALE), Math.floor(rtH * MIRROR_RT_SCALE));
+      floorMat.uniforms.uTexelSize.value.set(1 / cityRT.width, 1 / cityRT.height);
       renderer.setSize(window.innerWidth, window.innerHeight);
     };
 
@@ -375,7 +542,7 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
       const mesh = new THREE.Mesh(geo, mat);
       mesh.rotation.x = -Math.PI / 2;
       mesh.position.set(at.x, 0.2, at.z);
-      scene.add(mesh);
+      ringGroup.add(mesh);
       rings.push({ mesh, life: 0, maxLife: 1.4 });
     }
 
@@ -396,6 +563,15 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
         x: 0,
         y: 0,
       });
+    }
+
+    // Scratch vectors for orienting the billboards to whichever camera is
+    // rendering, without allocating per frame.
+    const _sunTarget = new THREE.Vector3();
+    function orientSunTo(worldPos: THREE.Vector3) {
+      _sunTarget.copy(worldPos);
+      sun.lookAt(_sunTarget);
+      halo.lookAt(_sunTarget);
     }
 
     // ── Animate loop ──────────────────────────────────────────────────────
@@ -420,16 +596,24 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
         orbit.target.z + r * Math.sin(pa) * Math.cos(aa),
       );
       camera.lookAt(orbit.target);
+      camera.updateMatrixWorld(true);
 
-      gridMat.uniforms.uTime.value = t;
-      sun.quaternion.copy(camera.quaternion);
-      halo.quaternion.copy(camera.quaternion);
+      // Mirrored camera: reflect the real camera across the y=0 street plane.
+      const reflM = _reflM.copy(reflMatrix).multiply(camera.matrixWorld);
+      mirrorCam.matrixWorld.copy(reflM);
+      mirrorCam.matrixWorldInverse.copy(reflM).invert();
+      mirrorCam.projectionMatrix.copy(camera.projectionMatrix);
+
+      floorMat.uniforms.uTime.value = t;
+      floorMat.uniforms.uCamPos.value.copy(camera.position);
+      floorMat.uniforms.uProj.value.copy(camera.projectionMatrix);
+      floorMat.uniforms.uMirrorView.value.copy(mirrorCam.matrixWorldInverse);
 
       // Motes rise and wrap.
       const pos = motes.geometry.getAttribute("position") as THREE.BufferAttribute;
       for (let i = 0; i < MOTES; i++) {
         let y = pos.getY(i) + moteSpeeds[i] * dt;
-        if (y > 15) y = -2;
+        if (y > 15) y = 0;
         pos.setY(i, y);
       }
       pos.needsUpdate = true;
@@ -455,7 +639,7 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
         ring.mesh.scale.setScalar(1 + p * 22);
         (ring.mesh.material as THREE.MeshBasicMaterial).opacity = (1 - p) * 0.9;
         if (p >= 1) {
-          scene.remove(ring.mesh);
+          ringGroup.remove(ring.mesh);
           ring.mesh.geometry.dispose();
           (ring.mesh.material as THREE.Material).dispose();
           rings.splice(i, 1);
@@ -464,6 +648,20 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
 
       if (!reduced) updateAmbient(dt, t);
 
+      // ── Pass A: render the city into the reflection target from the
+      //    mirrored camera (street + rings hidden, billboards face the mirror).
+      _sunTarget.setFromMatrixPosition(mirrorCam.matrixWorld);
+      orientSunTo(_sunTarget);
+      floor.visible = false;
+      ringGroup.visible = false;
+      renderer.setRenderTarget(cityRT);
+      renderer.render(scene, mirrorCam);
+
+      // ── Pass B: render the main scene — the street is now the mirror.
+      orientSunTo(camera.position);
+      floor.visible = true;
+      ringGroup.visible = true;
+      renderer.setRenderTarget(null);
       renderer.render(scene, camera);
     }
     animate();
@@ -488,7 +686,8 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
         if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
         else if (mat) mat.dispose();
       });
-      disposables.forEach((t) => t.dispose());
+      disposables.forEach((tt) => tt.dispose());
+      cityRT.dispose();
       renderer.forceContextLoss();
       renderer.dispose();
       if (renderer.domElement.parentNode === host) {
