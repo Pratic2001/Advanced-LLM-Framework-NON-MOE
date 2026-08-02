@@ -308,11 +308,26 @@ ${PALETTE_GLSL}
 
 float dFlareMinGlobal;
 
+// Differential rotation: the photosphere spins fastest at the equator and
+// crawls at the poles (analytic approximation of the real shear law), so both
+// granulation scales genuinely advect across the disk instead of drifting
+// uniformly. Sampling the surface point under the rotation keeps the pattern
+// attached to the material.
+vec3 rotatePole(vec3 p, float t){
+  float lat = clamp(abs(p.y)/max(length(p), 1e-4), 0.0, 1.0);
+  float ang = t*0.30*(1.0 - 0.78*lat*lat);
+  float c = cos(ang), s = sin(ang);
+  return vec3(p.x*c - p.z*s, p.y, p.x*s + p.z*c);
+}
+
 float map(vec3 p){
   // Photosphere with two scales of granulation — broad convective cells plus a
   // finer overlying layer, so the limb reads as texture rather than a smooth ball.
-  float gran = fbm(p*4.2 + vec3(0.0,0.0,uTime*0.035), 5) - 0.5;
-  float granFine = fbm(p*11.0 + vec3(uTime*0.05, uTime*0.03, 0.0), 4) - 0.5;
+  // The pattern is sampled from the differential-rotated surface coordinate so
+  // the convective cells advect along the rotation field.
+  vec3 sp = rotatePole(p, uTime);
+  float gran = fbm(sp*4.2 + vec3(0.0,0.0,uTime*0.035), 5) - 0.5;
+  float granFine = fbm(sp*11.0 + vec3(uTime*0.05, uTime*0.03, 0.0), 4) - 0.5;
   float coreR = SUN_R + gran*0.016*TURBULENCE + granFine*0.006;
   float dCore = length(p) - coreR;
 
@@ -364,8 +379,11 @@ void main(){
   float mu = clamp(dot(n,v), 0.0, 1.0);
   bool isFlare = dFlareAtHit < (length(p)-SUN_R+0.02);
 
-  float n1 = fbm(p*6.0 + vec3(0.0,0.0,uTime*0.06), 7);
-  float n2 = fbm(p*1.4 + vec3(0.0,0.0,uTime*0.01), 4);
+  // Advect surface features (granulation, faculae, spots) with the sheared
+  // rotation field rather than a uniform time-sweep.
+  vec3 spt = rotatePole(p, uTime);
+  float n1 = fbm(spt*6.0 + vec3(0.0,0.0,uTime*0.06), 7);
+  float n2 = fbm(spt*1.4 + vec3(0.0,0.0,uTime*0.01), 4);
   float spot = smoothstep(0.32,0.14,n2);
   float tp = clamp(n1*0.65+0.38 - spot*0.55, 0.0, 1.0);
 
@@ -384,12 +402,12 @@ void main(){
   float rimGlow = pow(1.0-mu, 3.2)*0.32;
   surf += rimGlow*hotAccent();
 
-  // Fine granulation shimmer across the face.
-  float fine = fbm(p*22.0 + vec3(uTime*0.12, uTime*0.07, 0.0), 4);
+  // Fine granulation shimmer across the face (also advected).
+  float fine = fbm(spt*22.0 + vec3(uTime*0.12, uTime*0.07, 0.0), 4);
   surf *= 0.9 + 0.22*fine;
 
   // Faculae: bright plage patches, most visible toward the limb.
-  float facNoise = fbm(p*3.0 + vec3(0.0,0.0,uTime*0.02), 4);
+  float facNoise = fbm(spt*3.0 + vec3(0.0,0.0,uTime*0.02), 4);
   float fac = smoothstep(0.62, 0.86, facNoise) * pow(mu, 2.2);
   surf *= 1.0 + 0.5*fac;
 
@@ -447,8 +465,12 @@ void main(){
     float distC = length(closest);
     float halo = exp(-max(distC-SUN_R,0.0)*3.2);
     float ang = atan(closest.z, closest.x);
-    float streamer = fbm(vec3(cos(ang)*3.1, sin(ang)*3.1, distC*2.2 - uTime*0.06), 5);
-    float glow = halo * mix(0.45, 1.35, streamer);
+    vec3 sP = vec3(cos(ang)*3.1, sin(ang)*3.1, distC*2.2 - uTime*0.06);
+    // Broad streamer field plus a finer, faster-rolling filament octave so the
+    // corona resolves into sharp radial filaments over the smooth halo.
+    float streamer = fbm(sP, 5);
+    float filament = fbm(sP*3.2 + vec3(0.0,0.0,uTime*0.11), 4) - 0.5;
+    float glow = halo * mix(0.4, 1.45, streamer) * (1.0 + 0.35*filament);
 
     vec3 coronaInner = mix(uColorA, vec3(1.0,0.9,0.75), 0.35);
     vec3 coronaOuter = mix(uColorC, vec3(1.0,0.85,0.55), 0.45);

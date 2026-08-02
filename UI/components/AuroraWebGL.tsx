@@ -40,6 +40,63 @@ const RAY_FREQ = 0.42; // vertical ray striation frequency
 const RAY_TILT = 1.3; // field-aligned lean of the ray striations
 const PULSE_COLOR = 0.45; // click-pulse colour boost
 const FLASH_AMT = 0.55; // whole-scene flash boost
+const LAKE_FRESNEL_POW = 3.0; // frozen-lake fresnel falloff
+
+// ── Frozen-lake planar-mirror vertex + fragment shaders ────────────────────
+const LAKE_VERT = `
+varying vec3 vWorld;
+void main() {
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vWorld = wp.xyz;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}
+`;
+const LAKE_FRAG = `
+#define LAKE_FRESNEL ${LAKE_FRESNEL_POW}
+uniform float uTime;
+uniform vec3 uCamPos;
+uniform mat4 uProj;
+uniform mat4 uMirrorView;
+uniform sampler2D uLakeTex;
+uniform vec3 uColorA;
+varying vec3 vWorld;
+float hashL(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float noiseL(vec2 x){
+  vec2 i = floor(x); vec2 f = fract(x);
+  f = f*f*(3.0-2.0*f);
+  return mix(mix(hashL(i), hashL(i+vec2(1,0)), f.x),
+             mix(hashL(i+vec2(0,1)), hashL(i+vec2(1,1)), f.x), f.y);
+}
+void main() {
+  vec4 clip = uProj * (uMirrorView * vec4(vWorld, 1.0));
+  vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+  bool inMirror = clip.w > 0.01 && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+
+  // Ice surface: faint ripples/frost displace the sample so it's not a hard mirror.
+  vec2 rip = vec2(noiseL(vWorld.xz * 0.8 + vec2(uTime * 0.02, 0.0)),
+                  noiseL(vWorld.xz * 0.8 + vec2(0.0, uTime * 0.02)));
+  uv += (rip - 0.5) * 0.012;
+
+  vec3 refl = vec3(0.0);
+  if (inMirror) {
+    refl = texture2D(uLakeTex, clamp(uv, 0.004, 0.996)).rgb;
+    // Fresnel: grazing horizons reflect the aurora most; near-field is flat ice.
+    vec3 V = normalize(uCamPos - vWorld);
+    float fres = 0.04 + 0.96 * pow(1.0 - max(dot(V, vec3(0.0, 1.0, 0.0)), 0.0), LAKE_FRESNEL);
+    refl *= fres;
+  }
+  // Icy body colour + frost-crack veins.
+  vec3 ice = vec3(0.02, 0.028, 0.05);
+  float crack = smoothstep(0.30, 0.0, noiseL(vWorld.xz * 0.05)) * 0.35
+              + smoothstep(0.35, 0.0, noiseL(vWorld.xz * 0.19 + 11.0)) * 0.3;
+  vec3 col = ice + refl + uColorA * crack * 0.18;
+  // Horizon melt to the scene clear colour (0x030610) so the ice meets the sky
+  // with no visible seam once the mountains are absent from the horizon.
+  float horizon = 1.0 - smoothstep(-72.0, -40.0, vWorld.z);
+  col = mix(col, vec3(0.012, 0.024, 0.063), horizon);
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
 
 // Shared noise / fbm helpers (the project's established GLSL idiom).
 const NOISE_GLSL = `
@@ -366,35 +423,40 @@ export function AuroraWebGL({ className = "" }: { className?: string }) {
       scene.add(m);
     }
 
-    // ── Mountain ridge (two layers for depth) ─────────────────────────────
-    function makeRidge(mz: number, color: number, scale: number) {
-      // Horizontal terrain, flat near the camera and rising into peaks toward
-      // the horizon, so it reads as mountain silhouettes at the bottom.
-      const geo = new THREE.PlaneGeometry(260, 70, 160, 30);
-      geo.rotateX(-Math.PI / 2);
-      const pos = geo.attributes.position as THREE.BufferAttribute;
-      for (let i = 0; i < pos.count; i++) {
-        const x = pos.getX(i);
-        const wz = pos.getZ(i) + mz; // world z
-        const far = THREE.MathUtils.smoothstep(wz, 12, -45);
-        const peak =
-          Math.abs(Math.sin(x * 0.012 + 0.7)) * 9 +
-          Math.abs(Math.sin(x * 0.031 + 2.1)) * 7 +
-          Math.abs(Math.sin(x * 0.007 + 5.3)) * 14;
-        pos.setY(i, -3 + peak * scale * far * 0.6);
-      }
-      pos.needsUpdate = true;
-      geo.computeVertexNormals();
-      const m = new THREE.Mesh(
-        geo,
-        new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide }),
-      );
-      m.position.set(0, 0, mz);
-      m.renderOrder = 1;
-      scene.add(m);
-    }
-    makeRidge(-32, 0x04060c, 1);
-    makeRidge(-48, 0x020408, 0.7);
+    // ── Frozen lake (planar mirror of the aurora / mountains) ────────────
+    // A sheet of ice that reflects the curtains + ranges from a mirrored
+    // camera, with fresnel falloff and faint frost-crack veins and ripples.
+    const LAKE_RT_SCALE = 0.6;
+    const lakeRT = new THREE.WebGLRenderTarget(
+      Math.max(2, Math.floor(window.innerWidth * LAKE_RT_SCALE)),
+      Math.max(2, Math.floor(window.innerHeight * LAKE_RT_SCALE)),
+    );
+    disposables.push(lakeRT.texture);
+    const lakeGeo = new THREE.PlaneGeometry(320, 90, 1, 1);
+    lakeGeo.rotateX(-Math.PI / 2);
+    const lakeMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uTime: { value: 0 },
+        uCamPos: { value: camera.position },
+        uProj: { value: new THREE.Matrix4() },
+        uMirrorView: { value: new THREE.Matrix4() },
+        uLakeTex: { value: lakeRT.texture },
+        uColorA: colA,
+      },
+      vertexShader: LAKE_VERT,
+      fragmentShader: LAKE_FRAG,
+      side: THREE.DoubleSide, // needs both sides for a near-y plane
+    });
+    const lake = new THREE.Mesh(lakeGeo, lakeMat);
+    lake.position.set(0, -0.4, 0);
+    lake.renderOrder = 2;
+    scene.add(lake);
+
+    // Mirror camera: reflects the scene across the ice plane. auto-update is
+    // off — we repoint matrixWorld manually every frame (like the neon mirror).
+    const mirrorCam = new THREE.PerspectiveCamera(70, camera.aspect, 0.1, 200);
+    mirrorCam.matrixWorldAutoUpdate = false;
+    const reflMatrix = new THREE.Matrix4().makeScale(1, -1, 1);
 
     // ── Stars ─────────────────────────────────────────────────────────────
     const STARS = 700;
@@ -645,6 +707,25 @@ export function AuroraWebGL({ className = "" }: { className?: string }) {
 
       if (!reduced) updateAmbient(dt);
 
+      // Frozen-lake planar reflection: render the scene (curtains, stars,
+      // ranges) from a camera mirrored across the ice, then draw the lake
+      // sampling that buffer. The lake hides itself during the mirrored pass
+      // so it reflects sky, not its own ice.
+      lake.visible = false;
+      const reflM = reflMatrix.clone().multiply(camera.matrixWorld);
+      mirrorCam.matrixWorld.copy(reflM);
+      mirrorCam.matrixWorldInverse.copy(reflM).invert();
+      mirrorCam.projectionMatrix.copy(camera.projectionMatrix);
+      mirrorCam.aspect = camera.aspect;
+      renderer.setRenderTarget(lakeRT);
+      renderer.clear();
+      renderer.render(scene, mirrorCam);
+      lake.visible = true;
+      lakeMat.uniforms.uTime.value = t;
+      lakeMat.uniforms.uProj.value.copy(camera.projectionMatrix);
+      lakeMat.uniforms.uMirrorView.value.copy(mirrorCam.matrixWorldInverse);
+
+      renderer.setRenderTarget(null);
       renderer.render(scene, camera);
     }
     animate();

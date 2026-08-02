@@ -513,24 +513,71 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
     seabed.position.y = -24;
     underScene.add(seabed);
 
-    // ── Whale silhouette (under the surface, revealed by refraction) ───────
+    // ── Whale (smooth high-poly, glides under the surface, revealed by
+//    refraction) ──────────────────────────────────────────────────────────
+    // A rounded fusiform body + conic tail, dorsal and paired pectoral fins,
+    // all sharing one glossy deep-ocean-blue material so it reads as a single
+    // fluid animal rather than a few faceted primitives.
+    const whaleMat = new THREE.MeshBasicMaterial({ color: 0x0b2438 });
     const whale = new THREE.Group();
     const whaleBody = new THREE.Mesh(
-      new THREE.SphereGeometry(1.6, 10, 8),
-      new THREE.MeshBasicMaterial({ color: 0x0b2438 }),
+      new THREE.SphereGeometry(1.6, 48, 32),
+      whaleMat,
     );
     whaleBody.scale.set(1.8, 0.85, 0.6);
+    // Tapered tail/flukes (smooth cone swept flat into two lobes).
     const whaleTail = new THREE.Mesh(
-      new THREE.ConeGeometry(0.55, 1.8, 4),
-      new THREE.MeshBasicMaterial({ color: 0x0b2438 }),
+      new THREE.ConeGeometry(0.55, 1.8, 32, 8),
+      whaleMat,
     );
     whaleTail.position.set(0, 0, -1.7);
     whaleTail.rotation.x = Math.PI / 2;
-    whaleTail.scale.set(0.6, 1, 0.18);
-    whale.add(whaleBody, whaleTail);
+    whaleTail.scale.set(0.6, 0.5, 0.18);
+    // Dorsal fin (small rear cone).
+    const dorsalFin = new THREE.Mesh(
+      new THREE.ConeGeometry(0.22, 0.9, 24, 4),
+      whaleMat,
+    );
+    dorsalFin.position.set(-0.1, 0.55, -0.55);
+    dorsalFin.rotation.z = Math.PI / 2 - 0.35; // rake back
+    // Pectoral fins (smooth angled cones either side).
+    const pectorals: THREE.Mesh[] = [];
+    for (const s of [-1, 1]) {
+      const fin = new THREE.Mesh(new THREE.ConeGeometry(0.3, 1.3, 24, 4), whaleMat);
+      fin.position.set(0.62 * s, -0.05, 0.3);
+      fin.rotation.z = s * (Math.PI / 2 + 0.3);
+      fin.rotation.y = s * -0.5;
+      fin.scale.set(0.5, 1, 0.24);
+      pectorals.push(fin);
+      whale.add(fin);
+    }
+    whale.add(whaleBody, whaleTail, dorsalFin);
     whale.position.set(30, -9, -40);
     whale.scale.setScalar(2.2);
     underScene.add(whale);
+
+    // Gentle bioluminescent wake: a sparse additive glow-sprite pool that the
+    // tail sheds as it swims, drifting down and fading (tinted pale cyan with
+    // the live accent).
+    const wake: { s: THREE.Sprite; life: number; max: number }[] = [];
+    let wakeTimer = 0;
+    function spawnWake() {
+      const mat = new THREE.SpriteMaterial({
+        map: glowTex,
+        color: colD.value,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      const s = new THREE.Sprite(mat);
+      const off = (Math.random() - 0.5) * 2.4;
+      s.position.set(whale.position.x + off, whale.position.y - 0.4, whale.position.z + 1.4);
+      const sc = 0.5 + Math.random() * 0.7;
+      s.scale.setScalar(sc);
+      wake.push({ s, life: 0, max: 2.2 + Math.random() * 1.6 });
+      underScene.add(s);
+    }
 
     // ── Marine snow (sinking below the surface) ───────────────────────────
     const SNOW = 420;
@@ -815,12 +862,40 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
       oceanMat.uniforms.uTime.value = t;
       seabedMat.uniforms.uTime.value = t;
 
-      // Whale glides across the underwater scene.
+      // Whale glides across the underwater scene with a gentle swimming
+      // pitch/roll and vertical bob so it reads as alive, shedding a faint
+      // bioluminescent wake.
       if (!reduced) {
         whale.position.x -= dt * 2.0;
         whale.position.z += dt * 0.6;
+        whale.position.y = -9 + Math.sin(t * 0.45) * 1.1; // slow lull/rise
         whale.rotation.y = 0.35;
-        if (whale.position.x < -60) whale.position.set(32, -8, -35);
+        whale.rotation.z = Math.sin(t * 0.7) * 0.045; // gentle roll
+        whale.rotation.x = Math.sin(t * 0.9) * 0.06; // pitch while surfacing
+        if (whale.position.x < -60) {
+          whale.position.set(32, -8, -35);
+          whale.rotation.x = 0;
+          whale.rotation.z = 0;
+        }
+        wakeTimer -= dt;
+        if (wakeTimer <= 0) {
+          wakeTimer = 0.28;
+          spawnWake();
+        }
+      }
+      for (let i = wake.length - 1; i >= 0; i--) {
+        const w = wake[i];
+        w.life += dt;
+        const p = Math.min(1, w.life / w.max);
+        w.s.position.y -= dt * 0.4; // shed particles sink slightly
+        const smat = w.s.material as THREE.SpriteMaterial;
+        smat.opacity = Math.sin(p * Math.PI) * 0.4; // fade in then out
+        w.s.scale.setScalar(0.6 + p * 1.4);
+        if (p >= 1) {
+          underScene.remove(w.s);
+          (w.s.material as THREE.Material).dispose();
+          wake.splice(i, 1);
+        }
       }
       oceanMat.uniforms.uWhalePos.value.copy(whale.position);
 

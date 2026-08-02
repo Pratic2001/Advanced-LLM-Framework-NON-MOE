@@ -80,15 +80,29 @@ float noise(vec2 x){
              mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
 }
 
-// Sample the reflected city with a soft glossy blur (4 taps + centre).
+// Sample the reflected city. Instead of a symmetric 4-tap gloss, smear the
+// tap primarily along the street's receding (vertical-in-reflection) axis —
+// the UV axis that maps to "away from the camera" on the ground plane — so
+// bright horizontal neon bands of the towers draw as tall wet-streak
+// reflections, the classic neon-on-rain asphalt look.
 vec3 sampleReflection(vec2 uv) {
-  vec2 o = FLOOR_GLOSS * uTexelSize;
-  vec3 c  = texture2D(uCityTex, clamp(uv, 0.002, 0.998)).rgb;
-  c += texture2D(uCityTex, clamp(uv + vec2(o.x, 0.0), 0.002, 0.998)).rgb;
-  c += texture2D(uCityTex, clamp(uv - vec2(o.x, 0.0), 0.002, 0.998)).rgb;
-  c += texture2D(uCityTex, clamp(uv + vec2(0.0, o.y), 0.002, 0.998)).rgb;
-  c += texture2D(uCityTex, clamp(uv - vec2(0.0, o.y), 0.002, 0.998)).rgb;
-  return c * (1.0 / 5.0);
+  float o = FLOOR_GLOSS * uTexelSize.y;
+  float w1 = 1.0, w2 = 0.82, w3 = 0.55, w4 = 0.3;
+  vec3 c  = texture2D(uCityTex, clamp(uv, 0.002, 0.998)).rgb * w1;
+  // Vertical smear (keep symmetric so both up/down contribute to the streak,
+  // but weight the far taps so streaks read as a continuous column).
+  c += texture2D(uCityTex, clamp(uv + vec2(0.0, o * 1.0), 0.002, 0.998)).rgb * w2;
+  c += texture2D(uCityTex, clamp(uv - vec2(0.0, o * 1.0), 0.002, 0.998)).rgb * w2;
+  c += texture2D(uCityTex, clamp(uv + vec2(0.0, o * 2.4), 0.002, 0.998)).rgb * w3;
+  c += texture2D(uCityTex, clamp(uv - vec2(0.0, o * 2.4), 0.002, 0.998)).rgb * w3;
+  c += texture2D(uCityTex, clamp(uv + vec2(0.0, o * 4.2), 0.002, 0.998)).rgb * w4;
+  c += texture2D(uCityTex, clamp(uv - vec2(0.0, o * 4.2), 0.002, 0.998)).rgb * w4;
+  // A weaker horizontal tap keeps a faint cross-hatch so it still reads as a
+  // plane, not vertical-only.
+  c += texture2D(uCityTex, clamp(uv + vec2(o * 1.4, 0.0), 0.002, 0.998)).rgb * 0.4;
+  c += texture2D(uCityTex, clamp(uv - vec2(o * 1.4, 0.0), 0.002, 0.998)).rgb * 0.4;
+  float w = w1 + w2 * 2.0 + w3 * 2.0 + w4 * 2.0 + 0.8;
+  return c / w;
 }
 
 void main() {
@@ -144,16 +158,28 @@ void main() {
 }
 `;
 
-// ── Glossy black-glass tower shader (fresnel neon rim) ─────────────────────
+// ── Tower scene shader: dark glass, procedural window facade, LED strips ──
+// Local box coords are passed pre-instance-scale (x/z in [-0.8,0.8] across a
+// wall, y in [-0.5,0.5]) along with the instanced height, so the fragment
+// lays a world-unit window grid onto every wall — tall towers carry many
+// floors, short ones just a few. Windows mix between dark and lit (tinted
+// across the palette + warm offices, some flickering), and every tower gets
+// neon edge strips + a lit roof band, then the fresnel glass rim.
 const TOWER_VERT = `
 varying vec3 vWNormal;
 varying vec3 vWorld;
+varying vec3 vLocal;
+varying float vTowerH;
 void main() {
   vec4 wp = modelMatrix * vec4(position, 1.0);
   #ifdef USE_INSTANCING
     wp = modelMatrix * instanceMatrix * vec4(position, 1.0);
+    vTowerH = length((instanceMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz);
+  #else
+    vTowerH = 1.0;
   #endif
   vWorld = wp.xyz;
+  vLocal = position; // unit-box local coords, pre-Y-scale
   // Towers are axis-aligned boxes scaled only on Y, so the object-space
   // normal is already the world normal (mat3(modelMatrix) is identity).
   vWNormal = normalize(mat3(modelMatrix) * normal);
@@ -164,20 +190,70 @@ void main() {
 const TOWER_FRAG = `
 #define TOWER_RIM ${TOWER_RIM_POW.toFixed(2)}
 #define TOWER_RIMB ${TOWER_RIM_BOOST.toFixed(2)}
+#define WIN_W 0.30
+#define WIN_H 0.36
+#define WIN_GAPX 0.38
+#define WIN_GAPY 0.46
+uniform float uTime;
 uniform vec3 uColorA;
+uniform vec3 uColorB;
+uniform vec3 uColorC;
 uniform vec3 uColorD;
 varying vec3 vWNormal;
 varying vec3 vWorld;
+varying vec3 vLocal;
+varying float vTowerH;
+
+float hashF(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
 void main() {
   vec3 N = normalize(vWNormal);
   vec3 V = normalize(cameraPosition - vWorld);
   float fres = pow(1.0 - abs(dot(N, V)), TOWER_RIM);
-  vec3 base = vec3(0.02, 0.025, 0.04);           // near-black glass
-  vec3 rim = mix(uColorA, uColorD, 0.5) * fres * TOWER_RIMB;
-  // A faint top sheen so the slabs read as lit glass, not flat black.
+
+  // ---- Procedural facade -----------------------------------------------
+  // Wall coords: side walls are vertical (N.y small) so windows only appear
+  // there; the roof band is handled separately at the top of the wall.
+  vec2 face = abs(vLocal.x) >= abs(vLocal.z)
+    ? vec2(vLocal.z, vLocal.y)   // x-face: wall runs along z
+    : vec2(vLocal.x, vLocal.y);  // z-face: wall runs along x
+  vec2 pos = vec2(face.x, (face.y + 0.5) * vTowerH); // world units along + up the wall
+
+  vec2 cell = floor(pos / vec2(WIN_GAPX, WIN_GAPY));
+  vec2 fc = fract(pos / vec2(WIN_GAPX, WIN_GAPY)) - 0.5;
+  float cellHash = hashF(cell + fract(vWorld.xz));
+
+  // Window pane inside each cell (thin dark frame between panes).
+  float pane = 1.0 - smoothstep(WIN_W * 0.5, WIN_W * 0.5 + 0.02, abs(fc.x))
+                   - smoothstep(WIN_H * 0.5, WIN_H * 0.5 + 0.02, abs(fc.y));
+  pane = clamp(pane, 0.0, 1.0);
+
+  // Lit vs dark; lit panes tint across the palette (cyan -> blue -> violet)
+  // plus a few warm-white offices, and a subset flicker (AC/server floors).
+  float lit = step(0.48, cellHash);
+  float tint = fract(cellHash * 7.31);
+  vec3 winCol = mix(uColorA, uColorB, smoothstep(0.0, 0.45, tint));
+  winCol = mix(winCol, uColorC, smoothstep(0.45, 0.78, tint));
+  winCol = mix(winCol, vec3(1.0, 0.85, 0.58), smoothstep(0.78, 1.0, tint));
+  float flick = step(0.55, 0.68 + 0.32 * sin(uTime * (1.5 + fract(cellHash * 13.1) * 5.0) + cellHash * 40.0));
+
+  // Windows only on side walls (not the flat roof); scale brightness so the
+  // mirror pass reflects a believable skyline.
+  float sideMask = 1.0 - smoothstep(0.55, 0.85, abs(N.y));
+  float winLight = pane * lit * flick * sideMask;
+
+  // Neon edge strips down the tower corners + a lit roof band.
+  float edge = smoothstep(0.72, 0.80, abs(face.x)); // wall's own ends = corners
+  float roofBand = smoothstep(vTowerH - 1.4, vTowerH - 0.6, pos.y) * sideMask;
+  vec3 neon = mix(uColorA, uColorD, 0.55);
+
+  vec3 col = vec3(0.016, 0.02, 0.032);                    // dark glass
+  col += winCol * winLight * 1.5;                         // lit windows
+  col += neon * (edge * 1.1 + roofBand * 0.8);            // corner + roof LED
+  col += mix(uColorA, uColorD, 0.5) * fres * TOWER_RIMB;  // fresnel glass rim
   float top = smoothstep(-0.2, 0.9, N.y);
-  rim += uColorA * top * 0.05;
-  gl_FragColor = vec4(base + rim, 1.0);
+  col += uColorA * top * 0.05;
+  gl_FragColor = vec4(col, 1.0);
 }
 `;
 
@@ -336,7 +412,10 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
     const towerGeo = new THREE.BoxGeometry(1.6, 1, 1.6);
     const towerMat = new THREE.ShaderMaterial({
       uniforms: {
+        uTime: { value: 0 },
         uColorA: colA,
+        uColorB: colB,
+        uColorC: colC,
         uColorD: colD,
       },
       vertexShader: TOWER_VERT,
@@ -378,19 +457,57 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
       pylons.push(m);
     }
 
-    // ── Floating wireframe holograms ──────────────────────────────────────
+    // ── Floating holograms (smooth high-poly geometry + projection shader)
+    // A fresnel-glow core, a moving scan band, an interference shimmer and a
+    // faint data-dot grid make them read as lit volumetric holos rather than
+    // wireframes. Each takes one of the live palette colors as its tint.
+    const HOLO_VERT = `
+varying vec3 vWNormal;
+varying vec3 vWorld;
+void main() {
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vWorld = wp.xyz;
+  vWNormal = normalize(mat3(modelMatrix) * normal);
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}
+`;
+    const HOLO_FRAG = `
+uniform float uTime;
+uniform vec3 uTint;
+varying vec3 vWNormal;
+varying vec3 vWorld;
+float hashH(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+void main() {
+  vec3 N = normalize(vWNormal);
+  vec3 V = normalize(cameraPosition - vWorld);
+  float fres = pow(1.0 - abs(dot(N, V)), 2.5);
+  // Local Y position for the scan band (pass in world-y, integer-ish floors).
+  float scan = smoothstep(0.04, 0.0, abs(fract(vWorld.y * 0.5 + uTime * 0.35) - 0.5) - 0.2);
+  // Faint interference shimmer.
+  float shimmer = 0.5 + 0.5 * sin(vWorld.y * 1.7 + vWorld.x * 2.3 - uTime * 2.0);
+  // Dot grid projected on the surface (world-space, so it feels holographic).
+  vec2 g = abs(fract(vWorld.xz * 3.0) - 0.5);
+  float dot = smoothstep(0.32, 0.0, min(g.x, g.y));
+  float core = fres * 0.9 + scan * 0.9 + dot * 0.12 * shimmer;
+  vec3 col = uTint * (0.16 + core);
+  gl_FragColor = vec4(col, core * 0.9 + 0.12);
+}
+`;
     const holos: THREE.Mesh[] = [];
-    const holoColors = [colA.value, colB.value, colC.value];
+    const holoTints = [colA.value, colB.value, colC.value];
     for (let i = 0; i < 3; i++) {
       const geo =
         i % 2 === 0
-          ? new THREE.TorusGeometry(1.5, 0.45, 10, 32)
-          : new THREE.OctahedronGeometry(1.7, 0);
-      const mat = new THREE.MeshBasicMaterial({
-        color: holoColors[i],
-        wireframe: true,
+          ? new THREE.TorusGeometry(1.5, 0.45, 24, 96)
+          : new THREE.IcosahedronGeometry(1.7, 3);
+      const mat = new THREE.ShaderMaterial({
+        uniforms: {
+          uTime: { value: 0 },
+          uTint: { value: holoTints[i] },
+        },
+        vertexShader: HOLO_VERT,
+        fragmentShader: HOLO_FRAG,
         transparent: true,
-        opacity: 0.7,
         depthWrite: false,
         blending: THREE.AdditiveBlending,
         side: THREE.DoubleSide,
@@ -618,11 +735,15 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
       }
       pos.needsUpdate = true;
 
-      // Holograms rotate + bob.
+      // Tower facade / hologram live uniforms.
+      towerMat.uniforms.uTime.value = t;
+
+      // Holograms rotate + bob + drive their scan shimmer.
       for (let i = 0; i < holos.length; i++) {
         holos[i].rotation.y += dt * 0.5;
         holos[i].rotation.x += dt * 0.2;
         holos[i].position.y = 9 + i * 2.5 + Math.sin(t * 0.8 + i * 2) * 0.7;
+        (holos[i].material as THREE.ShaderMaterial).uniforms.uTime.value = t;
       }
 
       // Pylons pulse.
