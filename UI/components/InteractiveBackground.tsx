@@ -82,7 +82,7 @@ function rgba(c: RGB, a: number): string {
 }
 
 // ── Neural nodes strategy ─────────────────────────────────────────────────
-// Used by neon-cyber, aurora-borealis, cosmic-void.
+// Used by neon-cyber and aurora-borealis.
 
 interface NeuralNode {
   x: number;
@@ -178,7 +178,7 @@ function renderNeuralNodes(
 }
 
 // ── Embers strategy ───────────────────────────────────────────────────────
-// Used by solar-flare, golden-hour, rose-quartz.
+// Used by solar-flare.
 
 interface Ember {
   x: number;
@@ -259,71 +259,6 @@ function renderEmbers(
   // Apply fade-to-haze on top
   ctx.fillStyle = fadeGrad;
   ctx.fillRect(0, 0, w, h);
-}
-
-// ── Matrix glyphs strategy ────────────────────────────────────────────────
-// Used by matrix-green.
-
-const MATRIX_GLYPHS =
-  "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン0123456789$#@%&*+=<>";
-
-interface MatrixColumn {
-  x: number;
-  y: number;
-  speed: number;
-  length: number;
-}
-
-function createMatrixColumns(count: number, w: number, h: number): MatrixColumn[] {
-  const cols: MatrixColumn[] = [];
-  const colWidth = 18;
-  for (let x = 0; x < w; x += colWidth) {
-    cols.push({
-      x: x + Math.random() * 6,
-      y: Math.random() * h,
-      speed: 1.5 + Math.random() * 4,
-      length: 8 + Math.floor(Math.random() * 20),
-    });
-  }
-  return cols;
-}
-
-function renderMatrixGlyphs(
-  ctx: CanvasRenderingContext2D,
-  cols: MatrixColumn[],
-  palette: RGB[],
-  w: number,
-  h: number,
-  _mouse: { x: number; y: number },
-  _interactive: boolean,
-  reduced: boolean,
-  _time: number
-) {
-  // Soft fade trail so glyphs leave a smear
-  ctx.fillStyle = "rgba(0, 0, 0, 0.18)";
-  ctx.fillRect(0, 0, w, h);
-
-  const c = palette[0]; // dominant green
-  ctx.font = "16px monospace";
-  ctx.textBaseline = "top";
-
-  for (const col of cols) {
-    if (!reduced) col.y += col.speed;
-    if (col.y - col.length * 18 > h) {
-      col.y = -col.length * 18 + Math.random() * 60;
-    }
-    for (let i = 0; i < col.length; i++) {
-      const ch = MATRIX_GLYPHS[Math.floor(Math.random() * MATRIX_GLYPHS.length)];
-      const y = col.y - i * 18;
-      if (y < -20 || y > h + 20) continue;
-      const isHead = i === 0;
-      const alpha = isHead ? 1 : 0.85 * (1 - i / col.length);
-      ctx.fillStyle = isHead
-        ? "rgba(220, 255, 220, " + alpha + ")"
-        : rgba(c, alpha);
-      ctx.fillText(ch, col.x, y);
-    }
-  }
 }
 
 // ── Bubbles strategy ──────────────────────────────────────────────────────
@@ -1582,18 +1517,13 @@ function renderCosmos(
 type StrategyKey =
   | "neural"
   | "embers"
-  | "matrix"
   | "bubbles"
   | "cosmos";
 
 const PALETTE_STRATEGY: Record<string, StrategyKey> = {
   "neon-cyber": "neural",
   "aurora-borealis": "neural",
-  "cosmic-void": "neural",
   "solar-flare": "embers",
-  "golden-hour": "embers",
-  "rose-quartz": "embers",
-  "matrix-green": "matrix",
   "ocean-depths": "bubbles",
   "deep-space": "cosmos",
 };
@@ -1695,9 +1625,6 @@ export function InteractiveBackground({
       case "embers":
         stateRef.current = createEmbers(140, w, h, paletteRGB);
         break;
-      case "matrix":
-        stateRef.current = createMatrixColumns(0, w, h);
-        break;
       case "bubbles":
         stateRef.current = createBubbles(70, w, h, paletteRGB);
         break;
@@ -1744,19 +1671,6 @@ export function InteractiveBackground({
           renderEmbers(
             ctx,
             state as Ember[],
-            paletteRGB,
-            w,
-            h,
-            mouse,
-            true,
-            reduced,
-            time
-          );
-          break;
-        case "matrix":
-          renderMatrixGlyphs(
-            ctx,
-            state as MatrixColumn[],
             paletteRGB,
             w,
             h,

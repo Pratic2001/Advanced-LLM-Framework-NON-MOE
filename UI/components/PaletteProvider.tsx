@@ -10,7 +10,7 @@ import {
   useMemo,
   useRef,
 } from "react";
-import { Palette, ChevronDown, Settings, X, Sparkles, Sun, Moon, Sliders, RotateCcw } from "lucide-react";
+import { Palette, ChevronDown, Settings, X, Sparkles, Sliders, RotateCcw } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { onCosmosEvent } from "./cosmosEvents";
 
@@ -18,7 +18,7 @@ import { onCosmosEvent } from "./cosmosEvents";
 //
 // Each palette only carries the accent colors (primary/secondary/tertiary/
 // accent and their glows). Base structural colors (background, foreground,
-// card, border, muted) are owned by the active theme — see THEMES below.
+// card, border, muted) use the dark structural token set below.
 
 export interface ColorPalette {
   id: string;
@@ -63,7 +63,7 @@ export const PALETTES: ColorPalette[] = [
   },
   {
     id: "solar-flare",
-    name: "Solar Flare",
+    name: "Solar Flair",
     description: "Orange/red/yellow energy burst",
     primary: "24 95% 53%",
     primaryGlow: "24 100% 65%",
@@ -73,32 +73,6 @@ export const PALETTES: ColorPalette[] = [
     tertiaryGlow: "51 100% 65%",
     accent: "32 95% 44%",
     accentGlow: "32 100% 58%",
-  },
-  {
-    id: "cosmic-void",
-    name: "Cosmic Void",
-    description: "Deep purple/violet/indigo space theme",
-    primary: "270 95% 65%",
-    primaryGlow: "270 100% 75%",
-    secondary: "262 83% 58%",
-    secondaryGlow: "262 100% 70%",
-    tertiary: "238 90% 60%",
-    tertiaryGlow: "238 100% 72%",
-    accent: "300 81% 60%",
-    accentGlow: "300 100% 72%",
-  },
-  {
-    id: "matrix-green",
-    name: "Matrix Green",
-    description: "Terminal green/amber monochrome",
-    primary: "142 76% 36%",
-    primaryGlow: "142 100% 50%",
-    secondary: "120 100% 30%",
-    secondaryGlow: "120 100% 45%",
-    tertiary: "84 100% 25%",
-    tertiaryGlow: "84 100% 40%",
-    accent: "45 100% 51%",
-    accentGlow: "45 100% 65%",
   },
   {
     id: "ocean-depths",
@@ -112,32 +86,6 @@ export const PALETTES: ColorPalette[] = [
     tertiaryGlow: "173 100% 55%",
     accent: "166 76% 42%",
     accentGlow: "166 100% 55%",
-  },
-  {
-    id: "rose-quartz",
-    name: "Rose Quartz",
-    description: "Soft pink/rose/magenta elegance",
-    primary: "330 81% 60%",
-    primaryGlow: "330 100% 72%",
-    secondary: "340 82% 52%",
-    secondaryGlow: "340 100% 65%",
-    tertiary: "300 81% 60%",
-    tertiaryGlow: "300 100% 72%",
-    accent: "355 100% 66%",
-    accentGlow: "355 100% 78%",
-  },
-  {
-    id: "golden-hour",
-    name: "Golden Hour",
-    description: "Warm amber/orange/gold sunset",
-    primary: "38 92% 50%",
-    primaryGlow: "38 100% 65%",
-    secondary: "24 95% 53%",
-    secondaryGlow: "24 100% 65%",
-    tertiary: "45 100% 51%",
-    tertiaryGlow: "45 100% 65%",
-    accent: "32 95% 44%",
-    accentGlow: "32 100% 58%",
   },
   {
     // Deep Space: calm steel/silver-blue with a warm-gold accent. Kept muted
@@ -161,16 +109,13 @@ export const PALETTES: ColorPalette[] = [
 
 // Deep Space is the default palette — it is the one wired to the WebGL cosmos
 // background (InteractiveBackground → CosmosWebGL), so fresh visitors land on
-// the real astrophysics scene instead of a flat 2D canvas. Index-based lookup
-// keeps the default in sync with the order of PALETTES (deep-space is last).
-const DEFAULT_PALETTE = PALETTES[PALETTES.length - 1];
+// the real astrophysics scene instead of a flat 2D canvas.
+const DEFAULT_PALETTE = PALETTES.find((palette) => palette.id === "deep-space") ?? PALETTES[0];
 
-// ── Themes ────────────────────────────────────────────────────────────────
+// ── Dark structural tokens ────────────────────────────────────────────────
 //
-// Themes own structural colors (background, foreground, card, border, muted).
-// One theme is active at a time and is independent of the accent palette.
-
-export type Theme = "dark" | "light";
+// Structural colors (background, foreground, card, border, muted) are kept
+// dark-only and independent of the accent palette.
 
 export interface ThemeColors {
   background: string;
@@ -193,47 +138,25 @@ export interface ThemeColors {
   destructiveForeground: string;
 }
 
-export const THEMES: Record<Theme, ThemeColors> = {
-  dark: {
-    background: "240 10% 3.9%",
-    foreground: "0 0% 98%",
-    card: "240 10% 5.9%",
-    cardForeground: "0 0% 98%",
-    popover: "240 10% 5.9%",
-    popoverForeground: "0 0% 98%",
-    border: "240 3.7% 15.9%",
-    input: "240 3.7% 15.9%",
-    ring: "199 89% 48%",
-    muted: "240 3.7% 15.9%",
-    mutedForeground: "240 5% 64.9%",
-    secondary: "240 3.7% 15.9%",
-    secondaryForeground: "0 0% 98%",
-    accent: "240 3.7% 15.9%",
-    accentForeground: "0 0% 98%",
-    primaryForeground: "240 5.9% 10%",
-    destructive: "0 62.8% 50.6%",
-    destructiveForeground: "0 0% 98%",
-  },
-  light: {
-    background: "0 0% 100%",
-    foreground: "240 10% 3.9%",
-    card: "0 0% 98%",
-    cardForeground: "240 10% 3.9%",
-    popover: "0 0% 100%",
-    popoverForeground: "240 10% 3.9%",
-    border: "240 5.9% 90%",
-    input: "240 5.9% 90%",
-    ring: "199 89% 48%",
-    muted: "240 4.8% 95.9%",
-    mutedForeground: "240 3.8% 46.1%",
-    secondary: "240 4.8% 95.9%",
-    secondaryForeground: "240 5.9% 10%",
-    accent: "240 4.8% 95.9%",
-    accentForeground: "240 5.9% 10%",
-    primaryForeground: "0 0% 98%",
-    destructive: "0 84.2% 60.2%",
-    destructiveForeground: "0 0% 98%",
-  },
+export const DARK_THEME: ThemeColors = {
+  background: "240 10% 3.9%",
+  foreground: "0 0% 98%",
+  card: "240 10% 5.9%",
+  cardForeground: "0 0% 98%",
+  popover: "240 10% 5.9%",
+  popoverForeground: "0 0% 98%",
+  border: "240 3.7% 15.9%",
+  input: "240 3.7% 15.9%",
+  ring: "199 89% 48%",
+  muted: "240 3.7% 15.9%",
+  mutedForeground: "240 5% 64.9%",
+  secondary: "240 3.7% 15.9%",
+  secondaryForeground: "0 0% 98%",
+  accent: "240 3.7% 15.9%",
+  accentForeground: "0 0% 98%",
+  primaryForeground: "240 5.9% 10%",
+  destructive: "0 62.8% 50.6%",
+  destructiveForeground: "0 0% 98%",
 };
 
 // Deep Space keeps the page itself near-black so the cosmos shows through, but
@@ -373,9 +296,6 @@ interface PaletteContextType {
   effectivePalette: ColorPalette;
   setPalette: (paletteId: string) => void;
   palettes: ColorPalette[];
-  theme: Theme;
-  setTheme: (theme: Theme) => void;
-  isDark: boolean;
   isOpen: boolean;
   setIsOpen: (open: boolean) => void;
   editingPaletteId: string | null;
@@ -392,7 +312,6 @@ const PaletteContext = createContext<PaletteContextType | undefined>(undefined);
 
 export function PaletteProvider({ children }: { children: ReactNode }) {
   const [currentPalette, setCurrentPalette] = useState<ColorPalette>(DEFAULT_PALETTE);
-  const [theme, setThemeState] = useState<Theme>("dark");
   const [isOpen, setIsOpen] = useState(false);
   const [editingPaletteId, setEditingPaletteId] = useState<string | null>(null);
   const [overrides, setOverrides] = useState<Record<string, Partial<ColorPalette>>>({});
@@ -402,17 +321,15 @@ export function PaletteProvider({ children }: { children: ReactNode }) {
     return o ? { ...currentPalette, ...o } : currentPalette;
   }, [currentPalette, overrides]);
 
-  // Apply a palette + theme combination to the document root
-  const apply = useCallback((palette: ColorPalette, nextTheme: Theme) => {
+  // Apply a palette to the dark-only document root.
+  const apply = useCallback((palette: ColorPalette) => {
     const root = document.documentElement;
-    const baseColors = THEMES[nextTheme];
     const structural = STRUCTURAL_OVERRIDES[palette.id];
     const colors: ThemeColors = structural
-      ? { ...baseColors, ...structural }
-      : baseColors;
+      ? { ...DARK_THEME, ...structural }
+      : DARK_THEME;
 
-    // Theme class drives :root vs :root.dark CSS variable selection
-    root.classList.toggle("dark", nextTheme === "dark");
+    root.classList.add("dark");
 
     // Accent colors (from effective palette — includes any user overrides)
     root.style.setProperty("--palette-primary", palette.primary);
@@ -448,7 +365,6 @@ export function PaletteProvider({ children }: { children: ReactNode }) {
     root.style.setProperty("--primary", palette.primary);
 
     localStorage.setItem("selected-palette", palette.id);
-    localStorage.setItem("selected-theme", nextTheme);
   }, []);
 
   const setPalette = useCallback(
@@ -457,17 +373,9 @@ export function PaletteProvider({ children }: { children: ReactNode }) {
       if (!palette) return;
       setCurrentPalette(palette);
       const o = overrides[palette.id];
-      apply(o ? { ...palette, ...o } : palette, theme);
+      apply(o ? { ...palette, ...o } : palette);
     },
-    [apply, overrides, theme]
-  );
-
-  const setTheme = useCallback(
-    (next: Theme) => {
-      setThemeState(next);
-      apply(effectivePalette, next);
-    },
-    [apply, effectivePalette]
+    [apply, overrides]
   );
 
   const updateOverride = useCallback(
@@ -492,8 +400,8 @@ export function PaletteProvider({ children }: { children: ReactNode }) {
 
   // Apply live overrides to the active palette
   useEffect(() => {
-    apply(effectivePalette, theme);
-  }, [effectivePalette, theme, apply]);
+    apply(effectivePalette);
+  }, [effectivePalette, apply]);
 
   const resetOverride = useCallback((paletteId: string) => {
     setOverrides((prev) => {
@@ -513,12 +421,10 @@ export function PaletteProvider({ children }: { children: ReactNode }) {
     // URL ?palette=<id> overrides everything — handy for previewing a palette.
     const urlPalette = new URLSearchParams(window.location.search).get("palette");
     const savedPaletteId = localStorage.getItem("selected-palette");
-    const savedTheme = localStorage.getItem("selected-theme");
     const palette =
       (urlPalette && PALETTES.find((p) => p.id === urlPalette)) ||
       (savedPaletteId && PALETTES.find((p) => p.id === savedPaletteId)) ||
       DEFAULT_PALETTE;
-    const nextTheme: Theme = savedTheme === "light" ? "light" : "dark";
     setCurrentPalette(palette);
 
     const rawOverrides = localStorage.getItem("custom-palette-overrides");
@@ -530,8 +436,7 @@ export function PaletteProvider({ children }: { children: ReactNode }) {
         /* ignore corrupt localStorage */
       }
     }
-    setThemeState(nextTheme);
-    apply(palette, nextTheme);
+    apply(palette);
   }, [apply]);
 
   // Persist overrides
@@ -549,9 +454,6 @@ export function PaletteProvider({ children }: { children: ReactNode }) {
       effectivePalette,
       setPalette,
       palettes: PALETTES,
-      theme,
-      setTheme,
-      isDark: theme === "dark",
       isOpen,
       setIsOpen,
       editingPaletteId,
@@ -570,8 +472,6 @@ export function PaletteProvider({ children }: { children: ReactNode }) {
       hasOverride,
       resetOverride,
       setPalette,
-      setTheme,
-      theme,
       updateOverride,
     ]
   );
@@ -942,8 +842,6 @@ export function PaletteSelector() {
     effectivePalette,
     setPalette,
     palettes,
-    theme,
-    setTheme,
     isOpen,
     setIsOpen,
     editingPaletteId,
@@ -1017,38 +915,6 @@ export function PaletteSelector() {
                 >
                   <X className="w-3.5 h-3.5 text-muted-foreground" />
                 </button>
-              </div>
-
-              {/* Theme toggle (light/dark) */}
-              <div className="px-2 pb-2">
-                <div className="flex items-center gap-1 p-1 rounded-lg bg-accent/30 border border-border/30">
-                  <button
-                    onClick={() => setTheme("light")}
-                    aria-label="Light mode"
-                    aria-pressed={theme === "light"}
-                    className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-all ${
-                      theme === "light"
-                        ? "bg-[hsl(var(--palette-primary))]/15 text-[hsl(var(--palette-primary))] shadow-sm"
-                        : "text-muted-foreground hover:text-foreground hover:bg-accent/50"
-                    }`}
-                  >
-                    <Sun className="w-3.5 h-3.5" />
-                    <span>Light</span>
-                  </button>
-                  <button
-                    onClick={() => setTheme("dark")}
-                    aria-label="Dark mode"
-                    aria-pressed={theme === "dark"}
-                    className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-all ${
-                      theme === "dark"
-                        ? "bg-[hsl(var(--palette-primary))]/15 text-[hsl(var(--palette-primary))] shadow-sm"
-                        : "text-muted-foreground hover:text-foreground hover:bg-accent/50"
-                    }`}
-                  >
-                    <Moon className="w-3.5 h-3.5" />
-                    <span>Dark</span>
-                  </button>
-                </div>
               </div>
 
               <div className="max-h-[450px] overflow-y-auto space-y-1">

@@ -27,60 +27,9 @@
 }
 
 @layer base {
-  /* Light theme is the default; the PaletteProvider toggles `dark` on <html>
-     to activate the dark token set below. */
+  /* Dark structural tokens are the only baseline. PaletteProvider still refreshes
+     these tokens for palette-specific dark backdrops. */
   :root {
-    --background: 0 0% 100%;
-    --foreground: 240 10% 3.9%;
-    --card: 0 0% 98%;
-    --card-foreground: 240 10% 3.9%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 240 10% 3.9%;
-    --primary: 199 89% 48%;
-    --primary-foreground: 0 0% 98%;
-    --secondary: 240 4.8% 95.9%;
-    --secondary-foreground: 240 5.9% 10%;
-    --muted: 240 4.8% 95.9%;
-    --muted-foreground: 240 3.8% 46.1%;
-    --accent: 240 4.8% 95.9%;
-    --accent-foreground: 240 5.9% 10%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 0 0% 98%;
-    --border: 240 5.9% 90%;
-    --input: 240 5.9% 90%;
-    --ring: 199 89% 48%;
-    --radius: 0.75rem;
-    --font-inter: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-
-    /* Palette accents - default to neon-cyber; PaletteProvider rewrites these */
-    --palette-primary: 199 89% 48%;
-    --palette-primary-glow: 199 100% 60%;
-    --palette-secondary: 220 100% 50%;
-    --palette-secondary-glow: 220 100% 65%;
-    --palette-tertiary: 262 83% 58%;
-    --palette-tertiary-glow: 262 100% 70%;
-    --palette-accent: 330 81% 60%;
-    --palette-accent-glow: 330 100% 72%;
-
-    /* Glass surface tints - dark surfaces want darker drop shadows and
-       lighter inset highlights; light surfaces want the inverse. */
-    --glass-shadow-color: rgba(15, 23, 42, 0.08);
-    --glass-highlight-color: rgba(255, 255, 255, 0.85);
-    --glass-bottom-tint: rgba(15, 23, 42, 0.04);
-    --glass-body-glow: 0.05;
-    /* Glass surfaces are more opaque in light mode so content stays legible. */
-    --glass-bg-alpha: 0.85;
-    --glass-bg-alpha-strong: 0.95;
-    --glass-bg-alpha-subtle: 0.7;
-
-    /* Light mode is already nearly opaque at strong; bump it the rest of the
-       way for the palette selector so it's truly solid against the body. */
-    --panel-bg-alpha: 0.98;
-    --panel-blur: 24px;
-  }
-
-  :root.dark {
     --background: 240 10% 3.9%;
     --foreground: 0 0% 98%;
     --card: 240 10% 5.9%;
@@ -100,6 +49,19 @@
     --border: 240 3.7% 15.9%;
     --input: 240 3.7% 15.9%;
     --ring: 199 89% 48%;
+    --radius: 0.75rem;
+    --font-inter: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+
+    /* Palette accents - default to neon-cyber; PaletteProvider rewrites these */
+    --palette-primary: 199 89% 48%;
+    --palette-primary-glow: 199 100% 60%;
+    --palette-secondary: 220 100% 50%;
+    --palette-secondary-glow: 220 100% 65%;
+    --palette-tertiary: 262 83% 58%;
+    --palette-tertiary-glow: 262 100% 70%;
+    --palette-accent: 330 81% 60%;
+    --palette-accent-glow: 330 100% 72%;
 
     --glass-shadow-color: rgba(0, 0, 0, 0.4);
     --glass-highlight-color: rgba(255, 255, 255, 0.12);
