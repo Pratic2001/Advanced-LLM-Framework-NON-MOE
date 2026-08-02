@@ -78,8 +78,10 @@ CONFIG = {
 
     # ---------------- Supernova remnant iris (3D shell) ----------------
     # Width/height segments of the iris sphere that grows around each blast.
-    "iris_width_segments": 48,
-    "iris_height_segments": 32,
+    # Kept high (160x128) so the vertex-displaced shell reads smooth/high-poly
+    # rather than faceted — this is what removed the "low poly hypernova" look.
+    "iris_width_segments": 160,
+    "iris_height_segments": 128,
 
     # ---------------- Accretion disk (the heavy one) ----------------
     # How many volumetric sheets the disk is stacked from. 20 = thickest.
@@ -98,10 +100,11 @@ CONFIG = {
     "halo_tubular_segments": 220,
 
     # ---------------- Supernova particle ejecta ----------------
-    # Particle count per big (ambient/click) supernova.
-    "nova_particles_big": 1000,
+    # Particle count per big (ambient/click) supernova. 1400 keeps the
+    # asymmetric clumps and jet-axis streaks dense enough to read sculpted.
+    "nova_particles_big": 1400,
     # Particle count per small supernova.
-    "nova_particles_small": 600,
+    "nova_particles_small": 900,
 
     # ---------------- Post pass (per-pixel, the true cost driver) ----------------
     # RK4 photon-geodesic integration steps per pixel. 200 = crisp lensing.
@@ -173,15 +176,15 @@ PRESETS = {
         "nebula_count": 6,
         "horizon_segments": 48,
         "rim_segments": 48,
-        "iris_width_segments": 40,
-        "iris_height_segments": 28,
+        "iris_width_segments": 160,
+        "iris_height_segments": 128,
         "disk_layer_count": 14,
         "disk_angular_segments": 150,
         "disk_radial_segments": 22,
         "halo_radial_segments": 16,
         "halo_tubular_segments": 180,
         "nova_particles_big": 1400,
-        "nova_particles_small": 700,
+        "nova_particles_small": 900,
         "geodesic_steps": 140,
         "bloom_taps": 256,
         "max_novae": 5,
@@ -275,16 +278,16 @@ TUNING = [
     {
         "key": "iris_width_segments", "group": "Supernova",
         "label": "Iris width segments",
-        "desc": "Latitudinal segments of the remnant-iris sphere.",
-        "type": "int", "min": 8, "max": 128, "default": 48,
+        "desc": "Latitudinal segments of the remnant-iris sphere. Keep high (>=160) so the displaced shell reads smooth, not faceted.",
+        "type": "int", "min": 8, "max": 256, "default": 160,
         "patterns": [(_pat(
             r"(new THREE\.SphereGeometry\(1, )(\d+)(, )(\d+)(\))"), [2])],
     },
     {
         "key": "iris_height_segments", "group": "Supernova",
         "label": "Iris height segments",
-        "desc": "Longitudinal segments of the remnant-iris sphere.",
-        "type": "int", "min": 8, "max": 64, "default": 32,
+        "desc": "Longitudinal segments of the remnant-iris sphere. Keep high (>=128) so the displaced shell reads smooth, not faceted.",
+        "type": "int", "min": 8, "max": 192, "default": 128,
         "patterns": [(_pat(
             r"(new THREE\.SphereGeometry\(1, )(\d+)(, )(\d+)(\))"), [4])],
     },
@@ -341,7 +344,7 @@ TUNING = [
         "key": "nova_particles_big", "group": "Supernova",
         "label": "Big supernova particles",
         "desc": "Particle count for big (ambient/click) supernovae.",
-        "type": "int", "min": 100, "max": 8000, "default": 2048,
+        "type": "int", "min": 100, "max": 8000, "default": 1400,
         "patterns": [(_pat(
             r"(const count = big \? )(\d+)( : )(\d+)(;)"), [2])],
     },

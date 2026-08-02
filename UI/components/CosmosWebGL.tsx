@@ -338,7 +338,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     // pattern onto this sphere's own surface direction, so the explosion has
     // real volume and reads correctly from any viewing angle instead of always
     // presenting the same flat cutout.
-    const irisGeo = new THREE.SphereGeometry(1, 48, 32);
+    const irisGeo = new THREE.SphereGeometry(1, 160, 128);
 
     // ---- starfield ----
     function createStarfield(count: number): THREE.Points {
@@ -1222,7 +1222,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     let flashLevel = 0;
 
     function makeSupernova(pos: THREE.Vector3, big: boolean): Supernova {
-      const count = big ? 1000 : 600;
+      const count = big ? 1400 : 900;
       const positions = new Float32Array(count * 3);
       const velocities = new Float32Array(count * 3);
       const sizes = new Float32Array(count);
@@ -1465,6 +1465,8 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
         vertexShader: `
           varying vec3 vDir;
+          varying vec3 vViewPos;
+          varying vec3 vCenterView;
           uniform float uAge, uSeed, uTime;
           uniform float uAnisoAngle, uAnisoAmt, uAnisoSpin;
           uniform float uPlumeAngle, uPlumeAmt, uJetAngle, uGapAngle, uGapWidth, uDesign;
@@ -1536,7 +1538,10 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
             float growth = clamp(1.0 + bump*0.9 + jetBoost - gapPinch, 0.35, 1.9) * stretch;
 
             vec3 displaced = dir * growth;
-            gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
+            vec4 mvPos = modelViewMatrix * vec4(displaced, 1.0);
+            vViewPos = mvPos.xyz;
+            vCenterView = (modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+            gl_Position = projectionMatrix * mvPos;
           }
         `,
         fragmentShader: `
@@ -1547,6 +1552,8 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           uniform float uDesign, uMaxR, uPlumeAngle, uPlumeAmt, uJetAngle;
           uniform float uGapAngle, uGapWidth, uKnotAngle;
           varying vec3 vDir;
+          varying vec3 vViewPos;
+          varying vec3 vCenterView;
 
           // Minimal RGB<->HSV round trip so each band's base color can be hue-
           // rotated per instance while keeping the same brightness structure.
@@ -1865,6 +1872,38 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
               shellAlpha = clamp(fillMask*0.9 + ringThin*1.3 + speckle*fillMask*0.6, 0.0, 1.0);
             }
 
+            // ---- Sedov shock front. A real hypernova blast wave doesn't keep
+            // inflating like a balloon — it slams into the interstellar medium
+            // and piles material up at the leading edge into a thin, bright,
+            // filamentary rim. Keyed to the view-space limb (the silhouette of
+            // the displaced shell) rather than a fixed radius, so the bright
+            // rim hugs the actual projected edge from every angle — the same
+            // limb-brightening a real spherical remnant shows. It sharpens as
+            // the front decelerates and relaxes as the remnant thins out.
+            vec3 R = normalize(vViewPos - vCenterView);
+            float facing = dot(R, normalize(-vViewPos));
+            float limb = 1.0 - clamp(abs(facing), 0.0, 1.0);
+            float shock = pow(limb, 1.8);
+            shock *= smoothstep(0.1, 0.42, uAge);
+            shock *= 1.0 - smoothstep(0.76, 1.0, uAge);
+            shock *= 0.5 + 0.5 * fbm(vec2(ang*21.0 + uSeed*19.0, limb*16.0 - uTime*0.18));
+            vec3 shockCol = hueShift(mix(vec3(1.0,0.88,0.62), vec3(0.72,0.92,1.0), 0.3 + 0.7*cloudy), uHueRing, 1.25);
+            col += shockCol * shock * 1.5;
+            shellAlpha = clamp(shellAlpha + shock * 0.9, 0.0, 1.0);
+
+            // ---- Volumetric interior. The shell is a skin; the swept,
+            // post-shock gas inside it glows faintly on its own — denser
+            // toward the center and threaded with slow interior filaments.
+            // Without it the remnant reads as a hollow bubble. Kept faint so
+            // the structured bands still dominate.
+            float interiorFill = 1.0 - smoothstep(uMaxR*0.3, uMaxR*0.95, r);
+            interiorFill *= smoothstep(0.0, 0.14, uAge);
+            float interiorFib = fbm(vec2(ang*15.0 + uSeed*31.0, r*2.4 - uTime*0.05));
+            interiorFib = pow(1.0 - abs(interiorFib*2.0 - 1.0), 3.0);
+            vec3 interiorCol = hueShift(mix(vec3(0.09,0.17,0.31), vec3(0.31,0.20,0.45), 0.5 + 0.5*cloudy), uHueIris, 0.9);
+            col += interiorCol * interiorFill * (0.08 + 0.20*interiorFib);
+            shellAlpha = clamp(shellAlpha + interiorFill * (0.06 + 0.10*interiorFib), 0.0, 1.0);
+
             // ---- Blend ignition into the settled remnant, then fade the
             // whole thing in at birth and out at the end of its life.
             // Dust-lane occlusion — real remnants are never uniformly bright.
@@ -1986,7 +2025,13 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           supernovae.splice(i, 1);
           continue;
         }
-        const drag = Math.pow(0.985, dt * 60);
+        // Sedov-Taylor blast wave: the ejecta isn't expanding into a vacuum,
+        // it's sweeping up interstellar gas. Drag therefore rises with age as
+        // the front piles into more material — so the shell visibly slams the
+        // brakes late in life (R ~ t^0.4, velocity ~ t^-0.6) and the faster
+        // outer clumps race ahead while the bulk settles behind, instead of
+        // everything drifting outward at a constant rate forever.
+        const drag = Math.pow(0.985 - 0.02 * age, dt * 60);
         const pos = s.positions, vel = s.velocities;
         for (let j = 0; j < pos.length; j += 3) {
           vel[j] *= drag;
@@ -2067,6 +2112,10 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           value: Array.from({ length: MAX_NOVAE }, () => new THREE.Vector3()),
         },
         uNovaRadius: { value: new Float32Array(MAX_NOVAE) },
+        // The visible shell radius, uncapped — the tracer's uNovaRadius is
+        // capped at 9.0 (see the update loop), so it can't recover the real
+        // shell size for the screen-space edge feather below.
+        uNovaShellRadius: { value: new Float32Array(MAX_NOVAE) },
       },
       vertexShader: `
         varying vec2 vUv;
@@ -2093,6 +2142,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         uniform int uNovaCount;
         uniform vec3 uNovaPos[MAX_NOVAE];
         uniform float uNovaRadius[MAX_NOVAE];
+        uniform float uNovaShellRadius[MAX_NOVAE];
         varying vec2 vUv;
 
         // ---- Real photon geodesic integration in Schwarzschild spacetime ----
@@ -2259,6 +2309,31 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
             color += caTint * ringGlow * 0.4 * ca * 40.0;
           }
 
+          // ---- Soft lensing edge. The geodesic tracer treats each nova as a
+          // hard opaque sphere, so the region where background light gets
+          // redirected cuts off abruptly at the shell's boundary as you orbit.
+          // Feather it in screen space: project each active nova's center and
+          // lay a soft glow just outside its silhouette that ramps the light
+          // in gently instead of snapping — the boundary reads as a smooth
+          // gravitational-lens falloff rather than a hard circle.
+          for(int n=0;n<MAX_NOVAE;n++){
+            if(n >= uNovaCount) break;
+            vec3 toNova = uNovaPos[n] - uCamPos;
+            float dN = dot(toNova, uCamForward);
+            if(dN < 0.05) continue;
+            vec2 cProj = vec2(dot(toNova,uCamRight)/uAspect, dot(toNova,uCamUp)) / (dN*uTanHalfFovY);
+            vec2 uvN = cProj*0.5 + 0.5;
+            vec2 dv = uv - uvN;
+            dv.x *= uAspect;
+            float distUV = length(dv);
+            float rShell = (uNovaShellRadius[n]/(dN*uTanHalfFovY)) * 0.5;
+            if(rShell < 1e-3) continue;
+            float halo = smoothstep(rShell*1.35, rShell*1.03, distUV)
+                       * smoothstep(0.0, rShell*0.55, distUV);
+            vec3 lensGlow = mix(vec3(1.0,0.85,0.6), vec3(0.75,0.9,1.0), uPalette);
+            color += lensGlow * halo * 0.10;
+          }
+
           // Cheap wide-radius bloom: pull in a handful of bright-pass taps at
           // increasing offsets and add them back additively, so the disk and
           // halo bands bleed soft light into the surrounding dark the way an
@@ -2353,6 +2428,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         // reading as a growing orb smothering the horizon, and occasionally as
         // the whole hole falling back to flat, un-bent shading.
         postMat.uniforms.uNovaRadius.value[i] = Math.min(s.iris.scale.x * 1.9, 9.0);
+        postMat.uniforms.uNovaShellRadius.value[i] = s.iris.scale.x;
       }
     }
 
