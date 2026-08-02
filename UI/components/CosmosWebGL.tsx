@@ -415,7 +415,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     // fixed distortion overlay.
     const bgGroup = new THREE.Group();
 
-    const stars = createStarfield(9000);
+    const stars = createStarfield(19000);
     bgGroup.add(stars);
 
     // ---- distant colourful nebulae (additive sprites) ----
@@ -433,7 +433,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         [1, "rgba(0,0,0,0)"],
       ]);
     }
-    for (let i = 0; i < 7; i++) {
+    for (let i = 0; i < 10; i++) {
       const c = nebulaColors[i % nebulaColors.length][1];
       const tex = makeNebulaTexture(c);
       const mat = new THREE.SpriteMaterial({
@@ -1078,7 +1078,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     // soft, rounded glowing tube rather than a stack of hard-edged sheets —
     // this is what finally gives the disk actual, real 3D depth: viewed dead
     // edge-on it now shows as a genuinely thick glowing band, not a line.
-    const DISK_LAYER_OFFSETS = [-0.967165, -0.640324, -0.596942, -0.544649, -0.533872, -0.398153, -0.278787, -0.275193, -0.274899, -0.193609, -0.027831, 0.110460, 0.127309, 0.208466, 0.231603, 0.319092, 0.494153, 0.807735, 0.906307, 0.999499];
+    const DISK_LAYER_OFFSETS = [-0.967165, -0.591132, -0.503712, -0.277589, -0.238770, 0.048997, 0.181414, 0.299650, 0.772893, 0.999499];
     const diskGroup = new THREE.Group();
     const diskMats: THREE.ShaderMaterial[] = [];
     DISK_LAYER_OFFSETS.forEach((yOff, i) => {
@@ -1222,7 +1222,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     let flashLevel = 0;
 
     function makeSupernova(pos: THREE.Vector3, big: boolean): Supernova {
-      const count = big ? 2048 : 900;
+      const count = big ? 1000 : 600;
       const positions = new Float32Array(count * 3);
       const velocities = new Float32Array(count * 3);
       const sizes = new Float32Array(count);
@@ -2127,7 +2127,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
 
           float prevSide = dot(p, uDiskNormal);
 
-          const int STEPS = 200;
+          const int STEPS = 128;
           for(int i=0;i<STEPS;i++){
             float r = length(p);
             if(r < uRs*0.98){
@@ -2264,7 +2264,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
           // halo bands bleed soft light into the surrounding dark the way an
           // over-exposed, bloom-heavy render does in the reference footage.
           vec3 bloom = vec3(0.0);
-          const int TAPS = 512;
+          const int TAPS = 128;
           for(int i=0;i<TAPS;i++){
             float fi = float(i);
             float ang = fi*2.399963;

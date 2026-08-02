@@ -66,9 +66,9 @@ from pathlib import Path
 CONFIG = {
     # ---------------- Sky (cheap, huge visual payoff) ----------------
     # Number of stars (THREE.Points). 3000 is already plenty on small screens.
-    "star_count": 9000,
+    "star_count": 19000,
     # Number of additive nebula sprites drifting in the background.
-    "nebula_count": 7,
+    "nebula_count": 10,
 
     # ---------------- Black hole & ring (sphere tessellation) ----------------
     # Tessellation of the black event-horizon sphere (both segments equal).
@@ -85,7 +85,7 @@ CONFIG = {
     # How many volumetric sheets the disk is stacked from. 20 = thickest.
     # Fewer layers = much cheaper. Non-20 counts are auto-resampled from the
     # reference distribution (see VALUE_PATCHER.md).
-    "disk_layer_count": 20,
+    "disk_layer_count": 10,
     # Angular tessellation of each disk sheet (smoothness around the ring).
     "disk_angular_segments": 200,
     # Radial tessellation of each disk sheet (smoothness toward the hole).
@@ -99,16 +99,16 @@ CONFIG = {
 
     # ---------------- Supernova particle ejecta ----------------
     # Particle count per big (ambient/click) supernova.
-    "nova_particles_big": 2048,
+    "nova_particles_big": 1000,
     # Particle count per small supernova.
-    "nova_particles_small": 900,
+    "nova_particles_small": 600,
 
     # ---------------- Post pass (per-pixel, the true cost driver) ----------------
     # RK4 photon-geodesic integration steps per pixel. 200 = crisp lensing.
     # 80-120 still looks great and is dramatically faster.
-    "geodesic_steps": 200,
+    "geodesic_steps": 128,
     # Bloom taps per pixel (512-tap wide-radius bloom).
-    "bloom_taps": 512,
+    "bloom_taps": 128,
     # Max simultaneously-lensable supernovae (must be >= 1).
     "max_novae": 6,
 
