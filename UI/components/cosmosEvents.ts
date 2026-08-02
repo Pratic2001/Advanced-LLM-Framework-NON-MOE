@@ -10,7 +10,15 @@
 // tokens, then decay back to the palette's base values on their own clock.
 
 export interface CosmosEvent {
-  type: "supernova";
+  // One event type per palette world (deep-space emits "supernova"; the
+  // flagship worlds emit their own). Consumers ignore `type`, so widening
+  // here is purely self-documentation.
+  type:
+    | "supernova"
+    | "neon-surge"
+    | "solar-eruption"
+    | "aurora-pulse"
+    | "ocean-surge";
   /** 0..1 — how strongly the UI should react to this blast. */
   heat: number;
   /** Target hue (degrees) that the event tints the palette toward. */

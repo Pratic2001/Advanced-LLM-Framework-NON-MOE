@@ -1,11 +1,39 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+  useMemo,
+  type ComponentType,
+} from "react";
 import dynamic from "next/dynamic";
+import { supportsWebGL } from "./webglSupport";
 
 // The WebGL3D renderer must never run during SSR (needs a real canvas/GPU).
 const CosmosWebGL = dynamic(
   () => import("./CosmosWebGL").then((m) => m.CosmosWebGL),
+  { ssr: false, loading: () => null },
+);
+
+// Per-palette WebGL worlds. Each is a fully self-contained scene (like
+// CosmosWebGL) mounted only while its palette is active, and disposed
+// (incl. forceContextLoss) on palette switch / unmount.
+const NeonCityWebGL = dynamic(
+  () => import("./NeonCityWebGL").then((m) => m.NeonCityWebGL),
+  { ssr: false, loading: () => null },
+);
+const SolarFlareWebGL = dynamic(
+  () => import("./SolarFlareWebGL").then((m) => m.SolarFlareWebGL),
+  { ssr: false, loading: () => null },
+);
+const AuroraWebGL = dynamic(
+  () => import("./AuroraWebGL").then((m) => m.AuroraWebGL),
+  { ssr: false, loading: () => null },
+);
+const OceanWebGL = dynamic(
+  () => import("./OceanWebGL").then((m) => m.OceanWebGL),
   { ssr: false, loading: () => null },
 );
 
@@ -1570,6 +1598,25 @@ const PALETTE_STRATEGY: Record<string, StrategyKey> = {
   "deep-space": "cosmos",
 };
 
+// Palettes that have shipped a dedicated WebGL world. These take priority over
+// the 2D strategy above when a GPU is available and reduced-motion is off; the
+// 2D canvas strategy remains the fallback. Palettes not listed stay on 2D.
+type WorldKey = "neon-city" | "solar" | "aurora" | "ocean";
+
+const PALETTE_WORLD: Record<string, WorldKey> = {
+  "neon-cyber": "neon-city",
+  "solar-flare": "solar",
+  "aurora-borealis": "aurora",
+  "ocean-depths": "ocean",
+};
+
+const WORLD_COMPONENTS: Record<WorldKey, ComponentType<{ className?: string }>> = {
+  "neon-city": NeonCityWebGL,
+  solar: SolarFlareWebGL,
+  aurora: AuroraWebGL,
+  ocean: OceanWebGL,
+};
+
 // ── The exported component ────────────────────────────────────────────────
 
 export function InteractiveBackground({
@@ -1585,7 +1632,17 @@ export function InteractiveBackground({
   const stateRef = useRef<unknown>(null);
   const lastTimeRef = useRef(0);
   const [reducedMotion, setReducedMotion] = useState(false);
+  const [webglOk] = useState(() => supportsWebGL());
   const strategyKey: StrategyKey = PALETTE_STRATEGY[palette] || "neural";
+  const worldKey: WorldKey | null = PALETTE_WORLD[palette] ?? null;
+  const isDeepSpace = palette === "deep-space";
+
+  // Deep space ALWAYS renders CosmosWebGL (it handles no-GPU and reduced-motion
+  // internally, so it is not gated here). Flagship worlds need a GPU and no
+  // reduced-motion; otherwise their 2D canvas strategy is the fallback.
+  const webglActive = isDeepSpace || (worldKey !== null && webglOk && !reducedMotion);
+  const World: ComponentType<{ className?: string }> | null =
+    webglActive && worldKey ? WORLD_COMPONENTS[worldKey] : null;
 
   // Palette colors as RGB tuples — convert from HSL strings stored on
   // <html>. The provider writes these vars on the root, so we read them
@@ -1616,6 +1673,14 @@ export function InteractiveBackground({
 
   // Reset state when strategy or palette changes
   useEffect(() => {
+    if (webglActive) {
+      // A WebGL world renders the background; there is no 2D canvas state.
+      // (The `webglActive` dep makes this re-run when reduced-motion toggles
+      // back on, so the 2D fallback re-allocates its state fresh.)
+      stateRef.current = null;
+      lastTimeRef.current = 0;
+      return;
+    }
     const canvas = canvasRef.current;
     if (!canvas) return;
     const w = window.innerWidth;
@@ -1643,7 +1708,7 @@ export function InteractiveBackground({
         break;
     }
     lastTimeRef.current = 0;
-  }, [strategyKey, paletteRGB]);
+  }, [strategyKey, paletteRGB, webglActive]);
 
   const animate = useCallback(
     (time: number) => {
@@ -1727,21 +1792,21 @@ export function InteractiveBackground({
   );
 
   useEffect(() => {
-    // The cosmos strategy owns its own WebGL RAF loop in CosmosWebGL.
-    // Don't run the 2D canvas loop for it — it would burn frames against
-    // a hidden canvas.
-    if (strategyKey === "cosmos") {
+    // A WebGL world (deep-space cosmos or a flagship world) owns its own RAF
+    // loop. Don't run the 2D canvas loop for it — it would burn frames
+    // against a hidden canvas.
+    if (webglActive) {
       return;
     }
     animationRef.current = requestAnimationFrame(animate);
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
     };
-  }, [animate, strategyKey]);
+  }, [animate, strategyKey, webglActive]);
 
-  // Mouse + touch tracking (skipped for cosmos — CosmosWebGL handles its own)
+  // Mouse + touch tracking (skipped for WebGL worlds — they handle their own)
   useEffect(() => {
-    if (strategyKey === "cosmos") return;
+    if (webglActive) return;
     const onMove = (e: MouseEvent) => {
       mouseRef.current = { x: e.clientX, y: e.clientY };
     };
@@ -1763,17 +1828,26 @@ export function InteractiveBackground({
       window.removeEventListener("touchmove", onTouch);
       window.removeEventListener("resize", onResize);
     };
-  }, [strategyKey]);
+  }, [strategyKey, webglActive]);
 
   return (
     <>
-      {strategyKey === "cosmos" ? (
+      {isDeepSpace ? (
         // WebGL renderer for the Deep Space palette: a faithful port of the
         // "Event Horizon" black-hole scene — event-horizon orb, tilted golden
         // disk, fresnel rim, halo, 9000 stars, colourful nebulae, particle
         // supernovae and a fake-lensing post pass. Falls back internally to an
         // animated CSS starfield if a GPU context cannot be created.
         <CosmosWebGL className={`fixed inset-0 -z-10 pointer-events-none ${className}`} />
+      ) : World ? (
+        // A flagship palette's dedicated WebGL world (neon city, solar flare,
+        // aurora, ocean). Mounted only while that palette is active; keyed so
+        // a palette switch unmounts (and disposes) the old world before the
+        // next mounts.
+        <World
+          key={worldKey ?? "world"}
+          className={`fixed inset-0 -z-10 pointer-events-none ${className}`}
+        />
       ) : (
         <canvas
           ref={canvasRef}

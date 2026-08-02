@@ -183,6 +183,15 @@ function HeroButton({
 export default function HomePage() {
   const { currentPalette } = usePalette();
   const isDeepSpace = currentPalette.id === "deep-space";
+
+  // Worlds with a strong centered focal point (black hole, sun, neon horizon)
+  // get a left-aligned hero so the scene stays visible behind the headline.
+  const HERO_LAYOUT: Record<string, "left" | "center"> = {
+    "deep-space": "left",
+    "neon-cyber": "left",
+    "solar-flare": "left",
+  };
+  const leftAlign = HERO_LAYOUT[currentPalette.id] === "left";
   const [tilt, setTilt] = useState<Record<string, { x: number; y: number }>>({});
 
   // Track mouse position per-card for 3D tilt + spotlight effect
@@ -243,13 +252,13 @@ export default function HomePage() {
         {/* Hero */}
         <section
           className={
-            isDeepSpace
+            leftAlign
               ? "flex-1 flex flex-col items-start justify-start px-6 md:px-14 lg:px-20 pt-10 md:pt-16 pb-16 text-left relative"
               : "flex-1 flex flex-col items-center justify-center px-6 py-20 md:py-28 text-center relative"
           }
         >
           <HeroParallax
-            leftAlign={isDeepSpace}
+            leftAlign={leftAlign}
             textChildren={
               <motion.div
                 initial={{ opacity: 0, y: 24 }}
@@ -269,7 +278,7 @@ export default function HomePage() {
 
                 <h1
                   className={
-                    isDeepSpace
+                    leftAlign
                       ? "text-4xl md:text-6xl font-bold tracking-tight mb-6 leading-[1.08]"
                       : "text-5xl md:text-7xl font-bold tracking-tight mb-6 leading-[1.05]"
                   }
@@ -299,7 +308,7 @@ export default function HomePage() {
 
                 <p
                   className={
-                    isDeepSpace
+                    leftAlign
                       ? "text-base md:text-lg text-muted-foreground max-w-xl leading-relaxed"
                       : "text-lg text-muted-foreground max-w-2xl mx-auto leading-relaxed"
                   }
@@ -313,7 +322,7 @@ export default function HomePage() {
             buttons={
               <div
                 className={`flex items-center gap-4 flex-wrap ${
-                  isDeepSpace ? "justify-start" : "justify-center"
+                  leftAlign ? "justify-start" : "justify-center"
                 }`}
               >
                 <HeroButton href="/signup" primary>

@@ -256,6 +256,90 @@ const DEEP_SPACE_OVERRIDES: Partial<ThemeColors> = {
   accentForeground: "0 0% 92%",
 };
 
+// Each palette with a WebGL world keeps a near-black background so the 3D
+// scene shows through, while the structural tokens (card/border/muted) are
+// lifted just enough that chrome stays legible over the scene. Ring mirrors
+// the palette's primary hue so focus rings/selection match the world.
+
+const NEON_CYBER_OVERRIDES: Partial<ThemeColors> = {
+  background: "240 30% 3%",
+  card: "220 25% 8%",
+  cardForeground: "0 0% 90%",
+  popover: "220 25% 7%",
+  popoverForeground: "0 0% 90%",
+  border: "220 25% 22%",
+  input: "220 25% 22%",
+  ring: "199 89% 48%",
+  muted: "240 15% 11%",
+  mutedForeground: "0 0% 72%",
+  secondary: "240 15% 12%",
+  secondaryForeground: "0 0% 92%",
+  accent: "240 15% 12%",
+  accentForeground: "0 0% 92%",
+};
+
+const SOLAR_FLARE_OVERRIDES: Partial<ThemeColors> = {
+  background: "20 40% 3%",
+  card: "20 30% 8%",
+  cardForeground: "0 0% 90%",
+  popover: "20 30% 7%",
+  popoverForeground: "0 0% 90%",
+  border: "20 30% 22%",
+  input: "20 30% 22%",
+  ring: "24 95% 53%",
+  muted: "20 20% 11%",
+  mutedForeground: "0 0% 72%",
+  secondary: "20 20% 12%",
+  secondaryForeground: "0 0% 92%",
+  accent: "20 20% 12%",
+  accentForeground: "0 0% 92%",
+};
+
+const AURORA_OVERRIDES: Partial<ThemeColors> = {
+  background: "170 30% 3%",
+  card: "170 25% 8%",
+  cardForeground: "0 0% 90%",
+  popover: "170 25% 7%",
+  popoverForeground: "0 0% 90%",
+  border: "170 25% 20%",
+  input: "170 25% 20%",
+  ring: "173 80% 40%",
+  muted: "170 18% 11%",
+  mutedForeground: "0 0% 72%",
+  secondary: "170 18% 12%",
+  secondaryForeground: "0 0% 92%",
+  accent: "170 18% 12%",
+  accentForeground: "0 0% 92%",
+};
+
+const OCEAN_OVERRIDES: Partial<ThemeColors> = {
+  background: "210 40% 3%",
+  card: "210 25% 8%",
+  cardForeground: "0 0% 90%",
+  popover: "210 25% 7%",
+  popoverForeground: "0 0% 90%",
+  border: "210 25% 20%",
+  input: "210 25% 20%",
+  ring: "189 94% 43%",
+  muted: "210 18% 11%",
+  mutedForeground: "0 0% 72%",
+  secondary: "210 18% 12%",
+  secondaryForeground: "0 0% 92%",
+  accent: "210 18% 12%",
+  accentForeground: "0 0% 92%",
+};
+
+// Structural overrides applied by palette id. Only palettes whose WebGL world
+// needs a dark backdrop to show through are listed; the rest use the plain
+// theme colors.
+const STRUCTURAL_OVERRIDES: Record<string, Partial<ThemeColors>> = {
+  "deep-space": DEEP_SPACE_OVERRIDES,
+  "neon-cyber": NEON_CYBER_OVERRIDES,
+  "solar-flare": SOLAR_FLARE_OVERRIDES,
+  "aurora-borealis": AURORA_OVERRIDES,
+  "ocean-depths": OCEAN_OVERRIDES,
+};
+
 // ── HSL parsing helpers ────────────────────────────────────────────────────
 
 type HSL = { h: number; s: number; l: number };
@@ -322,10 +406,10 @@ export function PaletteProvider({ children }: { children: ReactNode }) {
   const apply = useCallback((palette: ColorPalette, nextTheme: Theme) => {
     const root = document.documentElement;
     const baseColors = THEMES[nextTheme];
-    const colors: ThemeColors =
-      palette.id === "deep-space"
-        ? { ...baseColors, ...DEEP_SPACE_OVERRIDES }
-        : baseColors;
+    const structural = STRUCTURAL_OVERRIDES[palette.id];
+    const colors: ThemeColors = structural
+      ? { ...baseColors, ...structural }
+      : baseColors;
 
     // Theme class drives :root vs :root.dark CSS variable selection
     root.classList.toggle("dark", nextTheme === "dark");
@@ -494,7 +578,7 @@ export function PaletteProvider({ children }: { children: ReactNode }) {
 
   return (
     <PaletteContext.Provider value={value}>
-      <DeepSpacePaletteSync />
+      <PaletteEventSync />
       {children}
     </PaletteContext.Provider>
   );
@@ -508,11 +592,11 @@ export function usePalette() {
   return context;
 }
 
-// ── Deep Space dynamic accent sync ────────────────────────────────────────
-// When the Deep Space palette is active the WebGL cosmos background is live:
-// hypernovae flash white-gold, then their ejecta cools to teal/violet/magenta.
-// This component pulses the accent tokens in response — flooding the UI with
-// the event colour, then easing back to the palette's quiet base values. All
+// ── World event accent sync ────────────────────────────────────────────────
+// When a palette with a WebGL world is active, background events (deep-space
+// supernovae, neon glitch pulses, solar eruptions, aurora ripples, ocean
+// surges) pulse the accent tokens in response — flooding the UI with the
+// event colour, then easing back to the palette's quiet base values. All
 // writes go straight to CSS vars (no state, no localStorage), so every element
 // that reads `hsl(var(--palette-*))` — buttons, glows, gradient text, status
 // dots, cursor glow — reacts together.
@@ -529,7 +613,52 @@ function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
-function DeepSpacePaletteSync() {
+// Palettes whose background is a WebGL world that emits accent-pulsing events.
+const WORLD_PALETTES = new Set([
+  "deep-space",
+  "neon-cyber",
+  "solar-flare",
+  "aurora-borealis",
+  "ocean-depths",
+]);
+
+// Per-palette pulse targets — the (saturation, lightness) each accent eases
+// toward while a pulse is alive. Deep-space's exact values are the default.
+type SyncTarget = Record<AccentKey, [number, number]>;
+const SYNC_TARGETS: Record<string, SyncTarget> = {
+  "deep-space": {
+    primary: [78, 56],
+    secondary: [55, 44],
+    tertiary: [52, 38],
+    accent: [72, 64],
+  },
+  "neon-cyber": {
+    primary: [89, 55],
+    secondary: [100, 55],
+    tertiary: [83, 60],
+    accent: [81, 62],
+  },
+  "solar-flare": {
+    primary: [95, 60],
+    secondary: [84, 65],
+    tertiary: [100, 55],
+    accent: [95, 50],
+  },
+  "aurora-borealis": {
+    primary: [80, 48],
+    secondary: [89, 52],
+    tertiary: [100, 55],
+    accent: [76, 42],
+  },
+  "ocean-depths": {
+    primary: [94, 50],
+    secondary: [89, 52],
+    tertiary: [80, 45],
+    accent: [76, 47],
+  },
+};
+
+function PaletteEventSync() {
   const { currentPalette, effectivePalette } = usePalette();
   const heatRef = useRef(0);
   const hueRef = useRef(46);
@@ -542,7 +671,7 @@ function DeepSpacePaletteSync() {
     baseRef.current = effectivePalette;
   }, [effectivePalette]);
 
-  const active = currentPalette.id === "deep-space";
+  const active = WORLD_PALETTES.has(currentPalette.id);
 
   // Per-frame drive loop — only runs while a pulse is alive.
   const tick = useCallback((now: number) => {
@@ -576,10 +705,11 @@ function DeepSpacePaletteSync() {
       }
     };
 
-    setAccent("primary", 78, 56);
-    setAccent("secondary", 55, 44);
-    setAccent("tertiary", 52, 38);
-    setAccent("accent", 72, 64);
+    const targets = SYNC_TARGETS[baseRef.current.id] ?? SYNC_TARGETS["deep-space"];
+    setAccent("primary", ...targets.primary);
+    setAccent("secondary", ...targets.secondary);
+    setAccent("tertiary", ...targets.tertiary);
+    setAccent("accent", ...targets.accent);
 
     if (heat > 0) {
       rafRef.current = requestAnimationFrame(tick);
