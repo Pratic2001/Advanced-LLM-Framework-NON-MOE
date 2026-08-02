@@ -92,11 +92,16 @@ void main() {
   vec3 p = ro + rd * t;
   vec3 n = normalize(p);
   float nf = fbm(p * 1.7 + uTime * 0.12);
-  // Bright granulation, darker sunspots where noise dips.
-  vec3 col = mix(uColorA, uColorB, nf);
-  col *= 1.0 - smoothstep(0.30, 0.05, nf) * 0.85;
+  // Bright granulation, softer sunspots where the broad noise dips. The ramp is
+  // shallow and capped at 55% so the disk reads as organic cells, never the
+  // hard-edged blocky blotches of a low-poly / voxel sun.
+  vec3 col = mix(uColorA, uColorB, nf * 0.8 + 0.2);
+  col *= 1.0 - smoothstep(0.45, 0.12, nf) * 0.55;
+  // Fine cellular granulation on top.
+  float fine = fbm(p * 6.5 + vec3(uTime * 0.35, uTime * 0.18, 0.0));
+  col *= 0.86 + 0.28 * fine;
   // Gentle living flicker.
-  col *= 0.93 + 0.07 * sin(uTime * 3.0 + nf * 24.0);
+  col *= 0.94 + 0.06 * sin(uTime * 3.0 + nf * 24.0);
   // Limb darkening toward the edge.
   vec3 V = normalize(uCamPos - p);
   float ndv = abs(dot(n, V));
@@ -265,6 +270,10 @@ export function SolarFlareWebGL({ className = "" }: { className?: string }) {
     );
     const clock = new THREE.Clock();
     const disposables: THREE.Texture[] = [];
+    // Round soft-glow sprite for every particle system — without a map the
+    // points render as hard-edged squares, which reads as "Minecraft sun".
+    const glowTex = new THREE.CanvasTexture(makeFlashTexture());
+    disposables.push(glowTex);
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
     // ── Palette → live uniforms ───────────────────────────────────────────
@@ -368,6 +377,8 @@ export function SolarFlareWebGL({ className = "" }: { className?: string }) {
       transparent: true,
       opacity: 0.6,
       sizeAttenuation: true,
+      map: glowTex,
+      alphaTest: 0.05,
     });
     scene.add(new THREE.Points(starGeo, starMat));
 
@@ -410,6 +421,8 @@ export function SolarFlareWebGL({ className = "" }: { className?: string }) {
       depthWrite: false,
       blending: THREE.AdditiveBlending,
       sizeAttenuation: true,
+      map: glowTex,
+      alphaTest: 0.05,
     });
     const proms = new THREE.Points(promGeo, promMat);
     particleScene.add(proms);
@@ -475,6 +488,8 @@ export function SolarFlareWebGL({ className = "" }: { className?: string }) {
       depthWrite: false,
       blending: THREE.AdditiveBlending,
       sizeAttenuation: true,
+      map: glowTex,
+      alphaTest: 0.05,
     });
     const wind = new THREE.Points(windGeo, windMat);
     particleScene.add(wind);
@@ -512,6 +527,8 @@ export function SolarFlareWebGL({ className = "" }: { className?: string }) {
       depthWrite: false,
       blending: THREE.AdditiveBlending,
       sizeAttenuation: true,
+      map: glowTex,
+      alphaTest: 0.05,
     });
     const jets = new THREE.Points(jetGeo, jetMat);
     particleScene.add(jets);
