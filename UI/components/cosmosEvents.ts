@@ -18,7 +18,8 @@ export interface CosmosEvent {
     | "neon-surge"
     | "solar-eruption"
     | "aurora-pulse"
-    | "ocean-surge";
+    | "ocean-surge"
+    | "rose-pulse";
   /** 0..1 — how strongly the UI should react to this blast. */
   heat: number;
   /** Target hue (degrees) that the event tints the palette toward. */

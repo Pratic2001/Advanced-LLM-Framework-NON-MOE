@@ -88,6 +88,19 @@ export const PALETTES: ColorPalette[] = [
     accentGlow: "166 100% 55%",
   },
   {
+    id: "rose-quartz",
+    name: "Rose Quartz",
+    description: "Ray-traced rose-quartz crystal field",
+    primary: "330 65% 60%",
+    primaryGlow: "330 82% 72%",
+    secondary: "295 58% 62%",
+    secondaryGlow: "295 72% 74%",
+    tertiary: "268 55% 60%",
+    tertiaryGlow: "268 70% 72%",
+    accent: "345 70% 62%",
+    accentGlow: "345 85% 74%",
+  },
+  {
     // Deep Space: calm steel/silver-blue with a warm-gold accent. Kept muted
     // (low saturation) so it reads as realistic starlight rather than the vivid
     // neon of the other palettes — deliberately NOT a neon-cyber twin — while
@@ -252,6 +265,26 @@ const OCEAN_OVERRIDES: Partial<ThemeColors> = {
   accentForeground: "0 0% 92%",
 };
 
+// Rose Quartz: a near-black rose-tinted backdrop so the crystal field shows
+// through, with the structural tokens lifted just enough that chrome stays
+// legible over the glossy slab. Ring mirrors the palette's primary rose.
+const ROSE_QUARTZ_OVERRIDES: Partial<ThemeColors> = {
+  background: "335 35% 3%",
+  card: "330 25% 8%",
+  cardForeground: "0 0% 90%",
+  popover: "330 25% 7%",
+  popoverForeground: "0 0% 90%",
+  border: "330 25% 22%",
+  input: "330 25% 22%",
+  ring: "330 65% 60%",
+  muted: "330 18% 11%",
+  mutedForeground: "0 0% 72%",
+  secondary: "330 18% 12%",
+  secondaryForeground: "0 0% 92%",
+  accent: "330 18% 12%",
+  accentForeground: "0 0% 92%",
+};
+
 // Structural overrides applied by palette id. Only palettes whose WebGL world
 // needs a dark backdrop to show through are listed; the rest use the plain
 // theme colors.
@@ -261,6 +294,7 @@ const STRUCTURAL_OVERRIDES: Record<string, Partial<ThemeColors>> = {
   "solar-flare": SOLAR_FLARE_OVERRIDES,
   "aurora-borealis": AURORA_OVERRIDES,
   "ocean-depths": OCEAN_OVERRIDES,
+  "rose-quartz": ROSE_QUARTZ_OVERRIDES,
 };
 
 // ── HSL parsing helpers ────────────────────────────────────────────────────
@@ -520,6 +554,7 @@ const WORLD_PALETTES = new Set([
   "solar-flare",
   "aurora-borealis",
   "ocean-depths",
+  "rose-quartz",
 ]);
 
 // Per-palette pulse targets — the (saturation, lightness) each accent eases
@@ -555,6 +590,12 @@ const SYNC_TARGETS: Record<string, SyncTarget> = {
     secondary: [89, 52],
     tertiary: [80, 45],
     accent: [76, 47],
+  },
+  "rose-quartz": {
+    primary: [75, 68],
+    secondary: [70, 68],
+    tertiary: [65, 66],
+    accent: [82, 70],
   },
 };
 

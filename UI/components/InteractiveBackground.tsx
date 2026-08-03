@@ -36,6 +36,10 @@ const OceanWebGL = dynamic(
   () => import("./OceanWebGL").then((m) => m.OceanWebGL),
   { ssr: false, loading: () => null },
 );
+const RoseQuartzWebGL = dynamic(
+  () => import("./RoseQuartzWebGL").then((m) => m.RoseQuartzWebGL),
+  { ssr: false, loading: () => null },
+);
 
 // ── Palette-aware interactive background ───────────────────────────────────
 //
@@ -1525,19 +1529,21 @@ const PALETTE_STRATEGY: Record<string, StrategyKey> = {
   "aurora-borealis": "neural",
   "solar-flare": "embers",
   "ocean-depths": "bubbles",
+  "rose-quartz": "embers",
   "deep-space": "cosmos",
 };
 
 // Palettes that have shipped a dedicated WebGL world. These take priority over
 // the 2D strategy above when a GPU is available and reduced-motion is off; the
 // 2D canvas strategy remains the fallback. Palettes not listed stay on 2D.
-type WorldKey = "neon-city" | "solar" | "aurora" | "ocean";
+type WorldKey = "neon-city" | "solar" | "aurora" | "ocean" | "roseQuartz";
 
 const PALETTE_WORLD: Record<string, WorldKey> = {
   "neon-cyber": "neon-city",
   "solar-flare": "solar",
   "aurora-borealis": "aurora",
   "ocean-depths": "ocean",
+  "rose-quartz": "roseQuartz",
 };
 
 const WORLD_COMPONENTS: Record<WorldKey, ComponentType<{ className?: string }>> = {
@@ -1545,6 +1551,7 @@ const WORLD_COMPONENTS: Record<WorldKey, ComponentType<{ className?: string }>> 
   solar: SolarFlareWebGL,
   aurora: AuroraWebGL,
   ocean: OceanWebGL,
+  roseQuartz: RoseQuartzWebGL,
 };
 
 // ── The exported component ────────────────────────────────────────────────
