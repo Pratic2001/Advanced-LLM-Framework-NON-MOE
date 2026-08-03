@@ -449,11 +449,15 @@ export function OceanWebGL({ className = "" }: { className?: string }) {
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
       format: THREE.RGBAFormat,
+      // MSAA both passes: renderer antialias only covers the default
+      // framebuffer, so the blitted ocean scene would otherwise stay jagged.
+      samples: renderer.capabilities.isWebGL2 ? 4 : 0,
     });
     const oceanRT = new THREE.WebGLRenderTarget(Math.floor(rtW * 0.85), Math.floor(rtH * 0.85), {
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
       format: THREE.RGBAFormat,
+      samples: renderer.capabilities.isWebGL2 ? 4 : 0,
     });
 
     // ── Ocean fullscreen pass ─────────────────────────────────────────────

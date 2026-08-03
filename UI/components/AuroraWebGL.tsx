@@ -41,6 +41,9 @@ const RAY_TILT = 1.3; // field-aligned lean of the ray striations
 const PULSE_COLOR = 0.45; // click-pulse colour boost
 const FLASH_AMT = 0.55; // whole-scene flash boost
 const LAKE_FRESNEL_POW = 3.0; // frozen-lake fresnel falloff
+// NOTE: stringify with .toFixed(1) so the #define stays a FLOAT literal. Plain
+// `${3.0}` renders as "3", making `pow(..., 3)` an int exponent — invalid GLSL
+// ES on strict compilers (SwiftShader/ANGLE), silently tolerated by GPUs.
 
 // ── Frozen-lake planar-mirror vertex + fragment shaders ────────────────────
 const LAKE_VERT = `
@@ -52,7 +55,7 @@ void main() {
 }
 `;
 const LAKE_FRAG = `
-#define LAKE_FRESNEL ${LAKE_FRESNEL_POW}
+#define LAKE_FRESNEL ${LAKE_FRESNEL_POW.toFixed(1)}
 uniform float uTime;
 uniform vec3 uCamPos;
 uniform mat4 uProj;
@@ -430,6 +433,8 @@ export function AuroraWebGL({ className = "" }: { className?: string }) {
     const lakeRT = new THREE.WebGLRenderTarget(
       Math.max(2, Math.floor(window.innerWidth * LAKE_RT_SCALE)),
       Math.max(2, Math.floor(window.innerHeight * LAKE_RT_SCALE)),
+      // MSAA the mirrored reflection pass so the lake isn't jagged.
+      { samples: renderer.capabilities.isWebGL2 ? 4 : 0 },
     );
     disposables.push(lakeRT.texture);
     const lakeGeo = new THREE.PlaneGeometry(320, 90, 1, 1);

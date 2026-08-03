@@ -2075,6 +2075,9 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
       format: THREE.RGBAFormat,
+      // MSAA this target: renderer-level antialias only touches the default
+      // framebuffer, so the blitted composite would otherwise stay jagged.
+      samples: renderer.capabilities.isWebGL2 ? 4 : 0,
     });
 
     const postScene = new THREE.Scene();

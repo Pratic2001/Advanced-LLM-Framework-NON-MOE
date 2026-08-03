@@ -643,6 +643,9 @@ export function SolarFlareWebGL({ className = "" }: { className?: string }) {
         magFilter: THREE.LinearFilter,
         format: THREE.RGBAFormat,
         type: THREE.HalfFloatType,
+        // MSAA the composite: renderer antialias only covers the default
+        // framebuffer, so the blitted solar scene would otherwise stay jagged.
+        samples: renderer.capabilities.isWebGL2 ? 4 : 0,
       },
     );
 

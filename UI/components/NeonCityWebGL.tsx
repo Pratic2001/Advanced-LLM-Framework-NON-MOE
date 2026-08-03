@@ -354,6 +354,8 @@ export function NeonCityWebGL({ className = "" }: { className?: string }) {
         minFilter: THREE.LinearFilter,
         magFilter: THREE.LinearFilter,
         format: THREE.RGBAFormat,
+        // MSAA the mirror pass so the wet-street reflection isn't jagged.
+        samples: renderer.capabilities.isWebGL2 ? 4 : 0,
       },
     );
 
