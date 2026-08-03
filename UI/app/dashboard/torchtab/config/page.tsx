@@ -17,6 +17,7 @@ import { IntegratedTerminal } from "@/components/IntegratedTerminal";
 import { InteractiveShell } from "@/components/InteractiveShell";
 import { buildCommand } from "@/lib/command-builder";
 import { getExampleExtraArgs } from "@/lib/terminal-helpers";
+import { useSettings } from "@/hooks/use-settings";
 
 interface FlagField {
   key: string;
@@ -88,6 +89,7 @@ function primaryStageHasFlags(
 }
 
 export default function TorchtabConfigPage() {
+  const { pythonBin } = useSettings();
   const [config, setConfig] = useState<Record<string, any>>({});
   const [selectedStages, setSelectedStages] = useState<string[]>(["pretrain"]);
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
@@ -166,6 +168,7 @@ export default function TorchtabConfigPage() {
     script: stageScriptMap[primaryStage] as any,
     config,
     backend: "torch",
+    pythonBin: pythonBin || undefined,
     extraArgs: extraArgs.trim() || undefined,
   });
 

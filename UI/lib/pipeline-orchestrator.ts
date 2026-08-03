@@ -54,6 +54,13 @@ export class PipelineOrchestrator {
     // Create stages and launch first stage
     let previousJobId: string | null = null;
 
+    // Resolve the user's custom python interpreter once for the whole pipeline
+    // (venv support) so every stage command uses it.
+    const pythonUser = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { pythonBin: true },
+    });
+
     for (let i = 0; i < stages.length; i++) {
       const stage = stages[i];
       const scriptName = this.getScriptName(stage.type);
@@ -65,6 +72,7 @@ export class PipelineOrchestrator {
         backend,
         nodeCount: nodeIds?.length || 1,
         gpuCount: 1,
+        pythonBin: pythonUser?.pythonBin || undefined,
         extraArgs: stage.extraArgs,
       });
 
@@ -143,10 +151,17 @@ export class PipelineOrchestrator {
     // Remove __extraArgs so buildFlags doesn't render it as --__extraArgs
     const { __extraArgs, ...cleanConfig } = storedConfig;
 
+    // Resolve the job owner's custom python interpreter (venv support).
+    const pythonUser = await prisma.user.findUnique({
+      where: { id: nextStage.job.userId },
+      select: { pythonBin: true },
+    });
+
     const command = buildCommand({
       script: this.getScriptName(nextStage.jobType),
       config: cleanConfig,
       backend: (nextStage.job.backend as string).toLowerCase() as BackendType,
+      pythonBin: pythonUser?.pythonBin || undefined,
       extraArgs: storedExtraArgs,
     });
 

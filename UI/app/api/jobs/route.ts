@@ -59,6 +59,14 @@ export async function POST(req: Request) {
     }));
   }
 
+  // Resolve the user's custom python interpreter (venv support). Commands run
+  // through this route are authoritative — the client previews may show the
+  // same value fetched from /api/settings.
+  const user = await prisma.user.findUnique({
+    where: { id: session.user.id },
+    select: { pythonBin: true },
+  });
+
   // Build the CLI command
   const command = buildCommand({
     script: type as ScriptName,
@@ -67,6 +75,7 @@ export async function POST(req: Request) {
     nodes: nodes.map((n) => n.host),
     nodeCount: Math.max(nodes.length, 1),
     gpuCount: nodes[0]?.gpuCount || 1,
+    pythonBin: user?.pythonBin || undefined,
     extraArgs,
   });
 

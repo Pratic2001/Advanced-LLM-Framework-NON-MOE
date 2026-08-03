@@ -15,6 +15,7 @@ import {
 import { IntegratedTerminal } from "@/components/IntegratedTerminal";
 import { InteractiveShell } from "@/components/InteractiveShell";
 import { buildCommand } from "@/lib/command-builder";
+import { useSettings } from "@/hooks/use-settings";
 
 interface FlagField {
   key: string;
@@ -67,6 +68,7 @@ const allGroups = [
 ];
 
 export default function DeepSpeedConfigPage() {
+  const { pythonBin } = useSettings();
   const [config, setConfig] = useState<Record<string, any>>({});
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const [launching, setLaunching] = useState(false);
@@ -116,6 +118,7 @@ export default function DeepSpeedConfigPage() {
     script: "train_pretrain.py" as any,
     config,
     backend: "deepspeed",
+    pythonBin: pythonBin || undefined,
     extraArgs: extraArgs.trim() || undefined,
   });
 

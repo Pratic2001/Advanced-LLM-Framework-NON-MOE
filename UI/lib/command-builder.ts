@@ -38,7 +38,7 @@ export function buildCommand(input: BuildCommandInput): string {
   // Handle backend launchers
   if (backend === "deepspeed") {
     const numGpus = gpuCount * Math.max(nodeCount, 1);
-    cmd = `deepspeed --num_gpus ${gpuCount} --num_nodes ${nodeCount}`;
+    cmd = `${resolveLauncher(pythonBin, "deepspeed")} --num_gpus ${gpuCount} --num_nodes ${nodeCount}`;
 
     // Add hostfile if multi-node
     if (nodes.length > 1 && nodeCount > 1) {
@@ -49,7 +49,7 @@ export function buildCommand(input: BuildCommandInput): string {
   } else if (backend === "torch") {
     const nprocPerNode = gpuCount;
     const nnodes = Math.max(nodeCount, 1);
-    cmd = `torchrun --nproc_per_node=${nprocPerNode} --nnodes=${nnodes}`;
+    cmd = `${resolveLauncher(pythonBin, "torchrun")} --nproc_per_node=${nprocPerNode} --nnodes=${nnodes}`;
 
     if (nodes.length > 0 && nodeCount > 1) {
       const masterAddr = nodes[0];
@@ -74,6 +74,22 @@ export function buildCommand(input: BuildCommandInput): string {
   }
 
   return cmd;
+}
+
+/**
+ * Resolve a backend launcher from the same bin directory as a custom python
+ * interpreter. When pythonBin points into a virtualenv (e.g.
+ * /home/u/.venv/bin/python), torchrun/deepspeed must come from that venv too,
+ * otherwise the launcher on PATH could pair a different environment with the
+ * venv's packages. The default `python3` keeps the bare launcher names.
+ *
+ * String manipulation only — no node:path, since this module is imported
+ * client-side for command previews.
+ */
+function resolveLauncher(pythonBin: string, launcher: string): string {
+  if (!pythonBin || pythonBin === "python3") return launcher;
+  const idx = pythonBin.lastIndexOf("/");
+  return idx === -1 ? launcher : `${pythonBin.slice(0, idx + 1)}${launcher}`;
 }
 
 /**

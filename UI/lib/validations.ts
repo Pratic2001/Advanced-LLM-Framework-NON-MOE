@@ -16,6 +16,13 @@ export const registerSchema = z.object({
   name: z.string().min(1).max(255).optional(),
 });
 
+// ── Settings ─────────────────────────────────────────────────────────────────
+
+export const updateSettingsSchema = z.object({
+  // Empty string clears the setting (stored as null).
+  pythonBin: z.string().trim().max(1024, "Interpreter path is too long").optional(),
+});
+
 // ── Jobs ─────────────────────────────────────────────────────────────────────
 
 export const backendEnum = z.enum(["torch", "deepspeed", "hivemind"]);

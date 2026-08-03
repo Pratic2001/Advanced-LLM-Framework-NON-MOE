@@ -20,6 +20,7 @@ import {
   PlayCircle,
   BarChart3,
   Palette,
+  Settings2,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { ReactNode } from "react";
@@ -142,6 +143,21 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
             );
           })}
         </nav>
+
+        {/* Global Settings */}
+        <div className="p-2 border-t border-border/50">
+          <Link
+            href="/dashboard/settings"
+            className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-all ${
+              pathname.startsWith("/dashboard/settings")
+                ? "bg-[hsl(var(--palette-primary))]/10 text-[hsl(var(--palette-primary))] border border-[hsl(var(--palette-primary))]/20"
+                : "text-muted-foreground hover:text-foreground hover:bg-accent/50"
+            }`}
+          >
+            <Settings2 className="w-4 h-4 shrink-0" />
+            {sidebarOpen && <span>Settings</span>}
+          </Link>
+        </div>
 
         {/* User & Sign Out */}
         <div className="p-2 border-t border-border/50">

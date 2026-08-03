@@ -56,6 +56,7 @@ model User {
   email        String   @unique
   passwordHash String
   name         String?
+  pythonBin    String? // path to the python interpreter for training runs (venv support)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
