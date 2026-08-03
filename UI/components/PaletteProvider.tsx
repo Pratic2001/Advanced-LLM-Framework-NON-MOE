@@ -63,7 +63,7 @@ export const PALETTES: ColorPalette[] = [
   },
   {
     id: "solar-flare",
-    name: "Solar Flair",
+    name: "Solar Flare",
     description: "Orange/red/yellow energy burst",
     primary: "24 95% 53%",
     primaryGlow: "24 100% 65%",
