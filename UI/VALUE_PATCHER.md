@@ -39,8 +39,9 @@ After patching:
 - For production: `npm run build`.
 - Type-check any time: `npx tsc --noEmit`.
 
-Running the script with an unedited `CONFIG` is a **no-op** — the defaults are
-exactly the current reference-port values, so nothing changes.
+Running the script with an unedited `CONFIG` is a **no-op** — the tuning-sheet
+values are exactly what's already in the file (the current tuned state), so
+nothing changes until you edit a number.
 
 ---
 
@@ -51,23 +52,24 @@ numbers = faster / cheaper rendering. Raise numbers = prettier / heavier.**
 
 | Group | Key | Default | Range | What it does |
 |------|-----|--------:|------:|--------------|
-| Sky | `star_count` | 9000 | 200–30000 | Points in the starfield. Cheap to cut — 3000 looks fine on small screens. |
-| Sky | `nebula_count` | 7 | 0–20 | Drifting nebula sprites behind the hole. |
+| Sky | `star_count` | 14000 | 200–30000 | Points in the starfield. Cheap to cut — 3000 looks fine on small screens. |
+| Sky | `nebula_count` | 8 | 0–20 | Drifting nebula sprites behind the hole. |
 | Black hole | `horizon_segments` | 64 | 12–256 | Tessellation of the black event-horizon sphere. |
 | Black hole | `rim_segments` | 64 | 12–256 | Tessellation of the photon-ring rim sphere. |
-| Disk | `disk_layer_count` | 20 | 1–80 | Volumetric sheets the accretion disk is stacked from. **The heavy one** — each layer is a full shaded mesh. |
+| Disk | `disk_layer_count` | 8 | 1–80 | Volumetric sheets the accretion disk is stacked from. **The heavy one** — each layer is a full shaded mesh. |
 | Disk | `disk_angular_segments` | 200 | 24–512 | Smoothness of each disk sheet around the ring. |
 | Disk | `disk_radial_segments` | 28 | 1–96 | Smoothness of each disk sheet toward the hole. |
 | Halos | `halo_radial_segments` | 20 | 8–64 | Cross-section smoothness of each polar halo torus. |
 | Halos | `halo_tubular_segments` | 220 | 24–512 | Along-the-ring smoothness of each halo torus. |
-| Supernova | `iris_width_segments` | 48 | 8–128 | Latitudinal segments of each blast's 3D iris shell. |
-| Supernova | `iris_height_segments` | 32 | 8–64 | Longitudinal segments of the iris shell. |
-| Supernova | `nova_particles_big` | 2048 | 100–8000 | Particles per big (ambient/clicked) supernova. |
-| Supernova | `nova_particles_small` | 900 | 50–4000 | Particles per small supernova. |
-| Supernova | `ambient_nova_interval` | 9 | 2–600 | Base seconds between spontaneous background supernovae (plus a random spread). |
-| Post pass | `geodesic_steps` | 200 | 40–400 | RK4 photon-geodesic integration steps **per pixel**. The single biggest frame cost. 80–120 still looks great. |
-| Post pass | `bloom_taps` | 512 | 32–1024 | Wide-radius bloom samples per pixel. |
-| Post pass | `max_novae` | 6 | 1–10 | How many live explosions the ray tracer treats as lensing obstacles. Patches both the JS constant and the GLSL `#define`. |
+| Supernova | `iris_width_segments` | 160 | 8–256 | Latitudinal segments of each blast's 3D iris shell. Keep high (≥160) so the displaced shell reads smooth, not faceted. |
+| Supernova | `iris_height_segments` | 128 | 8–192 | Longitudinal segments of the iris shell. Keep high (≥128) for a smooth shell. |
+| Supernova | `nova_particles_big` | 1150 | 100–8000 | Particles per big (ambient/clicked) supernova. Fewer cuts the spawn-time allocation burst + per-frame ejecta update (the frame hitch right as a nova ignites) while keeping the clumps sculpted. |
+| Supernova | `nova_particles_small` | 750 | 50–4000 | Particles per small supernova. |
+| Supernova | `ambient_nova_interval` | 15 | 2–600 | Base seconds between spontaneous background supernovae (plus a random spread). Raise to have fewer blast-trigger frame dips. |
+| Post pass | `geodesic_steps` | 112 | 40–400 | RK4 photon-geodesic integration steps **per pixel**. The single biggest frame cost. 80–120 still looks great. |
+| Post pass | `bloom_taps` | 128 | 32–1024 | Wide-radius bloom samples per pixel. |
+| Post pass | `max_novae` | 4 | 1–10 | How many live explosions the ray tracer treats as lensing obstacles. Patches both the JS constant and the GLSL `#define`. |
+| Render res | `supersample_factor` | 1.15 | 1.0–3.0 | Internal render-resolution multiplier. Scene + per-pixel ray march both render at (drawing-buffer size × this), then the final blit downsamples to the screen — the only AA that reaches per-pixel ray-traced edges. See "Supersampling" below. |
 | Meteors | `meteor_first_delay` | 1.5 | 0–60 | Seconds before the first meteor shower arrives. |
 | Meteors | `meteor_interval` | 3.5 | 0.2–100000 | Base seconds between showers (plus a random spread). |
 | Meteors | `meteors_per_shower` | 8 | 1–200 | Base streak count per shower. |
@@ -76,9 +78,37 @@ numbers = faster / cheaper rendering. Raise numbers = prettier / heavier.**
 | Comets | `comet_interval` | 30 | 1–100000 | Base seconds between comets (plus a random spread). |
 | Comets | `comet_trail_points` | 26 | 4–400 | Particles in each comet's trailing wisp. |
 
+The Default column is the **current tuned state** of the file (what `CONFIG`
+holds), not a historical maximum. `--show` also prints each knob's
+*reference* default in parentheses.
+
 > **Turning effects off:** set `meteor_interval` / `comet_interval` to a large
 > number (e.g. `100000`) and the shower/comet simply never fires again in any
 > realistic session. Set `nebula_count` to `0` for no nebulae.
+
+### Supersampling (`supersample_factor`)
+
+Most of deep-space's look is not geometry — it's a **per-pixel ray march** in
+the post pass (real photon-geodesic tracing through the black hole's
+spacetime, then bloom + grade). Ordinary MSAA can never smooth that, because
+there are no polygon edges to sample — each pixel is computed independently.
+
+`supersample_factor` fixes this the only way that reaches per-pixel content:
+the scene **and** the ray march both render at `(drawing-buffer size × factor)`,
+and the final blit downsamples to the screen with linear filtering. Every
+screen pixel is an average of `factor²` ray-traced samples, which visibly
+smooths the black-hole shadow edge, lensing caustics, star points and the
+accretion-disk rim.
+
+- `1.0` — device resolution. No smoothing; the cheapest.
+- `1.15` — **default.** ~32% more ray-march pixels per frame. A clear smoothing
+  win at a modest cost — the sweet spot for mid-range GPUs.
+- `1.25` — ~56% more pixels; a further quality jump for fast dedicated GPUs.
+- `1.5` — ~2.25× the ray-march work (resolution scales by *area*). Very heavy;
+  only worth it on top-end GPUs.
+
+The bloom width is unchanged by this knob: bloom offsets stay measured in CSS
+pixels, and the final downsample cancels the supersample scale.
 
 ---
 
@@ -89,8 +119,8 @@ your own numbers just don't pass `--preset`.
 
 | Preset | Idea |
 |--------|------|
-| `--preset performance` | Aimed at weak iGPUs / 60 fps on small screens. ~½ the geodesic steps, 128-tap bloom, 8 disk layers, 700/350 nova particles, fewer meteors. |
-| `--preset balanced` | Middle ground — noticeably lighter than the reference, still rich. |
+| `--preset performance` | Aimed at weak iGPUs / 60 fps on small screens. ~½ the geodesic steps, 128-tap bloom, 8 disk layers, 700/350 nova particles, supersampling **off** (`1.0`), fewer meteors. |
+| `--preset balanced` | Middle ground — noticeably lighter than the reference, still rich. Geodesic steps up, supersampling `1.15`. |
 
 ```bash
 python3 value_patcher.py --preset performance   # apply
@@ -98,18 +128,20 @@ python3 value_patcher.py --diff --preset balanced   # preview first
 ```
 
 These are starting points, not gospel — tune from there. The "right" setting
-depends on the target machine; the biggest lever by far is `geodesic_steps`,
-followed by `disk_layer_count` and `star_count`.
+depends on the target machine; the biggest levers are `geodesic_steps` (per-pixel
+ray march) and `supersample_factor` (render resolution — it scales by *area*, so
+`1.5` is ~2.25× the ray-march work), followed by `disk_layer_count` and
+`star_count`.
 
 ---
 
 ## How it works
 
 1. **Anchors, not line numbers.** Each knob owns a strict regex that locates
-   its literal in `CosmosWebGL.tsx` (e.g. `const int STEPS = 200;` or the
-   `createStarfield(9000)` call). The regex must match **exactly once**; the
-   patcher only rewrites the captured *numbers*, preserving all surrounding
-   code verbatim.
+   its literal in `CosmosWebGL.tsx` (e.g. `const int STEPS = 128;`,
+   `const SUPERSAMPLE = 1.25;` or the `createStarfield(19000)` call). The
+   regex must match **exactly once**; the patcher only rewrites the captured
+   *numbers*, preserving all surrounding code verbatim.
 
 2. **Transactional (all-or-nothing).** Every knob is validated (type + range)
    and every anchor is checked *before* anything is written. If any anchor is

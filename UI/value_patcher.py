@@ -66,9 +66,9 @@ from pathlib import Path
 CONFIG = {
     # ---------------- Sky (cheap, huge visual payoff) ----------------
     # Number of stars (THREE.Points). 3000 is already plenty on small screens.
-    "star_count": 19000,
+    "star_count": 14000,
     # Number of additive nebula sprites drifting in the background.
-    "nebula_count": 10,
+    "nebula_count": 8,
 
     # ---------------- Black hole & ring (sphere tessellation) ----------------
     # Tessellation of the black event-horizon sphere (both segments equal).
@@ -87,7 +87,7 @@ CONFIG = {
     # How many volumetric sheets the disk is stacked from. 20 = thickest.
     # Fewer layers = much cheaper. Non-20 counts are auto-resampled from the
     # reference distribution (see VALUE_PATCHER.md).
-    "disk_layer_count": 10,
+    "disk_layer_count": 8,
     # Angular tessellation of each disk sheet (smoothness around the ring).
     "disk_angular_segments": 200,
     # Radial tessellation of each disk sheet (smoothness toward the hole).
@@ -100,20 +100,30 @@ CONFIG = {
     "halo_tubular_segments": 220,
 
     # ---------------- Supernova particle ejecta ----------------
-    # Particle count per big (ambient/click) supernova. 1400 keeps the
-    # asymmetric clumps and jet-axis streaks dense enough to read sculpted.
-    "nova_particles_big": 1400,
+    # Particle count per big (ambient/click) supernova. 1150 still keeps the
+    # asymmetric clumps and jet-axis streaks dense enough to read sculpted,
+    # while trimming the spawn-time allocation burst and the per-frame ejecta
+    # update that make the frame hitch right as a nova ignites.
+    "nova_particles_big": 1150,
     # Particle count per small supernova.
-    "nova_particles_small": 900,
+    "nova_particles_small": 750,
 
     # ---------------- Post pass (per-pixel, the true cost driver) ----------------
     # RK4 photon-geodesic integration steps per pixel. 200 = crisp lensing.
     # 80-120 still looks great and is dramatically faster.
-    "geodesic_steps": 128,
+    "geodesic_steps": 112,
     # Bloom taps per pixel (512-tap wide-radius bloom).
     "bloom_taps": 128,
     # Max simultaneously-lensable supernovae (must be >= 1).
-    "max_novae": 6,
+    "max_novae": 4,
+
+    # ---------------- Render resolution ----------------
+    # Internal supersampling of the deep-space pipeline: both the scene and the
+    # per-pixel ray march render at (drawing-buffer size x this), then the
+    # final blit downsamples to the screen. 1.0 = device resolution.
+    # 1.25 = ~56% more ray-march pixels, smoothed by the downsample — the only
+    # AA that reaches per-pixel ray-traced edges. 1.5+ is very heavy.
+    "supersample_factor": 1.15,
 
     # ---------------- Meteor showers ----------------
     # Seconds before the first shower (reference: 1.5 + rand*1.5).
@@ -138,7 +148,7 @@ CONFIG = {
     # ---------------- Ambient supernovae ----------------
     # Base seconds between spontaneous background supernovae
     # (reference: 9 + rand*6).
-    "ambient_nova_interval": 9,
+    "ambient_nova_interval": 15,
 }
 
 # Quick-start profiles. `--preset performance` overrides CONFIG entirely, so
@@ -162,6 +172,7 @@ PRESETS = {
         "geodesic_steps": 90,
         "bloom_taps": 128,
         "max_novae": 4,
+        "supersample_factor": 1.0,
         "meteor_first_delay": 2.0,
         "meteor_interval": 6.0,
         "meteors_per_shower": 6,
@@ -188,6 +199,7 @@ PRESETS = {
         "geodesic_steps": 140,
         "bloom_taps": 256,
         "max_novae": 5,
+        "supersample_factor": 1.15,
         "meteor_first_delay": 1.8,
         "meteor_interval": 4.5,
         "meteors_per_shower": 8,
@@ -381,6 +393,15 @@ TUNING = [
             (_pat(r"(const MAX_NOVAE = )(\d+)(;)"), [2]),
             (_pat(r"(#define MAX_NOVAE )(\d+)"), [2]),
         ],
+    },
+
+    # ---- Render resolution ----
+    {
+        "key": "supersample_factor", "group": "Render res",
+        "label": "Supersample factor",
+        "desc": "Internal render-resolution multiplier for the deep-space pipeline (scene + per-pixel ray march). 1.0 = device res; 1.25 = ~56% more ray-march pixels, smoothed by the final downsample (the only AA that reaches per-pixel ray-traced edges). 1.5+ is very heavy.",
+        "type": "float", "min": 1.0, "max": 3.0, "default": 1.25,
+        "patterns": [(_pat(r"(const SUPERSAMPLE = )([\d.]+)(;)"), [2])],
     },
 
     # ---- Meteor showers ----

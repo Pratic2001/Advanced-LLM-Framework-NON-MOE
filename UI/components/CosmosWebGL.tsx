@@ -415,7 +415,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     // fixed distortion overlay.
     const bgGroup = new THREE.Group();
 
-    const stars = createStarfield(19000);
+    const stars = createStarfield(14000);
     bgGroup.add(stars);
 
     // ---- distant colourful nebulae (additive sprites) ----
@@ -433,7 +433,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         [1, "rgba(0,0,0,0)"],
       ]);
     }
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 8; i++) {
       const c = nebulaColors[i % nebulaColors.length][1];
       const tex = makeNebulaTexture(c);
       const mat = new THREE.SpriteMaterial({
@@ -1078,7 +1078,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     // soft, rounded glowing tube rather than a stack of hard-edged sheets —
     // this is what finally gives the disk actual, real 3D depth: viewed dead
     // edge-on it now shows as a genuinely thick glowing band, not a line.
-    const DISK_LAYER_OFFSETS = [-0.967165, -0.591132, -0.503712, -0.277589, -0.238770, 0.048997, 0.181414, 0.299650, 0.772893, 0.999499];
+    const DISK_LAYER_OFFSETS = [-0.967165, -0.559590, -0.346996, -0.263286, 0.090704, 0.221687, 0.583748, 0.999499];
     const diskGroup = new THREE.Group();
     const diskMats: THREE.ShaderMaterial[] = [];
     DISK_LAYER_OFFSETS.forEach((yOff, i) => {
@@ -1222,7 +1222,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     let flashLevel = 0;
 
     function makeSupernova(pos: THREE.Vector3, big: boolean): Supernova {
-      const count = big ? 1400 : 900;
+      const count = big ? 1150 : 750;
       const positions = new Float32Array(count * 3);
       const velocities = new Float32Array(count * 3);
       const sizes = new Float32Array(count);
@@ -2071,19 +2071,60 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
     }
 
     // ---- post-process: fake gravitational lensing + cinematic grade ----
-    let rt = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight, {
+    //
+    // Supersampling: the ray-marched post pass is per-pixel, so MSAA cannot
+    // smooth it (MSAA only touches the default framebuffer and polygon edges).
+    // Render the scene AND the ray march at SUPERSAMPLE x the drawing-buffer
+    // size, then bilinear-downsample to the screen — the final blit averages
+    // SUPERSAMPLE^2 samples per output pixel, smoothing the black-hole shadow
+    // edge, lensing caustics and star points. uTexel stays at CSS resolution,
+    // so the bloom radius (in CSS px) is unchanged by the pipeline change.
+    const SUPERSAMPLE = 1.15;
+    const drawingBuf = renderer.getDrawingBufferSize(new THREE.Vector2());
+    const ssW = Math.max(2, Math.round(drawingBuf.x * SUPERSAMPLE));
+    const ssH = Math.max(2, Math.round(drawingBuf.y * SUPERSAMPLE));
+    const rt = new THREE.WebGLRenderTarget(ssW, ssH, {
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
       format: THREE.RGBAFormat,
-      // MSAA this target: renderer-level antialias only touches the default
+      // MSAA the scene pass: renderer-level antialias only touches the default
       // framebuffer, so the blitted composite would otherwise stay jagged.
       samples: renderer.capabilities.isWebGL2 ? 4 : 0,
+    });
+    // The ray-march output lands here at SS-res; it is a fullscreen quad with
+    // no polygon edges, so samples:0 (no MSAA) is correct and saves memory.
+    const postRT = new THREE.WebGLRenderTarget(ssW, ssH, {
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      format: THREE.RGBAFormat,
     });
 
     const postScene = new THREE.Scene();
     const postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     const postGeo = new THREE.PlaneGeometry(2, 2);
-    const MAX_NOVAE = 6;
+    // Final downsample blit: ray-marched SS-res image -> screen. Linear
+    // filtering averages the supersampled texels into each screen pixel.
+    const compositeScene = new THREE.Scene();
+    const compositeMat = new THREE.ShaderMaterial({
+      uniforms: { tDiffuse: { value: postRT.texture } },
+      vertexShader: `
+        varying vec2 vUv;
+        void main(){
+          vUv = uv;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: `
+        varying vec2 vUv;
+        uniform sampler2D tDiffuse;
+        void main(){
+          gl_FragColor = texture2D(tDiffuse, vUv);
+        }
+      `,
+    });
+    const compositeMesh = new THREE.Mesh(postGeo, compositeMat);
+    compositeScene.add(compositeMesh);
+    const MAX_NOVAE = 4;
     const postMat = new THREE.ShaderMaterial({
       uniforms: {
         tDiffuse: { value: rt.texture },
@@ -2141,7 +2182,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         uniform float uRs;
         uniform vec3 uDiskNormal;
         uniform float uDiskInner, uDiskOuter;
-        #define MAX_NOVAE 6
+        #define MAX_NOVAE 4
         uniform int uNovaCount;
         uniform vec3 uNovaPos[MAX_NOVAE];
         uniform float uNovaRadius[MAX_NOVAE];
@@ -2180,7 +2221,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
 
           float prevSide = dot(p, uDiskNormal);
 
-          const int STEPS = 128;
+          const int STEPS = 112;
           for(int i=0;i<STEPS;i++){
             float r = length(p);
             if(r < uRs*0.98){
@@ -2502,7 +2543,11 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
-      rt.setSize(window.innerWidth, window.innerHeight);
+      const drawingBuf = renderer.getDrawingBufferSize(new THREE.Vector2());
+      const ssW = Math.max(2, Math.round(drawingBuf.x * SUPERSAMPLE));
+      const ssH = Math.max(2, Math.round(drawingBuf.y * SUPERSAMPLE));
+      rt.setSize(ssW, ssH);
+      postRT.setSize(ssW, ssH);
       postMat.uniforms.uAspect.value = window.innerWidth / window.innerHeight;
       postMat.uniforms.uTexel.value.set(1 / window.innerWidth, 1 / window.innerHeight);
     };
@@ -2594,7 +2639,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       updateComets(dt);
 
       ambientTimer += dt;
-      if (ambientTimer > 9 + Math.random() * 6) {
+      if (ambientTimer > 15 + Math.random() * 6) {
         ambientTimer = 0;
         spawnAmbientSupernova();
       }
@@ -2605,8 +2650,10 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
 
       renderer.setRenderTarget(rt);
       renderer.render(scene, camera);
-      renderer.setRenderTarget(null);
+      renderer.setRenderTarget(postRT);
       renderer.render(postScene, postCamera);
+      renderer.setRenderTarget(null);
+      renderer.render(compositeScene, postCamera);
     }
 
     updateCamera(0);
@@ -2628,7 +2675,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
         s.mat.dispose();
         s.irisMat.dispose();
       }
-      for (const root of [scene, postScene]) {
+      for (const root of [scene, postScene, compositeScene]) {
         root.traverse((o) => {
           const obj = o as THREE.Mesh | THREE.Points | THREE.Sprite;
           if (obj.geometry) obj.geometry.dispose();
@@ -2640,6 +2687,7 @@ export function CosmosWebGL({ className = "" }: { className?: string }) {
       irisGeo.dispose();
       for (const t of disposables) t.dispose();
       rt.dispose();
+      postRT.dispose();
       renderer.forceContextLoss();
       renderer.dispose();
       if (cv.parentNode) cv.parentNode.removeChild(cv);
