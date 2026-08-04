@@ -1,0 +1,89 @@
+# =============================================================================
+# UI container — runs BOTH UI/ (Heavy, :3000, BASE_PATH=/heavy) and
+# UI_lite/ (Lite, :3001, BASE_PATH=/lite) under a tiny shell supervisor.
+#
+# Build context: the repo root. docker buildx is invoked from CI with:
+#   docker buildx build -f Dockerfile.ui \
+#     --build-arg PUBLIC_HOSTNAME=... \
+#     --build-arg NEXT_PUBLIC_HEAVY_UI_URL=... \
+#     --build-arg NEXT_PUBLIC_LITE_UI_URL=... \
+#     --tag pratic2001/llmforge-ui:$TAG .
+#
+# Build args are inlined by Next at build time — changing them requires a
+# rebuild. Runtime overrides (.env files mounted into /secrets) handle the
+# values that change per deploy (NEXTAUTH_SECRET, DATABASE_URL, etc.).
+# =============================================================================
+
+FROM node:22-alpine
+
+# tsx (TypeScript runner for server.ts), openssh-client (for the SSH key the
+# UI uses to reach the trainer container), and a few build tools for
+# native modules like @homebridge/node-pty-prebuilt-multiarch.
+RUN apk add --no-cache python3 make g++ openssh-client
+
+WORKDIR /app
+
+# ── Layer 1: install deps for both apps ─────────────────────────────────────
+# We copy package.json + lockfile from each subdir into the shared node_modules
+# at /app/node_modules. UI_lite and UI share an identical dependency tree
+# (verified by comparing both package.json — see comment in repo root).
+COPY UI/package.json     UI/package-lock.json     ./ui/
+COPY UI_lite/package.json UI_lite/package-lock.json ./ui_lite/
+
+# npm ci requires --include=dev so tsx/prisma/vitest/tailwind are present for
+# the build step.
+RUN cd ui      && npm ci --include=dev && cd .. \
+ && cd ui_lite && npm ci --include=dev && cd ..
+
+# ── Layer 2: copy source + build ───────────────────────────────────────────
+# Build-time env: these NEXT_PUBLIC_* vars get baked into the client bundles.
+ARG NEXT_PUBLIC_BASE_PATH
+ARG NEXT_PUBLIC_NEXTAUTH_URL
+ARG NEXT_PUBLIC_HEAVY_UI_URL
+ARG NEXT_PUBLIC_LITE_UI_URL
+
+ENV NEXT_PUBLIC_BASE_PATH=${NEXT_PUBLIC_BASE_PATH} \
+    NEXT_PUBLIC_NEXTAUTH_URL=${NEXT_PUBLIC_NEXTAUTH_URL} \
+    NEXT_PUBLIC_HEAVY_UI_URL=${NEXT_PUBLIC_HEAVY_UI_URL} \
+    NEXT_PUBLIC_LITE_UI_URL=${NEXT_PUBLIC_LITE_UI_URL} \
+    NEXT_TELEMETRY_DISABLED=1
+
+# Prisma schema lives in UI/. The DB client is generated into
+# UI/node_modules/@prisma/client and UI_lite imports it through a relative
+# path that resolves into the SAME node_modules dir as long as both builds
+# run from this image. We only generate once for UI; UI_lite's import
+# resolves to UI/node_modules/@prisma/client because that's what the lockfile
+# pins. If that breaks later, run `npm run db:generate` in UI_lite too.
+COPY UI/prisma ./ui/prisma
+RUN cd ui && npx prisma generate && cd ..
+
+COPY UI/.     ./ui/
+COPY UI_lite/. ./ui_lite/
+
+# Build each app. Both produce a `.next/standalone` dir per
+# next.config.mjs's `output: "standalone"` flag.
+RUN cd ui      && npm run build && cd .. \
+ && cd ui_lite && npm run build && cd ..
+
+# ── Layer 3: runtime image ─────────────────────────────────────────────────
+# Strip dev deps so the published image is small. We keep tsx (devDep, but
+# needed at runtime to run server.ts) by re-installing it in production mode
+# — `npm prune --omit=dev` removes it; instead we just install only
+# production deps in a separate node_modules for runtime, leaving the build
+# tree alone. Simpler: install tsx globally so the entrypoint can find it
+# regardless of how pruning shakes out.
+RUN npm install -g tsx@4.23.1
+
+# Where docker compose drops per-app .env files. The entrypoint script
+# passes them via tsx --env-file.
+RUN mkdir -p /secrets && chmod 700 /secrets
+
+# Drop the entrypoint script in last so a tweak doesn't bust the build cache.
+COPY entrypoint.ui.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Both Next servers listen on 0.0.0.0 inside the container; the Tailscale
+# sidecar in docker-compose.yml forwards :443 → :3000 and :3001.
+EXPOSE 3000 3001
+
+CMD ["/entrypoint.sh"]

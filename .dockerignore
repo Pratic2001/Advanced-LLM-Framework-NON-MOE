@@ -2,6 +2,7 @@
 .git
 .gitignore
 .github
+.claude
 
 # Trained artifacts — mounted in at runtime via -v, never baked into image.
 checkpoints
@@ -29,3 +30,20 @@ venv
 # Logs / scratch.
 logs
 *.log
+
+# Next.js build outputs — produced by the Dockerfile inside the image,
+# never copy them in (different base image = different node_modules ABI).
+.next
+.next/
+**/.next
+UI/.next
+UI_lite/.next
+UI_RenderRouter/.next
+
+# Runtime secrets shipped by the user as ./secrets/*.env — never bake them
+# into an image.
+secrets
+.env
+.env.local
+.env.*.local
+*.env

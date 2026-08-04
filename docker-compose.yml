@@ -1,0 +1,248 @@
+# =============================================================================
+# Advanced LLM Framework — containerized deployment
+#
+# Architecture (three services, each with its own Tailscale sidecar):
+#
+#   ui-router  ──► :3002  (UI_RenderRouter — landing page + iframe mounts)
+#   ui         ──► :3000  (Heavy UI, BASE_PATH=/heavy)
+#              ──► :3001  (UI_lite,   BASE_PATH=/lite)
+#   trainer    ──► :22    (PyTorch + SSH, GPU passthrough, framework code)
+#
+# Each sidecar joins the user's Tailscale tailnet so:
+#   • https://<host>.ts.net/         is served by ui-router
+#   • https://<host>.ts.net/heavy/   is served by ui:3000
+#   • https://<host>.ts.net/lite/    is served by ui:3001
+#   • trainer                      is reachable by SSH hostname "trainer"
+#
+# Setup:
+#   1. Populate ./secrets/{router,ui,ui-lite,trainer}.env (download from the
+#      release workflow's env-bundle artifact, or run the wizard locally).
+#   2. TS_AUTHKEY env var must be set in your shell OR written to
+#      ./secrets/ts-authkey (the sidecars read $TS_AUTHKEY at boot).
+#   3. docker compose pull && docker compose up -d
+#
+# Verify:
+#   docker compose ps                          # all 6 containers healthy
+#   docker exec trainer nvidia-smi             # GPU visible
+#   curl -s https://<host>.ts.net/api/auth/providers  # router reachable
+# =============================================================================
+
+name: llmforge
+
+services:
+  # ── 1. UI_RenderRouter ────────────────────────────────────────────────────
+  # The landing page at https://<host>.ts.net/. Just renders the iframe +
+  # nav that mounts /heavy and /lite.
+  ui-router:
+    image: pratic2001/llmforge-ui-router:${TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - ./secrets/router.env
+    environment:
+      - NODE_ENV=production
+      - PORT=3002
+      - HOSTNAME=0.0.0.0
+    # RenderRouter talks to UI/UI_lite via host.docker.internal because they
+    # are not on the same Compose network — they ride different Tailscale
+    # hostnames. host.docker.internal is set up below via extra_hosts.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - tailnet
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:3002 >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ── 2. UI (Heavy + Lite, one container, two ports) ────────────────────────
+  # Runs both UI/server.ts (:3000, BASE_PATH=/heavy) and
+  # UI_lite/server.ts (:3001, BASE_PATH=/lite) under a tiny supervisor.
+  # Reaches Postgres on the host via host.docker.internal, and the trainer
+  # container via SSH on the Tailscale hostname "trainer".
+  ui:
+    image: pratic2001/llmforge-ui:${TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - ./secrets/ui.env
+      - ./secrets/ui-lite.env
+    environment:
+      - NODE_ENV=production
+      - HOSTNAME=0.0.0.0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - tailnet
+    healthcheck:
+      # Both ports must be up; fail fast if either Next process died.
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:3000 >/dev/null 2>&1 && wget -q -O- http://localhost:3001 >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
+  # ── 3. Trainer (GPU + SSH) ────────────────────────────────────────────────
+  # Hosts the framework's PyTorch training scripts. UI container reaches it
+  # over SSH on the Tailscale hostname "trainer" (set by ts-trainer).
+  trainer:
+    image: pratic2001/llmforge-trainer:${TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - ./secrets/trainer.env
+    # GPU passthrough — RTX 3050 / 4050 / etc. The Compose `deploy.resources`
+    # stanza is honored by Compose v2+; if you're on an older `docker-compose`
+    # binary, also pass --gpus-all at the CLI.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    # Shared workspace with the host — checkpoints/ and packed/ live here so
+    # they survive `docker compose down` and are easy to `cp` off the host.
+    volumes:
+      - ${WORKSPACE_HOST:-./.workspace}:/workspace
+    networks:
+      - tailnet
+    healthcheck:
+      # sshd is the only thing we can probe from inside the container without
+      # extra tooling. -o BatchMode=yes forces key-only auth (no password
+      # prompts), so a successful connection here means the key file is wired
+      # correctly even if we don't have a key to authenticate with in CI.
+      test: ["CMD-SHELL", "ssh -o BatchMode=yes -o ConnectTimeout=3 -p 22 trainer@127.0.0.1 true 2>/dev/null || nc -z 127.0.0.1 22"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Tailscale sidecars — one per service. Each joins the user's tailnet
+  # under its own MagicDNS hostname (ui-router, ui, trainer) and runs
+  # `tailscale serve` to expose the in-container port(s) to the public URL.
+  #
+  # Pattern reference: https://tailscale.com/kb/1282/docker
+  # ─────────────────────────────────────────────────────────────────────────
+
+  ts-ui-router:
+    image: tailscale/tailscale:latest
+    hostname: ui-router
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:?TS_AUTHKEY must be set in the shell or ./secrets/ts-authkey}
+      - TS_HOSTNAME=ui-router
+      - TS_EXTRA_ARGS=--accept-routes
+    volumes:
+      - ts-state-ui-router:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    networks:
+      - tailnet
+    depends_on:
+      ui-router:
+        condition: service_healthy
+    # Wait for tailscaled, then route the public URL into the container.
+    # `--https=443` is the port tailscale serve uses to expose the service;
+    # `--set-path=/` means "this container answers the funnel root".
+    command: >
+      sh -c "
+        tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
+
+        until tailscale status --json 2>/dev/null | grep -q '\"BackendState\": \"Running\"'; do
+          sleep 2
+        done
+
+        tailscale set --accept-routes --hostname=ui-router
+
+        tailscale serve --bg --https=443 --set-path=/ http://localhost:3002
+
+        # Block forever so the sidecar stays alive.
+        tail -f /dev/null
+      "
+
+  ts-ui:
+    image: tailscale/tailscale:latest
+    hostname: ui
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:?TS_AUTHKEY must be set in the shell or ./secrets/ts-authkey}
+      - TS_HOSTNAME=ui
+      - TS_EXTRA_ARGS=--accept-routes
+    volumes:
+      - ts-state-ui:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    networks:
+      - tailnet
+    depends_on:
+      ui:
+        condition: service_healthy
+    command: >
+      sh -c "
+        tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
+
+        until tailscale status --json 2>/dev/null | grep -q '\"BackendState\": \"Running\"'; do
+          sleep 2
+        done
+
+        tailscale set --accept-routes --hostname=ui
+
+        # Two mount points: /heavy -> :3000, /lite -> :3001. Both Next servers
+        # were started with BASE_PATH=/heavy and BASE_PATH=/lite respectively,
+        # so they each answer only their own subtree. tailscale serve is
+        # path-stripping on the way in and re-prefixing on the way out, which
+        # is exactly what basePath expects.
+        tailscale serve --bg --https=443 --set-path=/heavy http://localhost:3000
+        tailscale serve --bg --https=443 --set-path=/lite  http://localhost:3001
+
+        tail -f /dev/null
+      "
+
+  ts-trainer:
+    image: tailscale/tailscale:latest
+    hostname: trainer
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:?TS_AUTHKEY must be set in the shell or ./secrets/ts-authkey}
+      - TS_HOSTNAME=trainer
+      - TS_EXTRA_ARGS=--accept-routes
+    volumes:
+      - ts-state-trainer:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    networks:
+      - tailnet
+    depends_on:
+      trainer:
+        condition: service_healthy
+    # `--ssh` exposes sshd on the tailnet without setting up a Funnel or
+    # serve entry — that's exactly what we want for the trainer container.
+    command: >
+      sh -c "
+        tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
+
+        until tailscale status --json 2>/dev/null | grep -q '\"BackendState\": \"Running\"'; do
+          sleep 2
+        done
+
+        tailscale set --accept-routes --hostname=trainer --ssh
+
+        tail -f /dev/null
+      "
+
+networks:
+  # All six containers share one bridge network so the sidecars can reach
+  # their sibling service by the in-network hostname (ui-router, ui,
+  # trainer) on the appropriate port. host.docker.internal still works for
+  # the Postgres-on-host case because of `extra_hosts: host-gateway`.
+  tailnet:
+    driver: bridge
+
+volumes:
+  # Tailscale node keys are persisted here so the hostnames stay stable
+  # across `docker compose down && up`.
+  ts-state-ui-router: {}
+  ts-state-ui: {}
+  ts-state-trainer: {}

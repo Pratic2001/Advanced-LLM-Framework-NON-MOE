@@ -23,6 +23,7 @@
 - [Module Overview](#-module-overview)
 - [Repository Structure](#-repository-structure)
 - [Requirements](#-requirements)
+- [Containerized Deployment](#-containerized-deployment)
 - [Full Documentation](#-full-documentation)
 - [License & Citation](#-license--citation)
 
@@ -465,6 +466,117 @@ python train_pretrain.py --rope-scaling '{"type": "ntk", "factor": 8.0}' ...
 | Standard baseline | Default (dense sequential) |
 
 All variant flags are also available in the **hivemind** decentralized training scripts — see [`hivemind/README.md`](hivemind/README.md).
+
+---
+
+## 🐳 Containerized Deployment
+
+The whole stack — UI_RenderRouter, UI, UI_lite, and the GPU trainer — runs as
+three Docker images on a single host and is exposed to your tailnet via a
+Tailscale sidecar per service. Pushing a git tag publishes the images to
+Docker Hub and produces an `env-bundle` artifact with the runtime env files.
+
+### Architecture
+
+```
+Browser
+   │
+   │  https://<your-host>.ts.net/         (Tailscale Funnel via ts-ui-router)
+   │  https://<your-host>.ts.net/heavy    (via ts-ui → ui container :3000)
+   │  https://<your-host>.ts.net/lite     (via ts-ui → ui container :3001)
+   ▼
+┌────────────────┐    ┌──────────────────────┐    ┌────────────────────┐
+│ ui-router      │    │ ui  (Heavy + Lite)   │    │ trainer  (GPU+SSH) │
+│ :3002          │    │ :3000, :3001         │    │ :22                │
+│                │    │ Postgres via host    │    │ PyTorch + framework│
+│                │    │  .docker.internal    │    │ code, sshd as      │
+│                │    │ trainer via          │    │  user `trainer`    │
+│                │    │  Tailscale hostname  │    │                    │
+└────────────────┘    └──────────────────────┘    └────────────────────┘
+```
+
+### One-time setup
+
+1. **Generate a Tailscale reusable auth key** at
+   <https://login.tailscale.com/admin/settings/keys>. Scope it to your
+   tailnet and tag it `tag:container` (or similar). You'll inject this into
+   `docker compose` at boot time.
+
+2. **Generate an SSH keypair** the UI container will use to reach the trainer:
+   ```bash
+   ssh-keygen -t ed25519 -N '' -f ./secrets/ui-sshkey
+   ```
+   The public key gets baked into the trainer image; the private key gets
+   shipped to the UI container via the env-bundle.
+
+3. **Populate the GitHub Actions secrets** at
+   <https://github.com/Pratic2001/Advanced-LLM-Framework-NON-MOE/settings/secrets/actions>:
+
+   | Secret | Description |
+   |---|---|
+   | `DOCKERHUB_USERNAME` | Docker Hub login (e.g. `pratic2001`) |
+   | `DOCKERHUB_TOKEN` | Docker Hub Personal Access Token |
+   | `TS_AUTHKEY` | Tailscale reusable auth key from step 1 |
+   | `PUBLIC_HOSTNAME` | Your tailnet hostname, e.g. `pratic-battleaxb450mkm2.tail5e5151.ts.net` |
+   | `NEXTAUTH_SECRET` | 32+ char secret, `openssl rand -base64 32` |
+   | `AUTH_SECRET` | Same value as `NEXTAUTH_SECRET` |
+   | `SSH_KEY_ENCRYPTION_KEY` | 32 hex chars for AES-256-GCM |
+   | `DATABASE_URL` | `postgresql://...` for the host's Postgres |
+   | `SSH_PUBLIC_KEY` | Contents of `./secrets/ui-sshkey.pub` |
+   | `SSH_PRIVATE_KEY` | Contents of `./secrets/ui-sshkey` |
+
+### Releasing
+
+```bash
+# Tag a release — pushes images + generates env-bundle artifact
+git tag v0.2.0 && git push --tags
+```
+
+Then in GitHub Actions:
+1. Wait for the **Release** workflow to finish.
+2. Download the **env-bundle** artifact.
+3. Unpack it next to your clone:
+   ```bash
+   tar -xf env-bundle.tar.gz
+   mv bundle/secrets .
+   ```
+
+### Running the stack
+
+```bash
+# Make sure the Tailscale auth key is in your shell
+export TS_AUTHKEY=tskey-xxxxxxxxxxxxxxxxxxxxxxxx
+
+docker compose pull
+docker compose up -d
+
+# Verify
+docker compose ps                        # all 6 containers healthy
+docker exec trainer nvidia-smi           # GPU visible
+```
+
+Open <https://your-host.ts.net/> in a browser on your tailnet and you should
+land on the RenderRouter.
+
+### Registering the trainer as a Node in the UI
+
+After `docker compose up -d`:
+
+1. Log in to the Heavy UI.
+2. **Settings → Nodes → Register Node**.
+3. Hostname: `trainer` (the Tailscale MagicDNS name of the trainer container).
+4. Port: `22`.
+5. Username: `trainer`.
+6. Paste the contents of `./secrets/ui-sshkey` into the **Private Key** field.
+7. Click **Test Connection** — you should see `NVIDIA GeForce RTX 3050` or
+   whatever GPU is in the trainer container.
+
+### Going back to local dev
+
+The `Dockerfile.ui-router` and `Dockerfile.ui` only matter for the release
+pipeline. Local dev against the dev servers (`:3210`, `:3211`, `:3212`)
+still uses `npm run dev` in each subdirectory — see `UI_RenderRouter/.env.example`
+and `UI/.env.example` for the local overrides.
 
 ---
 

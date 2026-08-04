@@ -146,7 +146,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build image
+      - name: Build trainer image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -162,3 +162,43 @@ jobs:
       - name: Run pretrain smoke test in container
         run: |
           docker run --rm -e CUDA_VISIBLE_DEVICES="" advanced-llm-framework:ci
+
+  # Mirror of release.yml's build-and-push matrix — same three images,
+  # no push. Catches Dockerfile regressions on every PR before a tag is
+  # cut. Build args that depend on GH Secrets get dummy values; the point
+  # here is to verify the Dockerfiles parse, copy, and build.
+  docker-build-all:
+    name: Build all 3 images (no push)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ui-router
+            dockerfile: Dockerfile.ui-router
+          - name: ui
+            dockerfile: Dockerfile.ui
+          - name: trainer
+            dockerfile: Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.image.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          push: false
+          load: true
+          tags: pratic2001/llmforge-${{ matrix.image.name }}:ci
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+          build-args: |
+            NEXT_PUBLIC_HEAVY_UI_URL=https://example.test/heavy
+            NEXT_PUBLIC_LITE_UI_URL=https://example.test/lite
+            NEXT_PUBLIC_BASE_PATH=
+            NEXT_PUBLIC_NEXTAUTH_URL=
+            UI_PUBKEY=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiPDfciKZbeqFG4XOKF8qxcYdM2xvMbCtbXyHPEfCIh dummy

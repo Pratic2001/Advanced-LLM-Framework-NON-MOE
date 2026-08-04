@@ -1,0 +1,48 @@
+# =============================================================================
+# sshd config for the trainer container.
+#
+# Hardening choices:
+#   • PasswordAuthentication no            — keys only (no brute force)
+#   • PermitRootLogin no                   — the UI never logs in as root
+#   • PubkeyAuthentication yes             — the UI ships a private key
+#   • AllowUsers trainer                   — single allowed login
+#   • X11Forwarding / AllowTcpForwarding no — not needed, smaller surface
+#   • UsePAM no                            — sshd manages auth itself
+#
+# GenerateHostKeys yes: on first boot sshd will create host keys under
+# /etc/ssh/ssh_host_*_key. If the image is reused across many containers,
+# they'll all share keys, which is fine because we auth by user key.
+# =============================================================================
+
+Port 22
+ListenAddress 0.0.0.0
+ListenAddress ::
+
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+PidFile /run/sshd.pid
+LoginGraceTime 30
+PermitRootLogin no
+StrictModes yes
+MaxAuthTries 3
+MaxSessions 10
+
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+
+PasswordAuthentication no
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+
+AllowAgentForwarding no
+AllowTcpForwarding no
+X11Forwarding no
+PermitUserEnvironment no
+
+AllowUsers trainer
+
+Subsystem sftp /usr/lib/openssh/sftp-server

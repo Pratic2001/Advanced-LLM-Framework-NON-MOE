@@ -1,0 +1,325 @@
+# =============================================================================
+# Release workflow — builds and pushes the three production container images
+# to Docker Hub, then bundles the runtime env files for the user to drop
+# next to docker-compose.yml.
+#
+# Trigger:
+#   • git tag matching v* (v1.2.3, v0.2.0, etc.)        → release
+#   • workflow_dispatch                                   → manual rerun
+#
+# Output:
+#   pratic2001/llmforge-ui-router:<TAG>+latest
+#   pratic2001/llmforge-ui:<TAG>+latest
+#   pratic2001/llmforge-trainer:<TAG>+latest
+#   Artifact: env-bundle, containing secrets/{router,ui,ui-lite,trainer}.env
+#
+# Required GH Secrets (Settings → Secrets and variables → Actions):
+#   DOCKERHUB_USERNAME          — pratic2001
+#   DOCKERHUB_TOKEN             — Docker Hub PAT
+#   TS_AUTHKEY                  — Tailscale reusable auth key
+#   PUBLIC_HOSTNAME             — e.g. pratic-battleaxb450mkm2.tail5e5151.ts.net
+#   NEXTAUTH_SECRET             — same as the value in the running .env.local
+#   AUTH_SECRET                 — same value as NEXTAUTH_SECRET (Auth.js uses
+#                                 AUTH_SECRET to sign the session cookie, but
+#                                 ws-manager verifies with NEXTAUTH_SECRET)
+#   SSH_KEY_ENCRYPTION_KEY      — 32 hex chars (AES-256-GCM)
+#   DATABASE_URL                — postgres:// connection string for the UI
+#                                 container to reach host Postgres via
+#                                 host.docker.internal:5432
+#   SSH_PUBLIC_KEY              — openssh ed25519 public key the trainer
+#                                 container accepts
+#   SSH_PRIVATE_KEY             — openssh ed25519 private key the UI
+#                                 container uses to SSH to the trainer
+#   NEXT_PUBLIC_LITE_UI_URL     — optional override of the auto-derived
+#   NEXT_PUBLIC_HEAVY_UI_URL      values below; leave unset to derive from
+#                                 PUBLIC_HOSTNAME.
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.2.0). Leave empty for 'latest'."
+        required: false
+        default: "latest"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Build & push ${{ matrix.image.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ui-router
+            dockerfile: Dockerfile.ui-router
+            context: .
+            build-args: |
+              NEXT_PUBLIC_HEAVY_UI_URL=${{ secrets.NEXT_PUBLIC_HEAVY_UI_URL || format('https://{0}/heavy', secrets.PUBLIC_HOSTNAME) }}
+              NEXT_PUBLIC_LITE_UI_URL=${{ secrets.NEXT_PUBLIC_LITE_UI_URL || format('https://{0}/lite', secrets.PUBLIC_HOSTNAME) }}
+          - name: ui
+            dockerfile: Dockerfile.ui
+            context: .
+            build-args: |
+              NEXT_PUBLIC_BASE_PATH=
+              NEXT_PUBLIC_NEXTAUTH_URL=
+              NEXT_PUBLIC_HEAVY_UI_URL=${{ secrets.NEXT_PUBLIC_HEAVY_UI_URL || format('https://{0}/heavy', secrets.PUBLIC_HOSTNAME) }}
+              NEXT_PUBLIC_LITE_UI_URL=${{ secrets.NEXT_PUBLIC_LITE_UI_URL || format('https://{0}/lite', secrets.PUBLIC_HOSTNAME) }}
+          - name: trainer
+            dockerfile: Dockerfile
+            context: .
+            build-args: |
+              UI_PUBKEY=${{ secrets.SSH_PUBLIC_KEY }}
+    steps:
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.event.inputs.tag || 'latest' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          push: true
+          tags: |
+            pratic2001/llmforge-${{ matrix.image.name }}:${{ steps.tag.outputs.value }}
+            pratic2001/llmforge-${{ matrix.image.name }}:latest
+          labels: |
+            org.opencontainers.image.title=llmforge-${{ matrix.image.name }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.value }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+          build-args: ${{ matrix.image.build-args }}
+
+  generate-env-bundle:
+    name: Generate env-bundle
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      # We don't actually need the source tree — just bash + secret material.
+      - name: Set up env files
+        env:
+          PUBLIC_HOSTNAME: ${{ secrets.PUBLIC_HOSTNAME }}
+          NEXTAUTH_SECRET: ${{ secrets.NEXTAUTH_SECRET }}
+          AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
+          SSH_KEY_ENCRYPTION_KEY: ${{ secrets.SSH_KEY_ENCRYPTION_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NEXT_PUBLIC_HEAVY_UI_URL: ${{ secrets.NEXT_PUBLIC_HEAVY_UI_URL }}
+          NEXT_PUBLIC_LITE_UI_URL: ${{ secrets.NEXT_PUBLIC_LITE_UI_URL }}
+          NEXT_PUBLIC_NEXTAUTH_URL: ${{ secrets.NEXT_PUBLIC_NEXTAUTH_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p bundle/secrets
+
+          if [[ -z "${PUBLIC_HOSTNAME}" ]]; then
+            echo "::error::PUBLIC_HOSTNAME secret is required"
+            exit 1
+          fi
+
+          # Derive any missing NEXT_PUBLIC_* values from PUBLIC_HOSTNAME.
+          : "${NEXT_PUBLIC_HEAVY_UI_URL:=https://${PUBLIC_HOSTNAME}/heavy}"
+          : "${NEXT_PUBLIC_LITE_UI_URL:=https://${PUBLIC_HOSTNAME}/lite}"
+          # Auth.js client treats NEXTAUTH_URL's path as the FULL auth base
+          # (including /api/auth). Derive that automatically so the user
+          # only has to update PUBLIC_HOSTNAME in one place.
+          : "${NEXT_PUBLIC_NEXTAUTH_URL:=https://${PUBLIC_HOSTNAME}/lite/api/auth}"
+
+          # ── router.env — used by ui-router container ─────────────────
+          cat > bundle/secrets/router.env <<EOF
+          # Generated by release.yml — do not edit by hand.
+          # Re-run the release workflow and redownload this bundle to update.
+          NEXT_PUBLIC_HEAVY_UI_URL=${NEXT_PUBLIC_HEAVY_UI_URL}
+          NEXT_PUBLIC_LITE_UI_URL=${NEXT_PUBLIC_LITE_UI_URL}
+          EOF
+
+          # ── ui.env — Heavy UI on :3000 ────────────────────────────────
+          cat > bundle/secrets/ui.env <<EOF
+          # Generated by release.yml — do not edit by hand.
+          NODE_ENV=production
+          PORT=3000
+          HOSTNAME=0.0.0.0
+          DATABASE_URL=${DATABASE_URL}
+          NEXTAUTH_URL=https://${PUBLIC_HOSTNAME}
+          NEXTAUTH_SECRET=${NEXTAUTH_SECRET}
+          AUTH_SECRET=${AUTH_SECRET}
+          AUTH_TRUST_HOST=true
+          NEXT_PUBLIC_BASE_PATH=/heavy
+          NEXT_PUBLIC_NEXTAUTH_URL=https://${PUBLIC_HOSTNAME}/heavy/api/auth
+          SSH_KEY_ENCRYPTION_KEY=${SSH_KEY_ENCRYPTION_KEY}
+          REPO_ROOT=../Advanced-LLM-Framework-NON-MOE/
+          EOF
+
+          # ── ui-lite.env — UI_lite on :3001 ───────────────────────────
+          cat > bundle/secrets/ui-lite.env <<EOF
+          # Generated by release.yml — do not edit by hand.
+          NODE_ENV=production
+          PORT=3001
+          HOSTNAME=0.0.0.0
+          DATABASE_URL=${DATABASE_URL}
+          NEXTAUTH_URL=https://${PUBLIC_HOSTNAME}
+          NEXTAUTH_SECRET=${NEXTAUTH_SECRET}
+          AUTH_SECRET=${AUTH_SECRET}
+          AUTH_TRUST_HOST=true
+          NEXT_PUBLIC_BASE_PATH=/lite
+          NEXT_PUBLIC_NEXTAUTH_URL=https://${PUBLIC_HOSTNAME}/lite/api/auth
+          SSH_KEY_ENCRYPTION_KEY=${SSH_KEY_ENCRYPTION_KEY}
+          REPO_ROOT=../Advanced-LLM-Framework-NON-MOE/
+          EOF
+
+          # ── trainer.env — currently only used for documentation; the
+          # trainer container does not need any env vars to run the SSH
+          # daemon. We still ship an empty file so the env_file: directive
+          # in docker-compose.yml doesn't error.
+          cat > bundle/secrets/trainer.env <<EOF
+          # Generated by release.yml — do not edit by hand.
+          # Trainer container has no runtime env requirements.
+          EOF
+
+          # README next to the bundle so the user knows what to do with it.
+          cat > bundle/README.txt <<EOF
+          env-bundle generated $(date -u +%FT%TZ)
+
+          Contents:
+            secrets/router.env      — UI_RenderRouter runtime config
+            secrets/ui.env          — Heavy UI runtime config (:3000)
+            secrets/ui-lite.env     — UI_lite runtime config (:3001)
+            secrets/trainer.env     — Trainer runtime config (currently empty)
+
+          Usage:
+            mv bundle/secrets ./
+            TS_AUTHKEY=tskey-xxxxxxxx  docker compose up -d
+
+          (TS_AUTHKEY must be set in your shell or in ./secrets/ts-authkey.)
+
+          The Tailscale auth key is NOT bundled — it's tied to your account
+          and should never live in version control.
+          EOF
+
+          tar czf env-bundle.tar.gz -C bundle .
+
+      - name: Upload env-bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: env-bundle
+          path: env-bundle.tar.gz
+          # 7 days is plenty for a release workflow.
+          retention-days: 7
+
+  smoke-test:
+    name: Smoke test (compose up + curl)
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      # We don't have a GPU on the runner, so the trainer container would
+      # crash on sshd without --gpus. Skip the GPU smoke here; CI's existing
+      # ci.yml covers pretrain on CPU. For this job, only the UI containers
+      # are exercised.
+      - uses: actions/checkout@v4
+
+      - name: Set up env files
+        env:
+          PUBLIC_HOSTNAME: ${{ secrets.PUBLIC_HOSTNAME }}
+          NEXTAUTH_SECRET: ${{ secrets.NEXTAUTH_SECRET }}
+          AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
+          SSH_KEY_ENCRYPTION_KEY: ${{ secrets.SSH_KEY_ENCRYPTION_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p secrets
+          cat > secrets/router.env <<EOF
+          NEXT_PUBLIC_HEAVY_UI_URL=https://example.test/heavy
+          NEXT_PUBLIC_LITE_UI_URL=https://example.test/lite
+          EOF
+          cat > secrets/ui.env <<EOF
+          NODE_ENV=production
+          PORT=3000
+          HOSTNAME=0.0.0.0
+          DATABASE_URL=${DATABASE_URL}
+          NEXTAUTH_URL=https://example.test
+          NEXTAUTH_SECRET=${NEXTAUTH_SECRET}
+          AUTH_SECRET=${AUTH_SECRET}
+          AUTH_TRUST_HOST=true
+          NEXT_PUBLIC_BASE_PATH=/heavy
+          NEXT_PUBLIC_NEXTAUTH_URL=https://example.test/heavy/api/auth
+          SSH_KEY_ENCRYPTION_KEY=${SSH_KEY_ENCRYPTION_KEY}
+          EOF
+          cat > secrets/ui-lite.env <<EOF
+          NODE_ENV=production
+          PORT=3001
+          HOSTNAME=0.0.0.0
+          DATABASE_URL=${DATABASE_URL}
+          NEXTAUTH_URL=https://example.test
+          NEXTAUTH_SECRET=${NEXTAUTH_SECRET}
+          AUTH_SECRET=${AUTH_SECRET}
+          AUTH_TRUST_HOST=true
+          NEXT_PUBLIC_BASE_PATH=/lite
+          NEXT_PUBLIC_NEXTAUTH_URL=https://example.test/lite/api/auth
+          SSH_KEY_ENCRYPTION_KEY=${SSH_KEY_ENCRYPTION_KEY}
+          EOF
+          cat > secrets/trainer.env <<EOF
+          EOF
+
+      # Stub TS_AUTHKEY so the sidecars don't refuse to start.
+      - name: Set dummy TS_AUTHKEY
+        run: echo "TS_AUTHKEY=tskey-fake-ci-smoke" >> "$GITHUB_ENV"
+
+      - name: Pull & boot
+        run: |
+          docker compose pull ui-router ui || true
+          docker compose up -d ui-router ui
+          # No trainer (no GPU). No sidecars either — they need a real
+          # Tailscale auth key.
+
+      - name: Wait for UI containers
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3002 >/dev/null 2>&1 \
+            && curl -fsS http://localhost:3000 >/dev/null 2>&1 \
+            && curl -fsS http://localhost:3001 >/dev/null 2>&1; then
+              echo "all three reachable"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose ps
+          docker compose logs --tail=200
+          echo "containers failed to come up"
+          exit 1
+
+      - name: Verify auth endpoints
+        run: |
+          # NextAuth's /api/auth/providers must return JSON on both ports.
+          curl -fsS http://localhost:3002/ >/dev/null
+          curl -fsS http://localhost:3000/api/auth/providers | grep -q credentials
+          curl -fsS http://localhost:3001/api/auth/providers | grep -q credentials
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v || true
