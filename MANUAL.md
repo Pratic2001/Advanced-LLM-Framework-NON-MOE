@@ -29,7 +29,8 @@
 19. [Model Architecture Reference](#19-model-architecture-reference)
 20. [End-to-End Pipeline: Train on an RTX 4090](#20-end-to-end-pipeline-train-a-capable-350m-model-on-an-rtx-4090)
 21. [Hardware Benchmark & Hyperparameter Tuning](#21-hardware-benchmark--hyperparameter-tuning)
-22. [Appendix A: Full CLI Reference](#appendix-a-full-cli-reference)
+22. [Release Pipeline (Containerized Deploy)](#22-release-pipeline-containerized-deploy)
+23. [Appendix A: Full CLI Reference](#appendix-a-full-cli-reference)
 
 ---
 
@@ -3321,6 +3322,113 @@ python benchmark_tune.py --pretrain --model-size 0.6B
 - **Analytical mode** (`--quick`): Uses closed-form formulas to estimate VRAM per parameter (12 bytes for AdamW, ~4 bytes for Muon) with activation memory scaling. No training required.
 - **Benchmark mode** (`--pretrain`/`--sft`/etc.): Generates synthetic JSONL data, trains a tiny BPE tokenizer (vocab_size=4096), packs data via the standard packers, then runs the actual training script as a subprocess with `--num-steps 30-50`. VRAM is monitored via a background thread polling `nvidia-smi` every 200ms.
 - **Safety**: All temporary data goes under `/tmp/benchmark_tune/` and is cleaned up unless `--keep-files`. Each benchmark run is capped at 50 steps. Training benchmarks are opt-in (default is `--quick` only).
+
+---
+
+## 22. Release Pipeline (Containerized Deploy)
+
+When you're ready to ship the framework as a deployable stack — three
+container images on Docker Hub, exposed to your tailnet via Tailscale —
+you cut a release by pushing a `v*` git tag. The full pipeline lives in
+`.github/workflows/release.yml`.
+
+> **Full reference: see [RELEASE.md](./RELEASE.md)** for the complete
+> pipeline doc (secrets, env-bundle contents, cold-start math, and the
+> `/dashboard`-vs-`/api/auth/providers` rationale). This section is a
+> quick reference for someone already familiar with the workflow.
+
+### Cutting a release
+
+```bash
+# Tag a release
+git tag v0.2.0
+git push --tags
+
+# Optional: re-run a failed release without re-tagging
+#   GitHub → Actions → "Release" → "Run workflow" → leave Tag blank
+#   to use :latest, or set Tag=v0.2.0 to re-publish a specific tag
+```
+
+What happens, in order:
+
+1. **`build-and-push`** — three parallel builds (`ui-router`, `ui`,
+   `trainer`), each pushed to `pratic2001/llmforge-<name>:<tag>` AND
+   `:latest`.
+2. **`generate-env-bundle`** — assembles
+   `secrets/{router,ui,ui-lite,trainer}.env` from GH Secrets and uploads
+   as the `env-bundle` artifact.
+3. **`smoke-test`** — `docker compose up -d` on the freshly-built images
+   with stubbed Tailscale auth keys, waits for `:3000/dashboard`,
+   `:3001/dashboard`, and `:3002/` to return 200, then tears down.
+4. **`notify-release`** — generates `release-summary-<tag>.pdf` (image
+   digests pulled live from Docker Hub + "What's New" commit log +
+   deployment steps) and uploads it as an artifact. Emails it if SMTP
+   secrets are configured.
+
+Typical wall-clock: ~6 minutes on a self-hosted runner, ~8–10 minutes
+on a GitHub-hosted runner.
+
+### Receiving the PDF by email
+
+The workflow always uploads the PDF as an artifact. To have it
+**emailed** to you as well, set these GitHub Secrets (`Settings →
+Secrets and variables → Actions`):
+
+| Secret | Example / default |
+|---|---|
+| `SMTP_HOST` | `smtp.gmail.com` |
+| `SMTP_PORT` | `465` (default) |
+| `SMTP_SECURE` | `true` (default) |
+| `SMTP_USERNAME` | `cpratic8@gmail.com` |
+| `SMTP_PASSWORD` | Gmail **app password** from <https://myaccount.google.com/apppasswords> (requires 2FA) |
+| `NOTIFY_EMAIL` | Recipient address (defaults to `SMTP_USERNAME`) |
+
+If any are missing, the email step is skipped with a notice that points
+at the Settings page — the artifact is still uploaded.
+
+### Reading the PDF
+
+The PDF is three pages:
+
+| Page | Contents |
+|---|---|
+| 1 | Project header (name, tag, timestamp, head SHA) + the three image digests pulled live from Docker Hub |
+| 2 | "What's New" — commit log since the previous `v[0-9]...` tag (or the last 25 commits if no previous tag) |
+| 3 | Deployment instructions + the artifact list |
+
+This is your shareable record of what shipped — point a teammate at the
+artifact and they have everything they need to pull the same images.
+
+### When the smoke-test fails
+
+The smoke-test catches "image built but server can't actually serve a
+request" before any artifact is published. If it fails:
+
+1. Open the failed run's `smoke-test` job and read the
+   `Wait for UI containers + verify Next is serving` step log.
+2. The 90×2s = 3 minute budget covers cold-start (image pull + npm ci +
+   Next compile + Prisma generate). If it timed out, the runner was
+   unusually slow — rerun.
+3. If a probe (`wget ... /dashboard`) failed, it means Next is up but
+   returning non-200. Check the `ui` container's logs in the step for
+   the route stack trace.
+4. Re-run from the Actions tab without re-tagging; the workflow uses
+   `:latest` for `workflow_dispatch` runs with no `tag` input.
+
+The full root-cause write-up for the recent
+`/dashboard`-vs-`/api/auth/providers` switch is in
+[RELEASE.md → Why not /api/auth/providers?](./RELEASE.md#appendix-why-not-apiauthproviders).
+
+### Required secrets — quick reference
+
+| Secret | Required for |
+|---|---|
+| `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` | Any release at all |
+| `PUBLIC_HOSTNAME` | Any release at all (inlined at build time into `NEXT_PUBLIC_*_UI_URL`) |
+| `NEXTAUTH_SECRET`, `AUTH_SECRET`, `SSH_KEY_ENCRYPTION_KEY`, `DATABASE_URL` | env-bundle (so the resulting stack has working auth + Postgres) |
+| `SSH_PUBLIC_KEY` | Trainer image (baked in at build time) |
+| `SSH_PRIVATE_KEY` | env-bundle (so UI container can SSH to trainer) |
+| `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `NOTIFY_EMAIL` | PDF email notification (optional) |
 
 ---
 

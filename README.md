@@ -26,6 +26,7 @@
 - [Containerized Deployment](#-containerized-deployment)
   - [Fresh-PC Setup](#fresh-pc-setup)
   - [Multi-PC Deployment](#multi-pc-deployment)
+- [Release Pipeline](#-release-pipeline)
 - [Full Documentation](#-full-documentation)
 - [License & Citation](#-license--citation)
 
@@ -308,6 +309,25 @@ torch first as shown in the `Dockerfile`.
 - **Smoke tests** — the five `--smoke-test` entry points above, on CPU
 - **Docker build** — image builds and runs the pretrain smoke test inside it
 
+### 🚢 Release
+
+`.github/workflows/release.yml` runs on `v*` tag push (and on
+`workflow_dispatch` for manual reruns). Four jobs:
+
+1. **build-and-push** — matrix over `[ui-router, ui, trainer]`,
+   builds + pushes to `pratic2001/llmforge-*:<tag>` and `:latest`
+2. **generate-env-bundle** — assembles `secrets/{router,ui,ui-lite,trainer}.env`
+   from GH Secrets, uploads as the `env-bundle` artifact
+3. **smoke-test** — `docker compose up -d` on the freshly-built images,
+   waits for `:3000`, `:3001`, `:3002` to return 200 on `/dashboard`,
+   then tears down
+4. **notify-release** — generates `release-summary-<tag>.pdf` (image
+   digests + "What's New" commit log + deployment steps) and emails it
+   if SMTP secrets are set
+
+See **[RELEASE.md](./RELEASE.md)** for the full pipeline reference,
+required secrets, and PDF/email configuration.
+
 ---
 
 ## 📦 Module Overview
@@ -548,21 +568,11 @@ Then in GitHub Actions:
 
 ### Optional: email the release PDF
 
-The Release workflow also emails the PDF to you if you set these GitHub
-Secrets (`Settings → Secrets and variables → Actions`):
-
-| Secret | Description |
-| --- | --- |
-| `SMTP_HOST` | e.g. `smtp.gmail.com` |
-| `SMTP_PORT` | `465` (default, TLS) |
-| `SMTP_SECURE` | `true` (default) |
-| `SMTP_USERNAME` | e.g. `cpratic8@gmail.com` |
-| `SMTP_PASSWORD` | Gmail **app password** — generate at <https://myaccount.google.com/apppasswords>. Your normal Gmail password won't work; you need 2FA + an app password. |
-| `NOTIFY_EMAIL` | Recipient address (defaults to `SMTP_USERNAME` if unset). |
-
-Without these, the workflow still uploads `release-summary-<tag>.pdf` as a
-workflow artifact — that's the canonical source of truth. Email is just a
-convenience.
+The Release workflow also emails the PDF to you if you set the SMTP
+secrets listed in [Release Pipeline → Receiving the PDF by email](#-release-pipeline).
+See **[RELEASE.md](./RELEASE.md)** for the full pipeline reference,
+the env-bundle artifact structure, the cold-start math, and a write-up
+of why the smoke-test probes `/dashboard` instead of `/api/auth/providers`.
 
 ### Running the stack
 
@@ -805,6 +815,58 @@ The UI container doesn't drive hivemind jobs — those are launched
 directly inside each trainer. If you want the UI to *coordinate* distributed
 training, use the `nodeIds[]` field on `POST /api/jobs` to fan out a job
 across multiple Nodes; the existing ssh-manager does the round-trip.
+
+---
+
+## 🚢 Release Pipeline
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which does
+**four** things in order:
+
+1. **`build-and-push`** — matrix build of the three container images
+   (`ui-router`, `ui`, `trainer`), each pushed to
+   `pratic2001/llmforge-<name>:<tag>` *and* `:latest` on Docker Hub.
+2. **`generate-env-bundle`** — assembles
+   `secrets/{router,ui,ui-lite,trainer}.env` from GH Secrets and uploads
+   it as the `env-bundle` workflow artifact.
+3. **`smoke-test`** — `docker compose up -d` on the freshly-built
+   images, waits up to 3 minutes for Next to be serving real HTML on
+   `/dashboard` for `:3000`, `:3001`, and `:3002`, then tears down.
+4. **`notify-release`** — generates `release-summary-<tag>.pdf`
+   (image digests pulled live from Docker Hub + "What's New" commit
+   log + deployment instructions) and uploads it as an artifact.
+   If you set SMTP secrets (see below), it also **emails** the PDF
+   to your address.
+
+### Cutting a release
+
+```bash
+git tag v0.2.0
+git push --tags
+# → Actions tab, wait for "Release" to finish (≈ 6 minutes)
+# → Download env-bundle and release-summary-v0.2.0 artifacts
+```
+
+### Receiving the PDF by email
+
+The workflow emails the PDF to you if you set these GitHub Secrets
+(`Settings → Secrets and variables → Actions`):
+
+| Secret | Example |
+|---|---|
+| `SMTP_HOST` | `smtp.gmail.com` |
+| `SMTP_PORT` | `465` (default) |
+| `SMTP_USERNAME` | `cpratic8@gmail.com` |
+| `SMTP_PASSWORD` | Gmail **app password** from <https://myaccount.google.com/apppasswords> (requires 2FA; your normal Gmail password will not work) |
+| `NOTIFY_EMAIL` | Recipient address (defaults to `SMTP_USERNAME` if unset) |
+
+Without these, the PDF is still uploaded as an artifact — that's the
+canonical source of truth. Email is a convenience.
+
+**Full pipeline reference:** see **[RELEASE.md](./RELEASE.md)** for the
+required secrets, the env-bundle artifact structure, the cold-start
+budget for the smoke-test, and a write-up of why the smoke-test probes
+`/dashboard` instead of `/api/auth/providers`.
 
 ---
 
