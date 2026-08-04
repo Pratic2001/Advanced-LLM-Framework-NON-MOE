@@ -343,11 +343,14 @@ jobs:
           docker compose up -d ui-router ui
 
       - name: Wait for UI containers
+        # Cold-start can take ~2 minutes on the CI runner (npm install in
+        # the entrypoint, Next compile, prisma generate on first boot).
+        # Give it 90 retries × 2s = 3 minutes before failing.
         run: |
           # docker-compose.yml doesn't publish host ports — Tailscale sidecars
           # are the only intended ingress. For CI we exec into the containers
           # via the internal `tailnet` network (no host port mapping needed).
-          for i in $(seq 1 30); do
+          for i in $(seq 1 90); do
             if docker compose exec -T ui-router wget -q -O- http://localhost:3002 >/dev/null 2>&1 \
             && docker compose exec -T ui sh -c "wget -q -O- http://localhost:3000 >/dev/null 2>&1 && wget -q -O- http://localhost:3001 >/dev/null 2>&1"; then
               echo "all three reachable"
