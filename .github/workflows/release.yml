@@ -56,6 +56,15 @@ jobs:
   build-and-push:
     name: Build & push ${{ matrix.image.name }}
     runs-on: ubuntu-latest
+    # All secrets are wired through job-level env. GH Actions does NOT
+    # expand `secrets.*` inside `strategy.matrix.*` (it errors with
+    # "Unrecognized named-value: 'secrets'" at parse time), so derive
+    # build args in a step below instead of inlining them here.
+    env:
+      PUBLIC_HOSTNAME: ${{ secrets.PUBLIC_HOSTNAME }}
+      NEXT_PUBLIC_HEAVY_UI_URL: ${{ secrets.NEXT_PUBLIC_HEAVY_UI_URL }}
+      NEXT_PUBLIC_LITE_UI_URL: ${{ secrets.NEXT_PUBLIC_LITE_UI_URL }}
+      SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
     strategy:
       fail-fast: false
       matrix:
@@ -63,22 +72,17 @@ jobs:
           - name: ui-router
             dockerfile: Dockerfile.ui-router
             context: .
-            build-args: |
-              NEXT_PUBLIC_HEAVY_UI_URL=${{ secrets.NEXT_PUBLIC_HEAVY_UI_URL || format('https://{0}/heavy', secrets.PUBLIC_HOSTNAME) }}
-              NEXT_PUBLIC_LITE_UI_URL=${{ secrets.NEXT_PUBLIC_LITE_UI_URL || format('https://{0}/lite', secrets.PUBLIC_HOSTNAME) }}
+            # Tag the kind of args this matrix entry needs; the build
+            # step composes the actual KEY=VALUE list from env vars.
+            args-kind: public-urls
           - name: ui
             dockerfile: Dockerfile.ui
             context: .
-            build-args: |
-              NEXT_PUBLIC_BASE_PATH=
-              NEXT_PUBLIC_NEXTAUTH_URL=
-              NEXT_PUBLIC_HEAVY_UI_URL=${{ secrets.NEXT_PUBLIC_HEAVY_UI_URL || format('https://{0}/heavy', secrets.PUBLIC_HOSTNAME) }}
-              NEXT_PUBLIC_LITE_UI_URL=${{ secrets.NEXT_PUBLIC_LITE_UI_URL || format('https://{0}/lite', secrets.PUBLIC_HOSTNAME) }}
+            args-kind: public-urls
           - name: trainer
             dockerfile: Dockerfile
             context: .
-            build-args: |
-              UI_PUBKEY=${{ secrets.SSH_PUBLIC_KEY }}
+            args-kind: ssh-pubkey
     steps:
       - name: Determine image tag
         id: tag
@@ -100,6 +104,47 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Compose build args from job-level env (which CAN read secrets).
+      # Anything unset on the secret side falls back to the derived
+      # PUBLIC_HOSTNAME form, matching what the env-bundle job does.
+      - name: Compute build args
+        id: buildargs
+        env:
+          KIND: ${{ matrix.image.args-kind }}
+        run: |
+          set -euo pipefail
+          HOST="${PUBLIC_HOSTNAME}"
+          if [[ -z "${HOST}" ]]; then
+            echo "::error::PUBLIC_HOSTNAME secret is required"
+            exit 1
+          fi
+          HEAVY="${NEXT_PUBLIC_HEAVY_UI_URL:-https://${HOST}/heavy}"
+          LITE="${NEXT_PUBLIC_LITE_UI_URL:-https://${HOST}/lite}"
+          PUBKEY="${SSH_PUBLIC_KEY:-}"
+
+          case "${KIND}" in
+            public-urls)
+              # Heavy UI (BASE_PATH=/heavy) and UI_lite (BASE_PATH=/lite)
+              # are both built in the same container from the same args;
+              # ui-router ignores BASE_PATH/NEXTAUTH_URL so empty values
+              # are fine.
+              ARGS=$(printf 'NEXT_PUBLIC_HEAVY_UI_URL=%s\nNEXT_PUBLIC_LITE_UI_URL=%s\nNEXT_PUBLIC_BASE_PATH=\nNEXT_PUBLIC_NEXTAUTH_URL=' "${HEAVY}" "${LITE}")
+              ;;
+            ssh-pubkey)
+              ARGS=$(printf 'UI_PUBKEY=%s' "${PUBKEY}")
+              ;;
+            *)
+              echo "::error::unknown args-kind: ${KIND}"
+              exit 1
+              ;;
+          esac
+          {
+            echo "args<<EOF"
+            printf '%s' "${ARGS}"
+            echo
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build & push
         uses: docker/build-push-action@v6
         with:
@@ -116,7 +161,7 @@ jobs:
             org.opencontainers.image.version=${{ steps.tag.outputs.value }}
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
-          build-args: ${{ matrix.image.build-args }}
+          build-args: ${{ steps.buildargs.outputs.args }}
 
   generate-env-bundle:
     name: Generate env-bundle
