@@ -5,6 +5,7 @@
 
 import prisma from "./db";
 import { extractStep, parseMetricLine } from "./utils";
+import type { Prisma } from "@prisma/client";
 
 export interface ParsedMetrics {
   step: number;
@@ -103,7 +104,7 @@ export class MetricsCollector {
     limit = 500,
     afterStep?: number
   ): Promise<ParsedMetrics[]> {
-    const where: any = { jobId };
+    const where: Prisma.JobMetricWhereInput = { jobId };
     if (afterStep !== undefined) {
       where.step = { gt: afterStep };
     }
