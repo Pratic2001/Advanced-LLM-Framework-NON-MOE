@@ -66,9 +66,9 @@ RUN cd ui && npx prisma generate && cd ..
 RUN { \
       echo 'DATABASE_URL=postgresql://postgres:postgres@localhost:5432/placeholder'; \
       echo 'NEXTAUTH_URL=http://localhost:3000'; \
-      echo 'NEXTAUTH_SECRET=build-time-placeholder-not-used-at-runtime'; \
-      echo 'AUTH_SECRET=build-time-placeholder-not-used-at-runtime'; \
-      echo 'SSH_KEY_ENCRYPTION_KEY=build-time-placeholder-not-used-at-runtime'; \
+      echo 'NEXTAUTH_SECRET=build-time-dummy-secret'; \
+      echo 'AUTH_SECRET=build-time-dummy-secret'; \
+      echo 'SSH_KEY_ENCRYPTION_KEY=00000000000000000000000000000000'; \
       echo 'AUTH_TRUST_HOST=true'; \
     } > ui/.env.local \
  && cp ui/.env.local ui_lite/.env.local
