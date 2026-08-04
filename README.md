@@ -24,6 +24,8 @@
 - [Repository Structure](#-repository-structure)
 - [Requirements](#-requirements)
 - [Containerized Deployment](#-containerized-deployment)
+  - [Fresh-PC Setup](#fresh-pc-setup)
+  - [Multi-PC Deployment](#multi-pc-deployment)
 - [Full Documentation](#-full-documentation)
 - [License & Citation](#-license--citation)
 
@@ -577,6 +579,211 @@ The `Dockerfile.ui-router` and `Dockerfile.ui` only matter for the release
 pipeline. Local dev against the dev servers (`:3210`, `:3211`, `:3212`)
 still uses `npm run dev` in each subdirectory — see `UI_RenderRouter/.env.example`
 and `UI/.env.example` for the local overrides.
+
+### Fresh-PC Setup
+
+Run `install.sh` on any new machine. It checks prerequisites, prompts for
+the two values you can't auto-generate (Tailscale hostname + auth key),
+generates SSH keys + secrets, pulls the images, and starts the stack.
+
+```bash
+# Clone the repo anywhere — install.sh doesn't need source code, only
+# docker + the images it pulls from Docker Hub.
+git clone https://github.com/Pratic2001/Advanced-LLM-Framework-NON-MOE.git
+cd Advanced-LLM-Framework-NON-MOE
+
+# Default: interactive. Skips prompts for things you already set via env.
+./install.sh
+
+# Non-interactive (CI, scripted deploys):
+./install.sh --non-interactive \
+  --public-hostname=pratic-battleaxb450mkm2.tail5e5151.ts.net \
+  --ts-authkey=tskey-xxxxxxxxxxxxxxxxxxxxxxxx \
+  --tag=v0.2.0
+```
+
+**What `install.sh` does, step by step:**
+
+1. Verifies `docker`, `docker compose` plugin, and `openssl` are installed.
+2. Prompts for `PUBLIC_HOSTNAME` (your tailnet hostname) and `TS_AUTHKEY`
+   (Tailscale reusable auth key from <https://login.tailscale.com/admin/settings/keys>).
+   All other values are auto-generated: NEXTAUTH_SECRET, AUTH_SECRET,
+   SSH_KEY_ENCRYPTION_KEY, plus a fresh ed25519 SSH keypair in `secrets/`.
+3. Writes `secrets/{router,ui,ui-lite,trainer}.env` from those values.
+4. Runs `docker compose pull` and `docker compose up -d`.
+5. Verifies the UI containers came up healthy and (if present) the
+   trainer can see its GPU via `nvidia-smi`.
+
+**Prerequisites a fresh box needs before `install.sh` will work:**
+
+```bash
+# Docker + compose plugin (Ubuntu/Debian)
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker "$USER"    # log out + back in for this to take effect
+
+# Tailscale (optional — only needed if you want to skip the bundled sidecars
+# and let the host's existing tailscaled do the routing instead)
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+
+# NVIDIA Container Toolkit (GPU host only)
+# https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+distribution=$(. /etc/os-release;echo "$ID$VERSION_ID")
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -sSL https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt update && sudo apt install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+**Updating an existing install:**
+
+```bash
+TAG=v0.3.0 ./install.sh       # pulls new tag, restarts in place
+# Secrets are preserved — install.sh reuses ./secrets/ui-sshkey if present
+# and only prompts for missing values.
+```
+
+---
+
+### Multi-PC Deployment
+
+The same Docker images cover three topologies. Pick the one that fits your
+hardware.
+
+#### Topology A — Split the GPU out (1 UI PC + 1 GPU PC)
+
+Common when the GPU box is in a different room / closet / cloud VM and
+your everyday workstation only needs to drive the UI.
+
+```
+┌──────────────────────────────────────┐    ┌──────────────────────────────────────┐
+│ UI PC  (no GPU, no NVIDIA toolkit)   │    │ GPU PC  (RTX 3050/4050/4090 etc.)   │
+│                                      │    │                                      │
+│  ui-router   (:3002)                 │    │  trainer   (:22, GPU)                │
+│  ui          (:3000 + :3001)         │    │                                      │
+│  ts-ui-router, ts-ui (sidecars)      │    │  ts-trainer (sidecar)                │
+│                                      │    │                                      │
+│  Postgres on host (or shared LAN)    │    │                                      │
+└──────────────────┬───────────────────┘    └──────────────────┬───────────────────┘
+                   │                                            │
+                   └────── Tailscale tailnet ───────────────────┘
+                            (MagicDNS name 'trainer'
+                             reaches the GPU host)
+```
+
+**On the GPU PC:**
+
+```bash
+git clone https://github.com/Pratic2001/Advanced-LLM-Framework-NON-MOE.git
+cd Advanced-LLM-Framework-NON-MOE
+./install.sh --non-interactive \
+  --public-hostname=pratic-battleaxb450mkm2.tail5e5151.ts.net \
+  --ts-authkey=tskey-xxx
+# install.sh generates secrets/ui-sshkey — copy the PUBLIC half to the UI PC.
+scp secrets/ui-sshkey.pub ui-pc:~/Advanced-LLM-Framework-NON-MOE/secrets/ui-sshkey.pub
+```
+
+**On the UI PC:**
+
+```bash
+git clone https://github.com/Pratic2001/Advanced-LLM-Framework-NON-MOE.git
+cd Advanced-LLM-Framework-NON-MOE
+
+# Drop the trainer service + ts-trainer sidecar — the GPU lives elsewhere.
+docker compose -f docker-compose.yml -f docker-compose.ui-only.yml up -d
+
+# Register the remote trainer as a Node:
+#   Settings → Nodes → Register Node:
+#     hostname = trainer            # the GPU PC's Tailscale MagicDNS name
+#     port     = 22
+#     username = trainer
+#     key      = contents of secrets/ui-sshkey (private half, on UI PC)
+```
+
+The UI container reaches the trainer over SSH on the Tailscale hostname
+`trainer`. No special firewall rules — Tailscale's encrypted tunnel handles
+NAT traversal.
+
+#### Topology B — Mirror the UI to multiple PCs (centralized trainer)
+
+Useful when you want low-latency access from a laptop at home AND a desktop
+at the office, but training still happens on one GPU machine.
+
+```
+┌────────────┐    ┌────────────┐    ┌─────────────────┐
+│ Home PC    │    │ Office PC  │    │ GPU Server      │
+│ ui + ts-ui │    │ ui + ts-ui │    │ trainer + ts-tr │
+│ Postgres ↘ │    │ Postgres ↘ │    │        ↑        │
+│            └────┴────────────┴────┘                 │
+│            shared Postgres (one host, or RDS etc.) │
+└────────────┴────────────────────────────────────────┘
+```
+
+Each UI PC runs `./install.sh` separately but uses the same
+`PUBLIC_HOSTNAME`. The trick is the Tailscale sidecars on each UI host
+publish the same path mappings (`/heavy`, `/lite`) under the same MagicDNS
+hostname — only one of them can win the funnel race at a time, so use
+**Tailscale Serve** (in-process) on the "primary" host and **Tailscale
+client routing** (the default `--accept-routes` flag in our compose) on
+the others.
+
+In practice: pick one host as the funnel entry point, and on the others
+drop the `ts-ui-router` and `ts-ui` sidecars:
+
+```yaml
+# docker-compose.ui-internal.yml — Topology B secondary host
+# Inherits from docker-compose.yml and -ui-only.yml, but also removes
+# the ts-* sidecars because this host's UI is reached via the primary.
+include:
+  - docker-compose.yml
+  - docker-compose.ui-only.yml
+```
+
+Override the `ts-ui-router` and `ts-ui` services to no-op, or just edit
+`docker-compose.yml` to comment them out before running on secondary hosts.
+
+Postgres must be reachable from every UI host. The simplest setup is to
+point `DATABASE_URL` in each `secrets/ui.env` at the same central Postgres
+(e.g. `postgresql://...@postgres-host.tailnet:5432/llm_training_ui`).
+
+#### Topology C — Distributed training across multiple GPUs
+
+For multi-GPU / multi-machine training, use the framework's
+[hivemind decentralized training scripts](./hivemind/README.md). The
+Docker images don't need to know about each other — each trainer container
+runs an independent peer and they discover each other via the
+`--initial-peers` flag.
+
+```bash
+# On GPU PC #1 (bootstrap peer):
+docker exec -it trainer bash
+python hivemind/train_pretrain_hivemind.py \
+  --hivemind --initial-peers "" --port 5678 \
+  --model-size 300M --data-dir /workspace/packed \
+  --checkpoint-dir /workspace/checkpoints/bootstrap
+
+# On GPU PC #2 (joins the swarm):
+docker exec -it trainer bash
+python hivemind/train_pretrain_hivemind.py \
+  --hivemind --initial-peers "gpu-pc-1.tailnet:5678" --port 5678 \
+  --model-size 300M --data-dir /workspace/packed \
+  --checkpoint-dir /workspace/checkpoints/worker1
+```
+
+Each peer trains locally and asynchronously averages parameters. See
+[`hivemind/README.md`](./hivemind/README.md) for the full set of options
+(`--target-group-size`, `--average-checkpoints`, etc.) and the cross-swarm
+averaging utilities documented in
+[hivemind-improvements](../hivemind-improvements) memory.
+
+The UI container doesn't drive hivemind jobs — those are launched
+directly inside each trainer. If you want the UI to *coordinate* distributed
+training, use the `nodeIds[]` field on `POST /api/jobs` to fan out a job
+across multiple Nodes; the existing ssh-manager does the round-trip.
 
 ---
 

@@ -1,0 +1,49 @@
+# =============================================================================
+# docker-compose.ui-only.yml — UI-host profile (multi-PC Topology A).
+#
+# Use this on a host that should run ONLY the UI containers — when the GPU
+# trainer lives on a separate machine that you've already added to the UI
+# via Settings → Nodes → Register Node.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.ui-only.yml up -d
+#
+# This drops the `trainer` and `ts-trainer` services. Postgres can stay on
+# this host (UI reaches it via host.docker.internal as before) or be moved
+# off — see the README's "Multi-PC Deployment" for the hostnames the UI
+# expects.
+# =============================================================================
+
+name: llmforge
+
+services:
+  ui-router:
+    # Keep all the original ui-router settings; an override is needed
+    # because we are dropping `depends_on: ui-router` from `ts-ui-router`
+    # is fine — the sidecar still waits on ui-router's healthcheck.
+    networks:
+      - tailnet
+
+  ui:
+    networks:
+      - tailnet
+
+  ts-ui-router:
+    networks:
+      - tailnet
+
+  ts-ui:
+    networks:
+      - tailnet
+
+  # ── Trainer and ts-trainer are intentionally absent ────────────────────
+  # Drop them with `docker compose -f ... up` and they won't start.
+
+networks:
+  tailnet:
+    driver: bridge
+
+volumes:
+  ts-state-ui-router: {}
+  ts-state-ui: {}
+  # ts-state-trainer dropped too — it would be unused noise.
