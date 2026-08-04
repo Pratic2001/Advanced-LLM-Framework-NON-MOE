@@ -342,6 +342,18 @@ jobs:
           # No trainer (no GPU). No sidecars either — they need a real
           # Tailscale auth key.
 
+      # ── Debug: confirm the bind mount landed. If /secrets/ui.env is
+      # missing here, the volume mount didn't take effect.
+      - name: Debug: inspect /secrets inside ui container
+        if: always()
+        run: |
+          echo "── docker compose ps ──"
+          docker compose ps
+          echo "── ls -la /secrets inside ui container ──"
+          docker compose exec -T ui ls -la /secrets 2>&1 || echo "exec failed"
+          echo "── ls -la ./secrets on the host ──"
+          ls -la secrets/
+
       - name: Wait for UI containers
         run: |
           # docker-compose.yml doesn't publish host ports — Tailscale sidecars
