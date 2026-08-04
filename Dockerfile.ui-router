@@ -45,9 +45,12 @@ RUN addgroup --system --gid 1001 nodejs \
 
 # Standalone server + static assets. .next/standalone/server.js is what
 # `next start -p 3002` would have run; we point CMD at it directly.
+#
+# UI_RenderRouter has no /public directory, so we don't COPY it — the empty
+# ./public we mkdir below satisfies Next's standalone static-server probe.
+RUN mkdir -p ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static    ./.next/static
-COPY --from=builder --chown=nextjs:nodejs /app/public           ./public
 
 USER nextjs
 EXPOSE 3002

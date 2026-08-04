@@ -57,6 +57,22 @@ ENV NEXT_PUBLIC_BASE_PATH=${NEXT_PUBLIC_BASE_PATH} \
 COPY UI/prisma ./ui/prisma
 RUN cd ui && npx prisma generate && cd ..
 
+# lib/env.ts validates DATABASE_URL/NEXTAUTH_URL/NEXTAUTH_SECRET at module
+# load via Zod. Next's build worker imports that module, so the build fails
+# without these even though the values only matter at runtime. Write dummy
+# placeholders here (overwritten at runtime by /secrets/*.env via the
+# entrypoint's `tsx --env-file=...`). The real DATABASE_URL/NEXTAUTH_URL
+# are injected via the Compose env_file at container start.
+RUN { \
+      echo 'DATABASE_URL=postgresql://postgres:postgres@localhost:5432/placeholder'; \
+      echo 'NEXTAUTH_URL=http://localhost:3000'; \
+      echo 'NEXTAUTH_SECRET=build-time-placeholder-not-used-at-runtime'; \
+      echo 'AUTH_SECRET=build-time-placeholder-not-used-at-runtime'; \
+      echo 'SSH_KEY_ENCRYPTION_KEY=build-time-placeholder-not-used-at-runtime'; \
+      echo 'AUTH_TRUST_HOST=true'; \
+    } > ui/.env.local \
+ && cp ui/.env.local ui_lite/.env.local
+
 COPY UI/.     ./ui/
 COPY UI_lite/. ./ui_lite/
 
