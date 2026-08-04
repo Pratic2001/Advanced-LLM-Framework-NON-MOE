@@ -23,9 +23,13 @@ tokenizer/
 
 # Environment
 .env
+.env.local
 .venv/
 venv/
 env/
+# Generated at runtime by .github/workflows/release.yml's smoke-test
+# job. Must NEVER be committed (contains real or dummy secrets).
+secrets/
 
 # IDE
 .vscode/

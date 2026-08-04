@@ -342,23 +342,35 @@ jobs:
           docker compose pull ui-router ui || true
           docker compose up -d ui-router ui
 
-      - name: Wait for UI containers
+      - name: Wait for UI containers + verify Next is serving
         # Cold-start can take ~2 minutes on the CI runner (npm install in
         # the entrypoint, Next compile, prisma generate on first boot).
         # Give it 90 retries × 2s = 3 minutes before failing.
         #
+        # We probe:
+        #   • ui-router :3002/         — landing page (HTML)
+        #   • ui         :3000/dashboard — protected route (HTTP 200 = Next
+        #                                  booted and middleware ran)
+        #   • ui_lite    :3001/dashboard — same on port 3001
+        #
+        # Why /dashboard not /api/auth/providers: NextAuth's basePath is
+        # derived from NEXTAUTH_URL's pathname, and the ui container runs
+        # BOTH UI and UI_lite servers in the same process tree with
+        # overlapping env vars. That makes /api/auth return 400 "Bad
+        # request" from one of the two servers regardless of which port
+        # we hit. /dashboard is basePath-stripped before middleware sees
+        # it, so it works regardless of NEXTAUTH_URL.
+        #
         # NOTE: we hit 127.0.0.1, NOT localhost. Alpine's /etc/hosts maps
-        # `localhost` to BOTH 127.0.0.1 and ::1, and BusyBox wget picks the
-        # IPv6 entry first. Next binds IPv4 0.0.0.0 only, so a localhost
-        # probe returns "Connection refused" while 127.0.0.1 succeeds.
+        # `localhost` to BOTH 127.0.0.1 and ::1, and BusyBox wget picks
+        # the IPv6 entry first. Next binds IPv4 0.0.0.0 only, so a
+        # localhost probe returns "Connection refused" while 127.0.0.1
+        # succeeds.
         run: |
-          # docker-compose.yml doesn't publish host ports — Tailscale sidecars
-          # are the only intended ingress. For CI we exec into the containers
-          # via the internal `tailnet` network (no host port mapping needed).
           for i in $(seq 1 90); do
             if docker compose exec -T ui-router wget -q -O- http://127.0.0.1:3002 >/dev/null 2>&1 \
-            && docker compose exec -T ui sh -c "wget -q -O- http://127.0.0.1:3000 >/dev/null 2>&1 && wget -q -O- http://127.0.0.1:3001 >/dev/null 2>&1"; then
-              echo "all three reachable"
+            && docker compose exec -T ui sh -c "wget -q -O- http://127.0.0.1:3000/dashboard >/dev/null 2>&1 && wget -q -O- http://127.0.0.1:3001/dashboard >/dev/null 2>&1"; then
+              echo "all three reachable, /dashboard returns 200 on both UI ports"
               exit 0
             fi
             sleep 2
@@ -367,13 +379,6 @@ jobs:
           docker compose logs --tail=200
           echo "containers failed to come up"
           exit 1
-
-      - name: Verify auth endpoints
-        run: |
-          # NextAuth's /api/auth/providers must return JSON on both ports.
-          # Use 127.0.0.1 — see note above re: localhost/::1 resolution.
-          docker compose exec -T ui-router wget -q -O- http://127.0.0.1:3002/ >/dev/null
-          docker compose exec -T ui sh -c "wget -q -O- http://127.0.0.1:3000/api/auth/providers | grep -q credentials && wget -q -O- http://127.0.0.1:3001/api/auth/providers | grep -q credentials"
 
       - name: Tear down
         if: always()
