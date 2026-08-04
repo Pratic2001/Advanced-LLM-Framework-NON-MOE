@@ -542,6 +542,27 @@ Then in GitHub Actions:
    tar -xf env-bundle.tar.gz
    mv bundle/secrets .
    ```
+4. (Optional) Download the **release-summary-`<tag>`** artifact — a one-page
+   PDF with the digest list, what was deployed, what changed (commit log),
+   and deployment instructions.
+
+### Optional: email the release PDF
+
+The Release workflow also emails the PDF to you if you set these GitHub
+Secrets (`Settings → Secrets and variables → Actions`):
+
+| Secret | Description |
+| --- | --- |
+| `SMTP_HOST` | e.g. `smtp.gmail.com` |
+| `SMTP_PORT` | `465` (default, TLS) |
+| `SMTP_SECURE` | `true` (default) |
+| `SMTP_USERNAME` | e.g. `cpratic8@gmail.com` |
+| `SMTP_PASSWORD` | Gmail **app password** — generate at <https://myaccount.google.com/apppasswords>. Your normal Gmail password won't work; you need 2FA + an app password. |
+| `NOTIFY_EMAIL` | Recipient address (defaults to `SMTP_USERNAME` if unset). |
+
+Without these, the workflow still uploads `release-summary-<tag>.pdf` as a
+workflow artifact — that's the canonical source of truth. Email is just a
+convenience.
 
 ### Running the stack
 
