@@ -64,6 +64,13 @@ services:
   ui:
     image: pratic2001/llmforge-ui:${TAG:-latest}
     restart: unless-stopped
+    # entrypoint.ui.sh reads two env files via `tsx --env-file=...`. env_file:
+    # below only sets process environment — it does NOT create the files in
+    # the container's filesystem. We also bind-mount the secrets directory
+    # read-only so the entrypoint can read /secrets/ui.env and
+    # /secrets/ui-lite.env directly.
+    volumes:
+      - ./secrets:/secrets:ro
     env_file:
       - ./secrets/ui.env
       - ./secrets/ui-lite.env

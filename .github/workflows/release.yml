@@ -344,10 +344,12 @@ jobs:
 
       - name: Wait for UI containers
         run: |
+          # docker-compose.yml doesn't publish host ports — Tailscale sidecars
+          # are the only intended ingress. For CI we exec into the containers
+          # via the internal `tailnet` network (no host port mapping needed).
           for i in $(seq 1 30); do
-            if curl -fsS http://localhost:3002 >/dev/null 2>&1 \
-            && curl -fsS http://localhost:3000 >/dev/null 2>&1 \
-            && curl -fsS http://localhost:3001 >/dev/null 2>&1; then
+            if docker compose exec -T ui-router wget -q -O- http://localhost:3002 >/dev/null 2>&1 \
+            && docker compose exec -T ui sh -c "wget -q -O- http://localhost:3000 >/dev/null 2>&1 && wget -q -O- http://localhost:3001 >/dev/null 2>&1"; then
               echo "all three reachable"
               exit 0
             fi
@@ -361,10 +363,134 @@ jobs:
       - name: Verify auth endpoints
         run: |
           # NextAuth's /api/auth/providers must return JSON on both ports.
-          curl -fsS http://localhost:3002/ >/dev/null
-          curl -fsS http://localhost:3000/api/auth/providers | grep -q credentials
-          curl -fsS http://localhost:3001/api/auth/providers | grep -q credentials
+          docker compose exec -T ui-router wget -q -O- http://localhost:3002/ >/dev/null
+          docker compose exec -T ui sh -c "wget -q -O- http://localhost:3000/api/auth/providers | grep -q credentials && wget -q -O- http://localhost:3001/api/auth/providers | grep -q credentials"
 
       - name: Tear down
         if: always()
         run: docker compose down -v || true
+
+  # ── Notify: PDF summary + email ─────────────────────────────────────────
+  # Builds a one-page PDF with what was deployed, what's new, and what's
+  # changed (git log between previous tag and this one). Uploads it as an
+  # artifact (always) and emails it if SMTP_* + NOTIFY_EMAIL secrets are set.
+  notify-release:
+    name: Generate release PDF + email
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # We need full history so `git log <prev>..HEAD` has something
+          # to enumerate.
+          fetch-depth: 0
+
+      - name: Determine tag + previous tag
+        id: refs
+        run: |
+          # Either the tag that triggered the run, or the manual override.
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ github.event.inputs.tag || 'latest' }}"
+          fi
+          # Find the previous tag (skip "latest" pseudo-tags). If none,
+          # PREVIOUS_TAG stays empty and the PDF lists the last 25 commits.
+          PREV=$(git tag --sort=-version:refname --no-contains "${TAG}" \
+                 | grep -E '^v[0-9]' | head -n 1 || true)
+          echo "tag=${TAG}"      >> "$GITHUB_OUTPUT"
+          echo "previous=${PREV:-}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve image digests from Docker Hub
+        id: digests
+        env:
+          TAG: ${{ steps.refs.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for n in ui-router ui trainer; do
+            d=$(docker buildx imagetools inspect \
+              "docker.io/pratic2001/llmforge-${n}:${TAG}" \
+              --raw 2>/dev/null \
+              | awk -F'[@ ]' '/^[0-9a-f]{64}$/ {print "sha256:"$1; exit}' || true)
+            if [[ -z "${d:-}" ]]; then
+              d="(digest not resolved)"
+            fi
+            echo "${n//-/_}_digest=${d}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pdfkit
+        run: npm install --no-save pdfkit@0.15.0
+
+      - name: Generate release PDF
+        env:
+          RELEASE_TAG:        ${{ steps.refs.outputs.tag }}
+          RELEASE_DATE:       ${{ github.event.repository.updated_at }}
+          RELEASE_REPO_URL:   ${{ github.server_url }}/${{ github.repository }}
+          RELEASE_COMMIT:     ${{ github.sha }}
+          PREVIOUS_TAG:       ${{ steps.refs.outputs.previous }}
+          PUBLIC_HOSTNAME:    ${{ secrets.PUBLIC_HOSTNAME }}
+          ROUTER_REF:         pratic2001/llmforge-ui-router:${{ steps.refs.outputs.tag }}
+          UI_REF:             pratic2001/llmforge-ui:${{ steps.refs.outputs.tag }}
+          TRAINER_REF:        pratic2001/llmforge-trainer:${{ steps.refs.outputs.tag }}
+          ROUTER_DIGEST:      ${{ steps.digests.outputs.ui_router_digest }}
+          UI_DIGEST:          ${{ steps.digests.outputs.ui_digest }}
+          TRAINER_DIGEST:     ${{ steps.digests.outputs.trainer_digest }}
+        run: |
+          node .github/scripts/generate-release-pdf.cjs
+          ls -la release.pdf
+
+      - name: Upload release PDF (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-summary-${{ steps.refs.outputs.tag }}
+          path: release.pdf
+          # 90 days so the PDF is recoverable for post-release audits.
+          retention-days: 90
+
+      - name: Email release PDF
+        if: ${{ secrets.SMTP_HOST != '' && secrets.NOTIFY_EMAIL != '' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port:    ${{ secrets.SMTP_PORT || 465 }}
+          secure:         ${{ secrets.SMTP_SECURE || 'true' }}
+          username:       ${{ secrets.SMTP_USERNAME }}
+          password:       ${{ secrets.SMTP_PASSWORD }}
+          from:           llmforge release bot <${{ secrets.SMTP_USERNAME }}>
+          to:             ${{ secrets.NOTIFY_EMAIL }}
+          subject:        "llmforge ${{ steps.refs.outputs.tag }} deployed"
+          body: |
+            llmforge ${{ steps.refs.outputs.tag }} was just deployed to Docker Hub.
+
+            Three images:
+              pratic2001/llmforge-ui-router:${{ steps.refs.outputs.tag }}
+              pratic2001/llmforge-ui:${{ steps.refs.outputs.tag }}
+              pratic2001/llmforge-trainer:${{ steps.refs.outputs.tag }}
+
+            Attached: release.pdf with the full summary (digest list, what's new,
+            commit log, deployment instructions).
+
+            View the run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          attachments: release.pdf
+          # Don't fail the workflow if SMTP is flaky — the artifact is the
+          # canonical source of truth.
+          ignore_error: true
+
+      - name: Skip-email notice
+        if: ${{ secrets.SMTP_HOST == '' || secrets.NOTIFY_EMAIL == '' }}
+        run: |
+          cat <<'EOF'
+          ::notice::Email step skipped. To receive release PDFs by email,
+          set these GH Secrets (Settings → Secrets and variables → Actions):
+            SMTP_HOST       e.g. smtp.gmail.com
+            SMTP_PORT       465 (default)
+            SMTP_USERNAME   e.g. cpratic8@gmail.com
+            SMTP_PASSWORD   Gmail app password (https://myaccount.google.com/apppasswords)
+            NOTIFY_EMAIL    address to send to (defaults to SMTP_USERNAME)
+          The PDF is always uploaded as a workflow artifact regardless.
+          EOF
