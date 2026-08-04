@@ -346,13 +346,18 @@ jobs:
         # Cold-start can take ~2 minutes on the CI runner (npm install in
         # the entrypoint, Next compile, prisma generate on first boot).
         # Give it 90 retries × 2s = 3 minutes before failing.
+        #
+        # NOTE: we hit 127.0.0.1, NOT localhost. Alpine's /etc/hosts maps
+        # `localhost` to BOTH 127.0.0.1 and ::1, and BusyBox wget picks the
+        # IPv6 entry first. Next binds IPv4 0.0.0.0 only, so a localhost
+        # probe returns "Connection refused" while 127.0.0.1 succeeds.
         run: |
           # docker-compose.yml doesn't publish host ports — Tailscale sidecars
           # are the only intended ingress. For CI we exec into the containers
           # via the internal `tailnet` network (no host port mapping needed).
           for i in $(seq 1 90); do
-            if docker compose exec -T ui-router wget -q -O- http://localhost:3002 >/dev/null 2>&1 \
-            && docker compose exec -T ui sh -c "wget -q -O- http://localhost:3000 >/dev/null 2>&1 && wget -q -O- http://localhost:3001 >/dev/null 2>&1"; then
+            if docker compose exec -T ui-router wget -q -O- http://127.0.0.1:3002 >/dev/null 2>&1 \
+            && docker compose exec -T ui sh -c "wget -q -O- http://127.0.0.1:3000 >/dev/null 2>&1 && wget -q -O- http://127.0.0.1:3001 >/dev/null 2>&1"; then
               echo "all three reachable"
               exit 0
             fi
@@ -366,8 +371,9 @@ jobs:
       - name: Verify auth endpoints
         run: |
           # NextAuth's /api/auth/providers must return JSON on both ports.
-          docker compose exec -T ui-router wget -q -O- http://localhost:3002/ >/dev/null
-          docker compose exec -T ui sh -c "wget -q -O- http://localhost:3000/api/auth/providers | grep -q credentials && wget -q -O- http://localhost:3001/api/auth/providers | grep -q credentials"
+          # Use 127.0.0.1 — see note above re: localhost/::1 resolution.
+          docker compose exec -T ui-router wget -q -O- http://127.0.0.1:3002/ >/dev/null
+          docker compose exec -T ui sh -c "wget -q -O- http://127.0.0.1:3000/api/auth/providers | grep -q credentials && wget -q -O- http://127.0.0.1:3001/api/auth/providers | grep -q credentials"
 
       - name: Tear down
         if: always()
