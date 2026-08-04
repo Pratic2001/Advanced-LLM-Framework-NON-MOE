@@ -337,22 +337,10 @@ jobs:
 
       - name: Pull & boot
         run: |
+          # No trainer on CI runners (no GPU). No sidecars either — they
+          # need a real Tailscale auth key, not the dummy we set above.
           docker compose pull ui-router ui || true
           docker compose up -d ui-router ui
-          # No trainer (no GPU). No sidecars either — they need a real
-          # Tailscale auth key.
-
-      # ── Debug: confirm the bind mount landed. If /secrets/ui.env is
-      # missing here, the volume mount didn't take effect.
-      - name: "Debug: inspect /secrets inside ui container"
-        if: always()
-        run: |
-          echo "── docker compose ps ──"
-          docker compose ps
-          echo "── ls -la /secrets inside ui container ──"
-          docker compose exec -T ui ls -la /secrets 2>&1 || echo "exec failed"
-          echo "── ls -la ./secrets on the host ──"
-          ls -la secrets/
 
       - name: Wait for UI containers
         run: |
@@ -464,17 +452,27 @@ jobs:
           # 90 days so the PDF is recoverable for post-release audits.
           retention-days: 90
 
+      # GH rejects `secrets.X` inside `if:` expressions at parse time
+      # (Unrecognized named-value: 'secrets'). Hoist all SMTP secrets to
+      # job-level env first, then gate the steps on env vars.
       - name: Email release PDF
-        if: ${{ secrets.SMTP_HOST != '' && secrets.NOTIFY_EMAIL != '' }}
+        if: ${{ env.SMTP_HOST != '' && env.NOTIFY_EMAIL != '' }}
+        env:
+          SMTP_HOST:      ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:      ${{ secrets.SMTP_PORT }}
+          SMTP_SECURE:    ${{ secrets.SMTP_SECURE }}
+          SMTP_USERNAME:  ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD:  ${{ secrets.SMTP_PASSWORD }}
+          NOTIFY_EMAIL:   ${{ secrets.NOTIFY_EMAIL }}
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ${{ secrets.SMTP_HOST }}
-          server_port:    ${{ secrets.SMTP_PORT || 465 }}
-          secure:         ${{ secrets.SMTP_SECURE || 'true' }}
-          username:       ${{ secrets.SMTP_USERNAME }}
-          password:       ${{ secrets.SMTP_PASSWORD }}
-          from:           llmforge release bot <${{ secrets.SMTP_USERNAME }}>
-          to:             ${{ secrets.NOTIFY_EMAIL }}
+          server_address: ${{ env.SMTP_HOST }}
+          server_port:    ${{ env.SMTP_PORT || 465 }}
+          secure:         ${{ env.SMTP_SECURE || 'true' }}
+          username:       ${{ env.SMTP_USERNAME }}
+          password:       ${{ env.SMTP_PASSWORD }}
+          from:           llmforge release bot <${{ env.SMTP_USERNAME }}>
+          to:             ${{ env.NOTIFY_EMAIL }}
           subject:        "llmforge ${{ steps.refs.outputs.tag }} deployed"
           body: |
             llmforge ${{ steps.refs.outputs.tag }} was just deployed to Docker Hub.
@@ -489,12 +487,15 @@ jobs:
 
             View the run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           attachments: release.pdf
-          # Don't fail the workflow if SMTP is flaky — the artifact is the
-          # canonical source of truth.
-          ignore_error: true
+        # Don't fail the workflow if SMTP is flaky — the artifact is the
+        # canonical source of truth.
+        continue-on-error: true
 
       - name: Skip-email notice
-        if: ${{ secrets.SMTP_HOST == '' || secrets.NOTIFY_EMAIL == '' }}
+        if: ${{ env.SMTP_HOST == '' || env.NOTIFY_EMAIL == '' }}
+        env:
+          SMTP_HOST:     ${{ secrets.SMTP_HOST }}
+          NOTIFY_EMAIL:  ${{ secrets.NOTIFY_EMAIL }}
         run: |
           cat <<'EOF'
           ::notice::Email step skipped. To receive release PDFs by email,

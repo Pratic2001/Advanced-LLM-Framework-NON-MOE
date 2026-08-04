@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # =============================================================================
 # UI container entrypoint — runs both UI and UI_lite server.ts processes.
 #
@@ -19,14 +19,36 @@ set -eu
 UI_PORT="${UI_PORT:-3000}"
 LITE_PORT="${LITE_PORT:-3001}"
 
-echo "[entrypoint] starting UI on :${UI_PORT} (BASE_PATH=/heavy)"
-cd /app/ui
-PORT="${UI_PORT}" tsx --env-file=/secrets/ui.env server.ts &
+# Allow overrides for the env-file paths. Useful for CI smoke tests where
+# the bind mount under /secrets may not exist; tests can pass UI_ENV_FILE /
+# LITE_ENV_FILE as plain env vars (no file dependency).
+UI_ENV_FILE="${UI_ENV_FILE:-/secrets/ui.env}"
+LITE_ENV_FILE="${LITE_ENV_FILE:-/secrets/ui-lite.env}"
+
+if [[ -f "${UI_ENV_FILE}" ]]; then
+  echo "[entrypoint] starting UI on :${UI_PORT} (BASE_PATH=/heavy, env=${UI_ENV_FILE})"
+  TSX_FLAGS="--env-file=${UI_ENV_FILE}"
+else
+  echo "[entrypoint] starting UI on :${UI_PORT} (BASE_PATH=/heavy, env=process)"
+  TSX_FLAGS=""
+fi
+(
+  cd /app/ui
+  PORT="${UI_PORT}" exec tsx ${TSX_FLAGS} server.ts
+) &
 UI_PID=$!
 
-echo "[entrypoint] starting UI_lite on :${LITE_PORT} (BASE_PATH=/lite)"
-cd /app/ui_lite
-PORT="${LITE_PORT}" tsx --env-file=/secrets/ui-lite.env server.ts &
+if [[ -f "${LITE_ENV_FILE}" ]]; then
+  echo "[entrypoint] starting UI_lite on :${LITE_PORT} (BASE_PATH=/lite, env=${LITE_ENV_FILE})"
+  TSX_FLAGS="--env-file=${LITE_ENV_FILE}"
+else
+  echo "[entrypoint] starting UI_lite on :${LITE_PORT} (BASE_PATH=/lite, env=process)"
+  TSX_FLAGS=""
+fi
+(
+  cd /app/ui_lite
+  PORT="${LITE_PORT}" exec tsx ${TSX_FLAGS} server.ts
+) &
 LITE_PID=$!
 
 # Wait for either process to exit, then tear down the other.
