@@ -3,6 +3,13 @@ const nextConfig = {
   // Security: remove X-Powered-By header
   poweredByHeader: false,
 
+  // Served behind a path on the Tailscale funnel (/heavy). basePath makes
+  // next/link, next/router, next/image, redirect() and asset URLs carry the
+  // prefix automatically; hand-written fetch/WebSocket/EventSource strings
+  // are prefixed via lib/base-path.ts. Set at build time from the same env
+  // var the client helper reads, so the two can never drift.
+  basePath: process.env.NEXT_PUBLIC_BASE_PATH || "",
+
   // Build output for Docker
   output: "standalone",
 

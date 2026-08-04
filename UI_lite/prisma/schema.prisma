@@ -1,0 +1,224 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum BackendType {
+  TORCH
+  DEEPSPEED
+  HIVEMIND
+}
+
+enum NodeRole {
+  HEAD
+  WORKER
+}
+
+enum NodeStatus {
+  PENDING
+  CONNECTING
+  CONNECTED
+  AUDITING
+  AUDITED
+  ERROR
+  DISCONNECTED
+}
+
+enum JobStatus {
+  PENDING
+  QUEUED
+  SETUP
+  RUNNING
+  PAUSED
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum JobType {
+  TOKENIZER_TRAIN
+  PACK_PRETRAIN
+  PACK_SFT
+  PACK_GRPO
+  PACK_DPO
+  PRETRAIN
+  SFT
+  GRPO
+  DPO
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  pythonBin    String? // path to the python interpreter for training runs (venv support)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  nodes         Node[]
+  jobs          Job[]
+  configPresets ConfigPreset[]
+  sshKeys       SshKey[]
+  pipelines     Pipeline[]
+  events        SystemEvent[]
+}
+
+model SshKey {
+  id                  String   @id @default(cuid())
+  userId              String
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label               String
+  publicKey           String
+  encryptedPrivateKey String
+  algorithm           String   @default("ed25519")
+  createdAt           DateTime @default(now())
+
+  nodes Node[]
+
+  @@unique([userId, label])
+}
+
+model Node {
+  id           String     @id @default(cuid())
+  userId       String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name         String
+  host         String
+  port         Int        @default(22)
+  username     String     @default("root")
+  role         NodeRole   @default(WORKER)
+  status       NodeStatus @default(PENDING)
+
+  gpuName       String?
+  gpuCount      Int?
+  vramGb        Float?
+  cpuModel      String?
+  cpuCores      Int?
+  cpuRamGb      Float?
+  diskGb        Float?
+  dockerVersion String?
+  pythonVersion String?
+  cudaVersion   String?
+
+  nfsMounted   Boolean  @default(false)
+  nfsMountPath String?
+
+  sshKeyId   String?
+  sshKey     SshKey?   @relation(fields: [sshKeyId], references: [id])
+  lastSeenAt DateTime?
+  errorMessage String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  jobs Job[]
+
+  @@unique([userId, host, port])
+}
+
+model ConfigPreset {
+  id          String      @id @default(cuid())
+  userId      String
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  backend     BackendType
+  config      Json
+  isDefault   Boolean     @default(false)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+}
+
+model Pipeline {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String?
+  backend   BackendType
+  status    String   @default("draft")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stages PipelineStage[]
+}
+
+model PipelineStage {
+  id         String   @id @default(cuid())
+  pipelineId String
+  pipeline   Pipeline @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  stageOrder Int
+  jobType    JobType
+  config     Json
+  status     String   @default("pending")
+  job Job? @relation("JobPipelineStage")
+}
+
+model Job {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type        JobType
+  backend     BackendType
+  status      JobStatus @default(PENDING)
+
+  config     Json
+  nodeId     String?
+  node       Node?      @relation(fields: [nodeId], references: [id])
+
+  pipelineStage PipelineStage? @relation("JobPipelineStage", fields: [pipelineStageId], references: [id])
+  pipelineStageId String?      @unique
+
+  pid        Int?
+  exitCode   Int?
+  startedAt  DateTime?
+  completedAt DateTime?
+  createdAt  DateTime   @default(now())
+
+  logPath      String?
+  logTail      String?
+  errorMessage String?
+
+  parentJobId String?
+  parentJob   Job?   @relation("JobPipeline", fields: [parentJobId], references: [id])
+  childJobs   Job[]  @relation("JobPipeline")
+
+  metrics JobMetric[]
+
+  @@index([userId, status])
+  @@index([userId, createdAt])
+}
+
+model JobMetric {
+  id        String   @id @default(cuid())
+  jobId     String
+  job       Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  step      Int
+  loss      Float?
+  vramUsed  Float?
+  vramTotal Float?
+  tokensPerSec Float?
+  lr        Float?
+  gradNorm  Float?
+  throughput Float?
+  nodeId    String?
+  nodeName  String?
+  timestamp DateTime @default(now())
+
+  @@index([jobId, step])
+  @@index([jobId, timestamp])
+}
+
+model SystemEvent {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  type      String
+  payload   Json?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}

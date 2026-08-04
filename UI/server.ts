@@ -20,6 +20,7 @@ import { parse } from "url";
 import next from "next";
 import { getWSManager } from "./lib/ws-manager";
 import { env } from "./lib/env";
+import { BASE_PATH } from "./lib/base-path";
 
 const dev = env.NODE_ENV !== "production";
 const hostname = env.HOSTNAME;
@@ -32,7 +33,17 @@ app.prepare().then(() => {
   const server = createServer((req, res) => {
     // Basic CORS headers
     const origin = req.headers.origin;
-    const allowedOrigin = process.env.NEXTAUTH_URL || `http://${hostname}:${port}`;
+    // Match on scheme+host only. A browser's Origin header never carries a
+    // path, so comparing against the full NEXTAUTH_URL (which now ends in
+    // /heavy for the funnel) would silently disable these CORS headers.
+    const allowedOrigin = (() => {
+      const raw = process.env.NEXTAUTH_URL || `http://${hostname}:${port}`;
+      try {
+        return new URL(raw).origin;
+      } catch {
+        return raw;
+      }
+    })();
     if (origin && origin === allowedOrigin) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
@@ -47,6 +58,20 @@ app.prepare().then(() => {
     }
 
     const parsedUrl = parse(req.url!, true);
+
+    // Tailscale Funnel mounts this app under BASE_PATH (e.g. /heavy) and
+    // strips that prefix before proxying to the backend. The basePath build
+    // only serves URLs that carry the prefix, so re-apply it here so that
+    // funnel-stripped pages, API routes, and _next assets resolve correctly.
+    const bp = BASE_PATH;
+    if (bp && parsedUrl.pathname && !parsedUrl.pathname.startsWith(bp)) {
+      // A funnel-stripped root ("/") would re-prepend to "/heavy/", which Next
+      // 308s to "/heavy" — and since that is the very URL the funnel already
+      // delivered, it becomes a redirect loop. Map root to the bare prefix.
+      parsedUrl.pathname = parsedUrl.pathname === "/" ? bp : bp + parsedUrl.pathname;
+      parsedUrl.path = parsedUrl.pathname + (parsedUrl.search || "");
+    }
+
     handle(req, res, parsedUrl);
   });
 
@@ -55,7 +80,7 @@ app.prepare().then(() => {
 
   server.listen(port, () => {
     console.log(
-      `[server] Listening at http://${hostname}:${port} (WebSocket: ws://${hostname}:${port}/api/ws)`
+      `[server] Listening at http://${hostname}:${port} (WebSocket: ws://${hostname}:${port}${BASE_PATH}/api/ws)`
     );
   });
 

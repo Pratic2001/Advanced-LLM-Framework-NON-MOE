@@ -1,0 +1,426 @@
+@import "tailwindcss";
+
+@theme {
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+}
+
+@layer base {
+  /* Dark structural tokens are the only baseline. PaletteProvider still refreshes
+     these tokens for palette-specific dark backdrops. */
+  :root {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 5.9%;
+    --card-foreground: 0 0% 98%;
+    --popover: 240 10% 5.9%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 199 89% 48%;
+    --primary-foreground: 240 5.9% 10%;
+    --secondary: 240 3.7% 15.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 3.7% 15.9%;
+    --muted-foreground: 240 5% 64.9%;
+    --accent: 240 3.7% 15.9%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 50.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 3.7% 15.9%;
+    --input: 240 3.7% 15.9%;
+    --ring: 199 89% 48%;
+    --radius: 0.75rem;
+    --font-inter: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+
+    /* Palette accents - default to neon-cyber; PaletteProvider rewrites these */
+    --palette-primary: 199 89% 48%;
+    --palette-primary-glow: 199 100% 60%;
+    --palette-secondary: 220 100% 50%;
+    --palette-secondary-glow: 220 100% 65%;
+    --palette-tertiary: 262 83% 58%;
+    --palette-tertiary-glow: 262 100% 70%;
+    --palette-accent: 330 81% 60%;
+    --palette-accent-glow: 330 100% 72%;
+
+    --glass-shadow-color: rgba(0, 0, 0, 0.4);
+    --glass-highlight-color: rgba(255, 255, 255, 0.12);
+    --glass-bottom-tint: rgba(0, 0, 0, 0.06);
+    --glass-body-glow: 0.08;
+    --glass-bg-alpha: 0.55;
+    --glass-bg-alpha-strong: 0.75;
+    --glass-bg-alpha-subtle: 0.35;
+
+    /* Palette selector dropdown — feels near-opaque against any backdrop,
+       even the cosmos particles that animate behind it. */
+    --panel-bg-alpha: 0.92;
+    --panel-blur: 28px;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-inter), system-ui, -apple-system, sans-serif;
+    /* Subtle ambient gradient overlay behind glass surfaces */
+    background-image:
+      radial-gradient(at 20% 0%, hsla(var(--palette-primary) / var(--glass-body-glow)) 0px, transparent 50%),
+      radial-gradient(at 80% 100%, hsla(var(--palette-tertiary) / var(--glass-body-glow)) 0px, transparent 50%);
+    background-attachment: fixed;
+  }
+
+  /* Smooth transitions for palette changes */
+  * {
+    transition: background-color 0.3s ease, border-color 0.3s ease, color 0.3s ease, box-shadow 0.3s ease;
+  }
+}
+
+/* ── Glassmorphism utilities ─────────────────────────── */
+
+.glass {
+  background: hsla(var(--card) / var(--glass-bg-alpha));
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  border: 1px solid hsla(var(--border) / 0.4);
+  box-shadow:
+    0 8px 32px 0 var(--glass-shadow-color),
+    inset 0 1px 0 var(--glass-highlight-color),
+    inset 0 -1px 0 var(--glass-bottom-tint);
+  position: relative;
+}
+
+/* Top sheen — the signature glass light reflection */
+.glass::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    180deg,
+    var(--glass-highlight-color) 0%,
+    transparent 35%,
+    transparent 65%,
+    var(--glass-bottom-tint) 100%
+  );
+  pointer-events: none;
+}
+
+.glass-strong {
+  background: hsla(var(--card) / var(--glass-bg-alpha-strong));
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid hsla(var(--border) / 0.5);
+  box-shadow:
+    0 12px 40px 0 var(--glass-shadow-color),
+    inset 0 1px 0 var(--glass-highlight-color),
+    inset 0 -1px 0 var(--glass-bottom-tint);
+  position: relative;
+}
+
+.glass-strong::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    180deg,
+    var(--glass-highlight-color) 0%,
+    transparent 30%,
+    transparent 70%,
+    var(--glass-bottom-tint) 100%
+  );
+  pointer-events: none;
+}
+
+.glass-subtle {
+  background: hsla(var(--card) / var(--glass-bg-alpha-subtle));
+  backdrop-filter: blur(10px) saturate(150%);
+  -webkit-backdrop-filter: blur(10px) saturate(150%);
+  border: 1px solid hsla(var(--border) / 0.25);
+  box-shadow:
+    0 4px 16px 0 var(--glass-shadow-color),
+    inset 0 1px 0 var(--glass-highlight-color);
+  position: relative;
+}
+
+/* Palette selector dropdown — a near-opaque panel so the active animated
+   backdrop (particles, cosmos) cannot bleed through and wash out the rows.
+   Sits on top of glass-strong so the user reads it as a distinct surface. */
+.palette-panel {
+  background: hsla(var(--card) / var(--panel-bg-alpha));
+  backdrop-filter: blur(var(--panel-blur)) saturate(180%);
+  -webkit-backdrop-filter: blur(var(--panel-blur)) saturate(180%);
+  border: 1px solid hsla(var(--border) / 0.6);
+  box-shadow:
+    0 16px 48px 0 var(--glass-shadow-color),
+    inset 0 1px 0 var(--glass-highlight-color),
+    inset 0 -1px 0 var(--glass-bottom-tint);
+  position: relative;
+}
+
+/* Palette-aware glass variants */
+.glass-primary {
+  background: hsla(var(--card) / var(--glass-bg-alpha));
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid hsla(var(--palette-primary) / 0.3);
+  box-shadow: 0 0 20px hsla(var(--palette-primary) / 0.15), 0 0 40px hsla(var(--palette-primary) / 0.05), inset 0 0 20px hsla(var(--palette-primary) / 0.05);
+}
+
+.glass-secondary {
+  background: hsla(var(--card) / var(--glass-bg-alpha));
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid hsla(var(--palette-secondary) / 0.3);
+  box-shadow: 0 0 20px hsla(var(--palette-secondary) / 0.15), 0 0 40px hsla(var(--palette-secondary) / 0.05), inset 0 0 20px hsla(var(--palette-secondary) / 0.05);
+}
+
+.glass-tertiary {
+  background: hsla(var(--card) / var(--glass-bg-alpha));
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid hsla(var(--palette-tertiary) / 0.3);
+  box-shadow: 0 0 20px hsla(var(--palette-tertiary) / 0.15), 0 0 40px hsla(var(--palette-tertiary) / 0.05), inset 0 0 20px hsla(var(--palette-tertiary) / 0.05);
+}
+
+/* ── Neon glow effects (palette-aware) ─────────────────────────────── */
+
+.glow-primary {
+  box-shadow:
+    0 0 20px hsla(var(--palette-primary) / 0.3),
+    0 0 40px hsla(var(--palette-primary) / 0.1),
+    inset 0 0 20px hsla(var(--palette-primary) / 0.05);
+}
+
+.glow-secondary {
+  box-shadow:
+    0 0 20px hsla(var(--palette-secondary) / 0.3),
+    0 0 40px hsla(var(--palette-secondary) / 0.1),
+    inset 0 0 20px hsla(var(--palette-secondary) / 0.05);
+}
+
+.glow-tertiary {
+  box-shadow:
+    0 0 20px hsla(var(--palette-tertiary) / 0.3),
+    0 0 40px hsla(var(--palette-tertiary) / 0.1),
+    inset 0 0 20px hsla(var(--palette-tertiary) / 0.05);
+}
+
+.glow-accent {
+  box-shadow:
+    0 0 20px hsla(var(--palette-accent) / 0.3),
+    0 0 40px hsla(var(--palette-accent) / 0.1),
+    inset 0 0 20px hsla(var(--palette-accent) / 0.05);
+}
+
+/* Text glows */
+.text-glow-primary {
+  color: hsl(var(--palette-primary));
+  text-shadow: 0 0 10px hsla(var(--palette-primary) / 0.5), 0 0 20px hsla(var(--palette-primary) / 0.3);
+}
+
+.text-glow-secondary {
+  color: hsl(var(--palette-secondary));
+  text-shadow: 0 0 10px hsla(var(--palette-secondary) / 0.5), 0 0 20px hsla(var(--palette-secondary) / 0.3);
+}
+
+.text-glow-tertiary {
+  color: hsl(var(--palette-tertiary));
+  text-shadow: 0 0 10px hsla(var(--palette-tertiary) / 0.5), 0 0 20px hsla(var(--palette-tertiary) / 0.3);
+}
+
+/* ── Animated gradient border ─────────────────────── */
+
+.gradient-border {
+  position: relative;
+  background: hsla(var(--card));
+  border-radius: var(--radius);
+}
+
+.gradient-border::before {
+  content: '';
+  position: absolute;
+  top: -1px;
+  left: -1px;
+  right: -1px;
+  bottom: -1px;
+  border-radius: calc(var(--radius) + 1px);
+  background: linear-gradient(135deg,
+    hsl(var(--palette-primary)),
+    hsl(var(--palette-secondary)),
+    hsl(var(--palette-tertiary)),
+    hsl(var(--palette-accent))
+  );
+  background-size: 300% 300%;
+  animation: gradient-rotate 4s ease infinite;
+  z-index: -1;
+  opacity: 0.5;
+}
+
+@keyframes gradient-rotate {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+/* ── Particle network background ─────────────────────── */
+
+.particle-network {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: -1;
+  pointer-events: none;
+}
+
+/* ── Grid background overlay ─────────────────────── */
+
+.grid-overlay {
+  background-image:
+    linear-gradient(hsla(var(--palette-primary) / 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, hsla(var(--palette-primary) / 0.03) 1px, transparent 1px);
+  background-size: 60px 60px;
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: -2;
+  pointer-events: none;
+  animation: grid-scroll 20s linear infinite;
+}
+
+/* ── Scrollbar styling ─────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: hsl(var(--background));
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsla(var(--muted-foreground) / 0.3);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsla(var(--muted-foreground) / 0.5);
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: hsla(var(--muted-foreground) / 0.3) hsl(var(--background));
+}
+
+/* ── Log viewer styling ──────────────────────────── */
+
+.log-line {
+  font-family: var(--font-mono), 'JetBrains Mono', monospace;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-line:hover {
+  background: hsla(var(--muted) / 0.3);
+}
+
+/* ── Status badges ───────────────────────────────── */
+
+.status-running {
+  @apply relative;
+}
+
+.status-running::after {
+  content: '';
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  background: #22c55e;
+  border-radius: 50%;
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.8); }
+}
+
+/* ── Skeleton loading ────────────────────────────── */
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    hsla(var(--muted) / 0.3) 25%,
+    hsla(var(--muted) / 0.5) 50%,
+    hsla(var(--muted) / 0.3) 75%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.5s ease-in-out infinite;
+  border-radius: var(--radius);
+}
+
+@keyframes skeleton-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* ── Focus visible styles ─────────────────────────── */
+
+.focus-visible-ring:focus-visible {
+  outline: none;
+  ring: 2px;
+  ring-color: hsl(var(--palette-primary));
+  ring-offset: 2px;
+  ring-offset-color: hsl(var(--background));
+}
+
+/* ── Selection styles ─────────────────────────────── */
+
+::selection {
+  background: hsla(var(--palette-primary) / 0.3);
+  color: hsl(var(--foreground));
+}
+
+/* ── Reduced motion ───────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
