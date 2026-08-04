@@ -49,13 +49,15 @@ ENV NEXT_PUBLIC_BASE_PATH=${NEXT_PUBLIC_BASE_PATH} \
     NEXT_TELEMETRY_DISABLED=1
 
 # Prisma schema lives in UI/. The DB client is generated into
-# UI/node_modules/@prisma/client and UI_lite imports it through a relative
-# path that resolves into the SAME node_modules dir as long as both builds
-# run from this image. We only generate once for UI; UI_lite's import
-# resolves to UI/node_modules/@prisma/client because that's what the lockfile
-# pins. If that breaks later, run `npm run db:generate` in UI_lite too.
+# ui/node_modules/@prisma/client and ui_lite/node_modules/@prisma/client.
+# Each app's TypeScript imports resolve to its OWN node_modules — they
+# don't share — so we have to regenerate the client in both trees,
+# otherwise ui_lite's Prisma namespace is the ungenerated npm-published
+# one and lacks schema types like JobMetricWhereInput.
 COPY UI/prisma ./ui/prisma
-RUN cd ui && npx prisma generate && cd ..
+COPY UI/prisma ./ui_lite/prisma
+RUN cd ui      && npx prisma generate && cd .. \
+ && cd ui_lite && npx prisma generate && cd ..
 
 # lib/env.ts validates DATABASE_URL/NEXTAUTH_URL/NEXTAUTH_SECRET at module
 # load via Zod. Next's build worker imports that module, so the build fails
