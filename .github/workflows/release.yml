@@ -344,7 +344,7 @@ jobs:
 
       # ── Debug: confirm the bind mount landed. If /secrets/ui.env is
       # missing here, the volume mount didn't take effect.
-      - name: Debug: inspect /secrets inside ui container
+      - name: "Debug: inspect /secrets inside ui container"
         if: always()
         run: |
           echo "── docker compose ps ──"
