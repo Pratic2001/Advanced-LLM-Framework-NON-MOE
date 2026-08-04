@@ -54,7 +54,7 @@ concurrency:
 
 jobs:
   build-and-push:
-    name: Build & push ${{ matrix.image.name }}
+    name: Build & push ${{ matrix.name }}
     runs-on: ubuntu-latest
     # All secrets are wired through job-level env. GH Actions does NOT
     # expand `secrets.*` inside `strategy.matrix.*` (it errors with
@@ -110,7 +110,7 @@ jobs:
       - name: Compute build args
         id: buildargs
         env:
-          KIND: ${{ matrix.image.args-kind }}
+          KIND: ${{ matrix.args-kind }}
         run: |
           set -euo pipefail
           HOST="${PUBLIC_HOSTNAME}"
@@ -148,19 +148,19 @@ jobs:
       - name: Build & push
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.image.context }}
-          file: ${{ matrix.image.dockerfile }}
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: |
-            pratic2001/llmforge-${{ matrix.image.name }}:${{ steps.tag.outputs.value }}
-            pratic2001/llmforge-${{ matrix.image.name }}:latest
+            pratic2001/llmforge-${{ matrix.name }}:${{ steps.tag.outputs.value }}
+            pratic2001/llmforge-${{ matrix.name }}:latest
           labels: |
-            org.opencontainers.image.title=llmforge-${{ matrix.image.name }}
+            org.opencontainers.image.title=llmforge-${{ matrix.name }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.tag.outputs.value }}
-          cache-from: type=gha,scope=${{ matrix.image.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
           build-args: ${{ steps.buildargs.outputs.args }}
 
   generate-env-bundle:
