@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # =============================================================================
 # UI container entrypoint — runs both UI and UI_lite server.ts processes.
 #
@@ -12,6 +12,11 @@
 #
 # If either process dies, kill the other and exit with the same code so
 # docker-compose's restart policy can take over.
+#
+# NOTE: This script is POSIX sh, not bash. node:22-alpine ships BusyBox ash
+# with no bash installed, so we use POSIX `[ -f ... ]` and the `&&` short-
+# circuit instead of `[[ -f ... ]]`. `set -u` keeps unbound variables from
+# silently expanding to "".
 # =============================================================================
 
 set -eu
@@ -25,29 +30,37 @@ LITE_PORT="${LITE_PORT:-3001}"
 UI_ENV_FILE="${UI_ENV_FILE:-/secrets/ui.env}"
 LITE_ENV_FILE="${LITE_ENV_FILE:-/secrets/ui-lite.env}"
 
-if [[ -f "${UI_ENV_FILE}" ]]; then
+# Decide whether to feed tsx an --env-file=... flag. If the file is missing
+# the process still runs, just without the .env overlay (env vars from the
+# container process environment will still be picked up by Next).
+if [ -f "${UI_ENV_FILE}" ]; then
   echo "[entrypoint] starting UI on :${UI_PORT} (BASE_PATH=/heavy, env=${UI_ENV_FILE})"
-  TSX_FLAGS="--env-file=${UI_ENV_FILE}"
+  UI_FLAGS="--env-file=${UI_ENV_FILE}"
 else
   echo "[entrypoint] starting UI on :${UI_PORT} (BASE_PATH=/heavy, env=process)"
-  TSX_FLAGS=""
+  UI_FLAGS=""
 fi
+
+if [ -f "${LITE_ENV_FILE}" ]; then
+  echo "[entrypoint] starting UI_lite on :${LITE_PORT} (BASE_PATH=/lite, env=${LITE_ENV_FILE})"
+  LITE_FLAGS="--env-file=${LITE_ENV_FILE}"
+else
+  echo "[entrypoint] starting UI_lite on :${LITE_PORT} (BASE_PATH=/lite, env=process)"
+  LITE_FLAGS=""
+fi
+
+# Start UI in a subshell so backgrounding works even if the parent later
+# changes directory. `exec` lets tsx become the child so wait() picks up
+# its exit code.
 (
   cd /app/ui
-  PORT="${UI_PORT}" exec tsx ${TSX_FLAGS} server.ts
+  PORT="${UI_PORT}" exec tsx ${UI_FLAGS} server.ts
 ) &
 UI_PID=$!
 
-if [[ -f "${LITE_ENV_FILE}" ]]; then
-  echo "[entrypoint] starting UI_lite on :${LITE_PORT} (BASE_PATH=/lite, env=${LITE_ENV_FILE})"
-  TSX_FLAGS="--env-file=${LITE_ENV_FILE}"
-else
-  echo "[entrypoint] starting UI_lite on :${LITE_PORT} (BASE_PATH=/lite, env=process)"
-  TSX_FLAGS=""
-fi
 (
   cd /app/ui_lite
-  PORT="${LITE_PORT}" exec tsx ${TSX_FLAGS} server.ts
+  PORT="${LITE_PORT}" exec tsx ${LITE_FLAGS} server.ts
 ) &
 LITE_PID=$!
 
