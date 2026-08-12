@@ -136,6 +136,64 @@ def passes_sft_pair_quality_filter(prompt: str, answer: str, min_chars: int = 20
     return True, None
 
 
+def _has_extractable_answer(answer: str) -> tuple:
+    """Check if an answer contains content that the GRPO reward function can
+    actually score: a \\boxed{...} expression (common in math datasets), a
+    number, or a short concrete token. These are the same patterns the reward
+    function in train_grpo.py extracts -- see ANSWER_RE and NUM_RE there.
+
+    Returns (passed: bool, reason: Optional[str])."""
+    if not answer:
+        return False, "empty_answer"
+    # \\boxed{...} capture -- single-level braces, matches math datasets
+    if re.search(r"\\boxed\{[^}]+\}", answer):
+        return True, None
+    # Numeric fallback (GSM8K, ScienceQA, etc.)
+    if re.search(r"-?\d+(?:\.\d+)?", answer):
+        return True, None
+    # Short concrete token (single word up to ~40 chars)
+    stripped = answer.strip()
+    if stripped and len(stripped.split()) <= 3 and len(stripped) <= 60:
+        return True, None
+    # Code output pattern (e.g. "True", "False", "None", "42", "error")
+    if re.search(r"^(?:true|false|none|null|ok|yes|no)$", answer.strip().lower()):
+        return True, None
+    return False, "no_extractable_answer"
+
+
+def passes_grpo_pair_quality_filter(prompt: str, answer: str, min_chars: int = 20) -> tuple:
+    """Quality bar for a (prompt, answer) pair being prepared for GRPO
+    training, where the answer must be machine-extractable by the reward
+    function. Reuses all the checks from passes_sft_pair_quality_filter AND
+    additionally verifies the answer contains extractable content (numeric,
+    boxed, or a short concrete token).
+
+    Returns (passed, reason). Checks:
+    - all passes_sft_pair_quality_filter checks apply
+    - answer must have extractable content (boxed/numeric/short concrete)"""
+    prompt = (prompt or "").strip()
+    answer = (answer or "").strip()
+    if not prompt:
+        return False, "empty_prompt"
+    if not answer:
+        return False, "empty_answer"
+    combined = f"{prompt}\n\n{answer}"
+    if len(combined) < min_chars:
+        return False, "too_short"
+    if _alnum_ratio(combined) < 0.25:
+        return False, "low_content_ratio"
+    if answer.strip().lower() == prompt.strip().lower():
+        return False, "answer_echoes_prompt"
+    lowered = combined.lower()
+    for marker in _JUNK_MARKERS:
+        if marker in lowered:
+            return False, f"junk_marker:{marker}"
+    extractable_ok, extractable_reason = _has_extractable_answer(answer)
+    if not extractable_ok:
+        return False, extractable_reason
+    return True, None
+
+
 _TRANSCRIPT_JUNK_MARKERS = ("[music]", "[applause]", "[laughter]", "♪ ♪ ♪")
 
 

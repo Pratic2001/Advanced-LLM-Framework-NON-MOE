@@ -77,7 +77,14 @@ do not reimplement filtering or dedup logic yourself:
         Use for pretrain-mode "text" fields (or any free-form prose).
 
     passes_sft_pair_quality_filter(prompt: str, answer: str, min_chars: int = 20) -> (bool, reason)
-        Use for sft/grpo-mode (prompt, answer) pairs.
+        Use for sft-mode (prompt, answer) pairs.
+
+    passes_grpo_pair_quality_filter(prompt: str, answer: str, min_chars: int = 20) -> (bool, reason)
+        Use for grpo-mode (prompt, answer) pairs. Like the sft filter, PLUS
+        it rejects answers the GRPO reward function cannot score (requires a
+        \\boxed{...} expression, a number, or a short concrete token). This is
+        critical for GRPO mode -- a freeform sentence answer will fail at
+        reward time even though it passes the sft filter.
 
     passes_code_quality_filter(text: str, path: str, min_doc_chars: int = 500) -> (bool, reason)
         Use only if the category is "code".
@@ -314,6 +321,13 @@ def _build_hf_generation_prompt(state: CodegenState, schema: dict,
     category = state["category"]
     mode = state["mode"]
     sample_json = json.dumps(rows[:5], ensure_ascii=False, indent=2)[:4000]
+    prior_error = state.get("prior_error")
+    repair_note = ""
+    if prior_error:
+        repair_note = (
+            f"\nThe previous version of this script failed with this error -- "
+            f"fix it, keep everything else the same:\n{prior_error}\n"
+        )
 
     return f"""You write ONE standalone Python script, nothing else.
 
@@ -348,6 +362,54 @@ Script requirements:
 - Wrap in broad try/except that always closes ShardWriter and prints
   RESULT_JSON with whatever was produced so far.
 
+Here is the STRUCTURE to follow (adapt the column mapping + filter to this
+dataset's real columns and to mode="{mode}"; do not copy placeholder names):
+    import argparse
+    import json
+    import os
+    import sys
+    import time
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from datasets import load_dataset
+    from quality import ExactDedup, ShardWriter, passes_prose_quality_filter,
+                        passes_sft_pair_quality_filter,
+                        passes_grpo_pair_quality_filter
+
+    def parse_size(s: str) -> int:
+        s = s.strip().upper()
+        for unit, mult in (("GB", 1024**3), ("MB", 1024**2), ("KB", 1024), ("B", 1)):
+            if s.endswith(unit):
+                return int(float(s[: -len(unit)]) * mult)
+        return int(float(s))
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--target-size", required=True)
+        ap.add_argument("--out-dir", default="./data")
+        ap.add_argument("--category", default="{category}")
+        ap.add_argument("--min-doc-chars", type=int, default=500)
+        args = ap.parse_args()
+        target_bytes = parse_size(args.target_size)
+        writer = ShardWriter(args.out_dir, args.category)
+        dedup = ExactDedup()
+        ds = load_dataset("{dataset_id}", {config!r}, split="{split}", streaming=True)
+        for row in ds:
+            # map the real column names from above:
+            text = (row.get("REAL_COLUMN_NAME") or "").strip()
+            record = {{"text": text, "source": "{dataset_id}", "category": args.category}}
+            passed, _reason = passes_prose_quality_filter(text, args.min_doc_chars)  # mode-appropriate filter
+            if not passed or dedup.is_duplicate(text):
+                continue
+            writer.write(record)
+            if writer.total_bytes >= target_bytes:
+                break
+        writer.close()
+        print("RESULT_JSON:" + json.dumps({{"actual_bytes": writer.total_bytes,
+                                             "docs": writer.total_docs}}))
+
+    if __name__ == "__main__":
+        main()
+{repair_note}
 Output ONLY the script in a single ```python fence.
 """
 
@@ -374,6 +436,13 @@ def _build_web_generation_prompt(state: CodegenState, schema: dict,
              "-- split into prompt/answer where a clear structure exists, "
              "else skip the page."
     )
+    prior_error = state.get("prior_error")
+    repair_note = ""
+    if prior_error:
+        repair_note = (
+            f"\nThe previous version of this script failed with this error -- "
+            f"fix it, keep everything else the same:\n{prior_error}\n"
+        )
 
     return f"""You write ONE standalone Python script, nothing else.
 
@@ -405,7 +474,7 @@ Script requirements:
   {{"actual_bytes": int, "docs": int}} -- must be the last line.
 - Wrap main loop in try/except that always closes ShardWriter and prints
   RESULT_JSON with whatever was produced so far.
-
+{repair_note}
 Output ONLY the script in a single ```python fence.
 """
 

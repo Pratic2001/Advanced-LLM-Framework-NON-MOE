@@ -616,7 +616,14 @@ do not reimplement filtering or dedup logic yourself:
         Use for pretrain-mode "text" fields (or any free-form prose).
 
     passes_sft_pair_quality_filter(prompt: str, answer: str, min_chars: int = 20) -> (bool, reason)
-        Use for sft/grpo-mode (prompt, answer) pairs.
+        Use for sft-mode (prompt, answer) pairs.
+
+    passes_grpo_pair_quality_filter(prompt: str, answer: str, min_chars: int = 20) -> (bool, reason)
+        Use for grpo-mode (prompt, answer) pairs. Like the sft filter, PLUS
+        it rejects answers the GRPO reward function cannot score (requires a
+        \\boxed{...} expression, a number, or a short concrete token). This is
+        critical for GRPO mode -- a freeform sentence answer will fail at
+        reward time even though it passes the sft filter.
 
     passes_code_quality_filter(text: str, path: str, min_doc_chars: int = 500) -> (bool, reason)
         Use only if the category is "code".
@@ -634,9 +641,10 @@ do not reimplement filtering or dedup logic yourself:
 
     passes_extended_sft_quality(prompt: str, answer: str, min_chars=20,
         max_compression_ratio=0.35, max_flagged_ngram_ratio=0.15, target_langs=None) -> (bool, reason)
-        Extended quality gate for SFT/GRPO pairs. Same zlib compression, flagged
+        Extended quality gate for SFT pairs. Same zlib compression, flagged
         n-gram, and language checks applied to the answer text. Prefer this over
         passes_sft_pair_quality_filter for higher-quality instruction data.
+        NOT for grpo-mode -- use passes_grpo_pair_quality_filter instead.
 
     score_text_quality(text, min_chars=500, target_langs=None) -> float
         Continuous quality score in [0, 1] for weighted sampling. Considers
@@ -684,6 +692,11 @@ Per-row error handling convention (IMPORTANT):
   little or no output and hides a real bug from the caller.
 - Reset the consecutive-failure counter to 0 every time a row succeeds.
 """
+
+# Runtime auto-fix rounds for the reasoning (--reasoning-model) path. The
+# direct path gets its repair loop from generate_validate_and_run(); the
+# reasoning path gets the same number of total generate+run attempts here.
+_REASONING_MAX_ATTEMPTS = 5
 
 
 
@@ -1049,6 +1062,7 @@ def post_filter_shards(
         sys.path.insert(0, _qlib_dir)
     from quality import passes_extended_text_quality as _ext_prose
     from quality import passes_extended_sft_quality as _ext_sft
+    from quality import passes_grpo_pair_quality_filter as _grpo_filter
 
     shard_dir = os.path.join(out_dir, category)
     if not os.path.isdir(shard_dir):
@@ -1102,6 +1116,14 @@ def post_filter_shards(
                 if mode == "pretrain":
                     text = record.get("text", "")
                     ok, _ = _ext_prose(text, min_chars=min_doc_chars, **q_kwargs)
+                elif mode == "grpo":
+                    # GRPO answers must be machine-extractable by the reward
+                    # function (numeric/boxed/short token) or the RL signal is
+                    # junk from step one -- enforce it here too, not just in
+                    # the codegen prompt.
+                    prompt = record.get("prompt", "")
+                    answer = record.get("answer", "")
+                    ok, _ = _grpo_filter(prompt, answer, min_chars=min_doc_chars)
                 else:
                     prompt = record.get("prompt", "")
                     answer = record.get("answer", "")
@@ -1285,23 +1307,54 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
         remaining = budget_bytes - total_bytes
 
         if reasoning_model and _HAS_REASONING:
-            ok = _reasoning_codegen(
-                category=category, mode=mode,
-                dataset_id=dataset_id, config=config,
-                split=sample["split"],
-                columns=sample["columns"], rows=sample["rows"],
-                script_path=script_path,
-                model=reasoning_model,
-            )
-            if not ok:
-                log_warn(f"[{category}] {dataset_id} reasoning codegen failed "
-                         f"-- skipping")
+            # Reasoning path -- same runtime auto-fix loop as the direct path.
+            # A script that compiles but crashes or produces zero data feeds
+            # its log tail back into _reasoning_codegen via prior_error for a
+            # rewrite, up to _REASONING_MAX_ATTEMPTS total rounds. Before
+            # this, the reasoning path was single-shot: a compilable-but-empty
+            # script was silently skipped -- exactly the "erroneous code for
+            # the first few attempts" failure class we want to self-heal.
+            reasoning_log = os.path.join(logs_dir, f"{safe_name}.log")
+            reasoning_prior_error: Optional[str] = None
+            result = {"actual_bytes": 0, "docs": 0}
+            ok = False
+            for raft_attempt in range(1, _REASONING_MAX_ATTEMPTS + 1):
+                ok = _reasoning_codegen(
+                    category=category, mode=mode,
+                    dataset_id=dataset_id, config=config,
+                    split=sample["split"],
+                    columns=sample["columns"], rows=sample["rows"],
+                    script_path=script_path,
+                    model=reasoning_model,
+                    prior_error=reasoning_prior_error,
+                )
+                if not ok:
+                    log_warn(f"[{category}] {dataset_id}: reasoning codegen "
+                             f"failed to compile on attempt "
+                             f"{raft_attempt}/{_REASONING_MAX_ATTEMPTS}")
+                    continue
+                result = run_generated_script(
+                    script_path, f"{remaining}B", out_dir, category, min_doc_chars,
+                    log_path=reasoning_log,
+                )
+                if result.get("actual_bytes", 0) > 0:
+                    break
+                log_tail = ""
+                if os.path.exists(reasoning_log):
+                    with open(reasoning_log, encoding="utf-8") as _lf:
+                        log_tail = _lf.read()[-2500:]
+                reasoning_prior_error = (
+                    f"Script produced no data (reasoning attempt {raft_attempt}). "
+                    f"Last output:\n{log_tail}"
+                )
+                log_warn(f"[{category}] {dataset_id}: reasoning run produced no "
+                         f"data on attempt {raft_attempt}/"
+                         f"{_REASONING_MAX_ATTEMPTS}, regenerating...")
+            if not ok or result.get("actual_bytes", 0) <= 0:
+                log_warn(f"[{category}] {dataset_id} reasoning codegen+run "
+                         f"exhausted {_REASONING_MAX_ATTEMPTS} attempts -- skipping")
                 rejected += 1
                 continue
-            result = run_generated_script(
-                script_path, f"{remaining}B", out_dir, category, min_doc_chars,
-                log_path=os.path.join(logs_dir, f"{safe_name}.log"),
-            )
         else:
             result = generate_validate_and_run(
                 lambda err: build_hf_codegen_prompt(
@@ -1368,20 +1421,46 @@ def run_category_web(category: str, budget_bytes: int, out_dir: str, mode: str,
     script_path = os.path.join(scripts_dir, f"{safe_name}.py")
 
     if reasoning_model and _HAS_REASONING:
-        ok = _reasoning_codegen(
-            category=category, mode=mode,
-            script_path=script_path,
-            model=reasoning_model,
-            raw_path=raw_path, sample_rows=sample_rows,
-        )
-        if not ok:
-            log_warn(f"[{category}] web reasoning codegen failed -- skipping")
+        # Reasoning path -- same runtime auto-fix loop as the direct path
+        # (see run_category_public for rationale).
+        reasoning_log = os.path.join(logs_dir, f"{safe_name}.log")
+        reasoning_prior_error: Optional[str] = None
+        result = {"actual_bytes": 0, "docs": 0}
+        ok = False
+        for raft_attempt in range(1, _REASONING_MAX_ATTEMPTS + 1):
+            ok = _reasoning_codegen(
+                category=category, mode=mode,
+                script_path=script_path,
+                model=reasoning_model,
+                raw_path=raw_path, sample_rows=sample_rows,
+                prior_error=reasoning_prior_error,
+            )
+            if not ok:
+                log_warn(f"[{category}] web reasoning codegen failed to compile "
+                         f"on attempt {raft_attempt}/{_REASONING_MAX_ATTEMPTS}")
+                continue
+            result = run_generated_script(
+                script_path, f"{budget_bytes}B", out_dir, category, min_doc_chars,
+                log_path=reasoning_log,
+                extra_args=["--raw-path", raw_path],
+            )
+            if result.get("actual_bytes", 0) > 0:
+                break
+            log_tail = ""
+            if os.path.exists(reasoning_log):
+                with open(reasoning_log, encoding="utf-8") as _lf:
+                    log_tail = _lf.read()[-2500:]
+            reasoning_prior_error = (
+                f"Script produced no data (reasoning attempt {raft_attempt}). "
+                f"Last output:\n{log_tail}"
+            )
+            log_warn(f"[{category}] web reasoning run produced no data on "
+                     f"attempt {raft_attempt}/{_REASONING_MAX_ATTEMPTS}, "
+                     f"regenerating...")
+        if not ok or result.get("actual_bytes", 0) <= 0:
+            log_warn(f"[{category}] web reasoning codegen+run exhausted "
+                     f"{_REASONING_MAX_ATTEMPTS} attempts -- skipping")
             return {"target_bytes": budget_bytes, "actual_bytes": 0, "docs": 0}
-        result = run_generated_script(
-            script_path, f"{budget_bytes}B", out_dir, category, min_doc_chars,
-            log_path=os.path.join(logs_dir, f"{safe_name}.log"),
-            extra_args=["--raw-path", raw_path],
-        )
     else:
         result = generate_validate_and_run(
             lambda err: build_web_codegen_prompt(category, mode, raw_path, sample_rows, prior_error=err),
