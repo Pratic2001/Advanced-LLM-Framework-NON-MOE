@@ -630,10 +630,26 @@ def _build_combined_mask(
         return None, None
 
     bsz = pad_mask_so_far.size(0)
+    # pad_mask_so_far accumulates across decode steps — its width is
+    # past_len + prev_seq_len, but we only want the past_len cache-aligned
+    # columns to broadcast against `causal` (which is `past_len + seq_len`).
+    # Slice the rightmost past_len columns, defensive left-pad if shorter
+    # (can happen on the first decode step if the prefill width was already
+    # padded to past_len during prefill).
+    cur = pad_mask_so_far.size(1)
+    if cur > past_len:
+        cache_pad = pad_mask_so_far[:, cur - past_len:]
+    elif cur < past_len:
+        pad_left = torch.zeros(
+            (bsz, past_len - cur), dtype=pad_mask_so_far.dtype, device=device,
+        )
+        cache_pad = torch.cat([pad_left, pad_mask_so_far], dim=1)
+    else:
+        cache_pad = pad_mask_so_far
     new_cols = torch.zeros(
         (bsz, seq_len), dtype=pad_mask_so_far.dtype, device=device,
     )
-    full_pad = torch.cat([pad_mask_so_far, new_cols], dim=1)
+    full_pad = torch.cat([cache_pad, new_cols], dim=1)
 
     total_len = past_len + seq_len
     q_pos = torch.arange(past_len, total_len, device=device).unsqueeze(1)

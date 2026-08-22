@@ -1358,7 +1358,7 @@ def train(args: argparse.Namespace):
     install_signal_handlers()
     log = setup_logging()
     log_event(log, "grpo_start",
-              model_size=args.model_size, num_steps=args.max_steps,
+              model_size=args.model_size, num_steps=args.num_steps,
               num_generations=args.num_generations, resume=args.resume)
 
     torch.manual_seed(args.seed + rank)
@@ -1466,7 +1466,7 @@ def train(args: argparse.Namespace):
     scheduler = build_scheduler(
         schedule="cosine",
         warmup_steps=args.warmup_steps,
-        max_steps=args.max_steps,
+        max_steps=args.num_steps,
         peak_lr=args.lr,
         min_lr=args.min_lr,
     )
@@ -1490,7 +1490,7 @@ def train(args: argparse.Namespace):
         print(f"\nEffective batch     : {eff_prompts} prompts "
               f"({eff_completions} completions)")
         print(f"Group size G        : {args.num_generations}")
-        print(f"Max steps           : {args.max_steps:,}")
+        print(f"Max steps           : {args.num_steps:,}")
         print(f"Reference policy    : {args.ref_policy}")
         print(f"Checkpoint every    : {args.save_every:,} steps\n")
 
@@ -1506,7 +1506,7 @@ def train(args: argparse.Namespace):
     data_iter = iter(train_ds)
 
     interrupted = False
-    while step < args.max_steps:
+    while step < args.num_steps:
         # --- graceful shutdown (collective-safe: all ranks agree to stop)
         if should_stop(device, world_size):
             interrupted = True
@@ -1645,7 +1645,7 @@ def train(args: argparse.Namespace):
         # On graceful shutdown `step` is exactly the next optimizer step to
         # run (we broke at the top of iteration `step`), so saving it makes
         # resume continue where we stopped — no lost progress.
-        final_step = step if interrupted else args.max_steps
+        final_step = step if interrupted else args.num_steps
         save_grpo_checkpoint(
             args.out_dir, final_step, model, optimizer, config,
             vars(args), is_lora, recipe,

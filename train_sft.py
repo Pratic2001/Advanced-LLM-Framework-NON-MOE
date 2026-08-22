@@ -699,17 +699,48 @@ def merge_and_save_mode(args, rank, world_size, device):
     # Build base model
     model = TransformerForCausalLM(config).to(device)
 
-    # Load base weights from the original pretrain checkpoint
+    # Inject LoRA *before* loading base weights — inject_lora restructures
+    # each targeted nn.Linear into a LoRA wrapper exposing `.base.weight`
+    # + `.lora_A/B`. Loading plain `*.weight` into the bare model first
+    # silently drops the values because the wrapper no longer has `.weight`.
+    inject_lora(
+        model,
+        rank=saved_args.get("lora_rank", 64),
+        alpha=saved_args.get("lora_alpha", 128.0),
+        target_modules=tuple(saved_args.get("lora_target_modules", "q_proj,k_proj,v_proj,o_proj").split(",")),
+        lora_type=saved_args.get("lora_type", "lora"),
+    )
+
+    # Load base weights from the original pretrain checkpoint, remapping
+    # plain `q_proj.weight` → `q_proj.base.weight` so the LoRA wrapper
+    # actually receives the pretrained values.
     base_ckpt_path = saved_args.get("checkpoint_dir")
+    base_loaded = False
     if base_ckpt_path and os.path.isdir(base_ckpt_path):
         base_latest = os.path.join(base_ckpt_path, "latest.pt")
         if os.path.exists(base_latest):
-            base_ckpt = load_torch_checkpoint(base_latest, map_location=device)
+            base_ckpt = load_torch_checkpoint(base_latest, map_location=device, allow_unsafe=True)
             if "model_state" in base_ckpt:
-                model.load_state_dict(base_ckpt["model_state"])
+                target_sd = {}
+                _LORA_SUFFIXES = (
+                    "q_proj.weight", "k_proj.weight", "v_proj.weight",
+                    "o_proj.weight", "gate_proj.weight", "up_proj.weight",
+                    "down_proj.weight",
+                )
+                for k, v in base_ckpt["model_state"].items():
+                    if k.endswith(_LORA_SUFFIXES):
+                        target_k = k[: -len("weight")] + "base.weight"
+                        if target_k in model.state_dict():
+                            target_sd[target_k] = v
+                            continue
+                    if k in model.state_dict():
+                        target_sd[k] = v
+                missing, unexpected = model.load_state_dict(target_sd, strict=False)
                 if hasattr(model, "tie_weights"):
                     model.tie_weights()
-                print(f"[Merge] loaded base weights from {base_latest}")
+                print(f"[Merge] loaded base weights from {base_latest} "
+                      f"(missing={len(missing)} unexpected={len(unexpected)})")
+                base_loaded = True
             else:
                 print("[Merge] WARNING: base checkpoint has no 'model_state' key")
         else:
@@ -719,20 +750,16 @@ def merge_and_save_mode(args, rank, world_size, device):
         print("[Merge] WARNING: --checkpoint-dir not found; "
               "LoRA will be merged onto random weights.")
 
-    # Inject LoRA with the same hyper-parameters as training
-    inject_lora(
-        model,
-        rank=saved_args.get("lora_rank", 64),
-        alpha=saved_args.get("lora_alpha", 128.0),
-        target_modules=tuple(saved_args.get("lora_target_modules", "q_proj,k_proj,v_proj,o_proj").split(",")),
-        lora_type=saved_args.get("lora_type", "lora"),
-    )
+    # Load LoRA weights onto the wrapper
+    lora_only_sd = {
+        k: v for k, v in ckpt["model_state"].items() if k in model.state_dict()
+    }
+    model.load_state_dict(lora_only_sd, strict=False)
 
-    # Load LoRA weights
-    model.load_state_dict(ckpt["model_state"], strict=False)
-
-    # Merge
-    model = merge_lora(model)
+    # Merge LoRA deltas into base weights and strip the wrappers.
+    # merge_lora returns the original base weights dict (for unmerge); we
+    # don't need them, so discard.
+    _ = merge_lora(model)
     if hasattr(model, "tie_weights"):
         model.tie_weights()
 
